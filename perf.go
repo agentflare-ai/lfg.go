@@ -1,16 +1,12 @@
 package lfg
 
 /*
-typedef struct lfm_model lfm_model;
-typedef struct lfm_context lfm_context;
-typedef struct lfm_vocab lfm_vocab;
-typedef struct lfm_sampler lfm_sampler;
-#include "lfm_inference.h"
+#include "lfg_inference.h"
 */
 import "C"
 
-// PerfContextData holds performance metrics for a context.
-type PerfContextData struct {
+// ContextPerf holds performance metrics for a context.
+type ContextPerf struct {
 	TStartMs float64 // absolute start time in ms
 	TLoadMs  float64 // time for loading the model in ms
 	TPEvalMs float64 // time for processing the prompt in ms
@@ -20,21 +16,21 @@ type PerfContextData struct {
 	NReused  int     // number of reused compute graphs
 }
 
-// PerfSamplerData holds performance metrics for a sampler chain.
-type PerfSamplerData struct {
+// SamplerPerf holds performance metrics for a sampler chain.
+type SamplerPerf struct {
 	TSampleMs float64 // time for sampling in ms
 	NSample   int     // number of sampled tokens
 }
 
-// PerfContext returns performance data for the context.
-func (ctx *Context) PerfContext() PerfContextData {
+// Performance returns performance data for the context.
+func (ctx *Context) Performance() ContextPerf {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
 	if ctx.c == nil {
-		return PerfContextData{}
+		return ContextPerf{}
 	}
-	data := C.lfm_perf_context(ctx.c)
-	return PerfContextData{
+	data := C.lfg_perf_context(ctx.c)
+	return ContextPerf{
 		TStartMs: float64(data.t_start_ms),
 		TLoadMs:  float64(data.t_load_ms),
 		TPEvalMs: float64(data.t_p_eval_ms),
@@ -45,58 +41,58 @@ func (ctx *Context) PerfContext() PerfContextData {
 	}
 }
 
-// PerfContextPrint prints performance data to the log.
-func (ctx *Context) PerfContextPrint() {
+// PrintPerformance prints performance data to the log.
+func (ctx *Context) PrintPerformance() {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
 	if ctx.c == nil {
 		return
 	}
-	C.lfm_perf_context_print(ctx.c)
+	C.lfg_perf_context_print(ctx.c)
 }
 
-// PerfContextReset resets performance counters.
-func (ctx *Context) PerfContextReset() {
+// ResetPerformance resets performance counters.
+func (ctx *Context) ResetPerformance() {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
 	if ctx.c == nil {
 		return
 	}
-	C.lfm_perf_context_reset(ctx.c)
+	C.lfg_perf_context_reset(ctx.c)
 }
 
-// PerfSampler returns performance data for a sampler chain.
-func (s *Sampler) PerfSampler() PerfSamplerData {
+// Performance returns performance data for a sampler chain.
+func (s *Sampler) Performance() SamplerPerf {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == nil {
-		return PerfSamplerData{}
+		return SamplerPerf{}
 	}
-	data := C.lfm_perf_sampler(s.c)
-	return PerfSamplerData{
+	data := C.lfg_perf_sampler(s.c)
+	return SamplerPerf{
 		TSampleMs: float64(data.t_sample_ms),
 		NSample:   int(data.n_sample),
 	}
 }
 
-// PerfSamplerPrint prints sampler performance data to the log.
-func (s *Sampler) PerfSamplerPrint() {
+// PrintPerformance prints sampler performance data to the log.
+func (s *Sampler) PrintPerformance() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == nil {
 		return
 	}
-	C.lfm_perf_sampler_print(s.c)
+	C.lfg_perf_sampler_print(s.c)
 }
 
-// PerfSamplerReset resets sampler performance counters.
-func (s *Sampler) PerfSamplerReset() {
+// ResetPerformance resets sampler performance counters.
+func (s *Sampler) ResetPerformance() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == nil {
 		return
 	}
-	C.lfm_perf_sampler_reset(s.c)
+	C.lfg_perf_sampler_reset(s.c)
 }
 
 // MemoryBreakdownPrint prints per-device memory usage via the log.
@@ -106,5 +102,5 @@ func (ctx *Context) MemoryBreakdownPrint() {
 	if ctx.c == nil {
 		return
 	}
-	C.lfm_memory_breakdown_print(ctx.c)
+	C.lfg_memory_breakdown_print(ctx.c)
 }

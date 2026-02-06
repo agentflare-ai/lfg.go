@@ -1,11 +1,7 @@
 package lfg
 
 /*
-typedef struct lfm_model lfm_model;
-typedef struct lfm_context lfm_context;
-typedef struct lfm_vocab lfm_vocab;
-typedef struct lfm_sampler lfm_sampler;
-#include "lfm_inference.h"
+#include "lfg_inference.h"
 
 // C trampoline for the progress callback.
 // Calls back into Go via the goProgressCallback function.
@@ -15,7 +11,7 @@ static _Bool progress_callback_trampoline(float progress, void *user_data) {
     return goProgressCallback(progress, user_data);
 }
 
-static lfm_progress_callback get_progress_trampoline(void) {
+static lfg_progress_callback get_progress_trampoline(void) {
     return progress_callback_trampoline;
 }
 */
@@ -52,7 +48,7 @@ func unregisterProgressCallback(id uintptr) {
 }
 
 // getProgressTrampoline returns the C function pointer for the progress callback.
-func getProgressTrampoline() C.lfm_progress_callback {
+func getProgressTrampoline() C.lfg_progress_callback {
 	return C.get_progress_trampoline()
 }
 

@@ -67,16 +67,16 @@ func gcCollect() {
 // Backend / System Info
 // ---------------------------------------------------------------------------
 
-func TestAPIVersion(t *testing.T) {
-	v := APIVersion()
+func TestVersion(t *testing.T) {
+	v := Version()
 	if v == "" {
-		t.Fatal("APIVersion returned empty string")
+		t.Fatal("Version returned empty string")
 	}
 	t.Logf("API version: %s", v)
 }
 
-func TestAPIVersionNumbers(t *testing.T) {
-	major, minor, patch := APIVersionNumbers()
+func TestVersionNumbers(t *testing.T) {
+	major, minor, patch := VersionNumbers()
 	t.Logf("API version: %d.%d.%d", major, minor, patch)
 	if major == 0 && minor == 0 && patch == 0 {
 		t.Fatal("all version numbers are zero")
@@ -100,7 +100,7 @@ func TestSystemInfo(t *testing.T) {
 }
 
 func TestSystemCapabilities(t *testing.T) {
-	t.Logf("MaxDevices: %d", MaxDevices())
+	t.Logf("DeviceCount: %d", DeviceCount())
 	t.Logf("MaxParallelSequences: %d", MaxParallelSequences())
 	t.Logf("SupportsMmap: %v", SupportsMmap())
 	t.Logf("SupportsMlock: %v", SupportsMlock())
@@ -115,14 +115,14 @@ func TestBackendFreeIdempotent(t *testing.T) {
 	t.Log("BackendFree() is available (skipping actual call to avoid invalidating test state)")
 }
 
-func TestTimeUS(t *testing.T) {
-	t0 := TimeUS()
+func TestTimeMicroseconds(t *testing.T) {
+	t0 := TimeMicroseconds()
 	if t0 <= 0 {
-		t.Fatalf("TimeUS returned non-positive: %d", t0)
+		t.Fatalf("TimeMicroseconds returned non-positive: %d", t0)
 	}
-	t1 := TimeUS()
+	t1 := TimeMicroseconds()
 	if t1 < t0 {
-		t.Fatalf("TimeUS is not monotonic: %d < %d", t1, t0)
+		t.Fatalf("TimeMicroseconds is not monotonic: %d < %d", t1, t0)
 	}
 }
 
@@ -175,33 +175,33 @@ func TestLoadModelBadPath(t *testing.T) {
 func TestModelProperties(t *testing.T) {
 	m := requireModel(t)
 
-	if m.NEmbd() <= 0 {
-		t.Fatal("NEmbd should be > 0")
+	if m.EmbeddingSize() <= 0 {
+		t.Fatal("EmbeddingSize should be > 0")
 	}
-	if m.NLayer() <= 0 {
-		t.Fatal("NLayer should be > 0")
+	if m.LayerCount() <= 0 {
+		t.Fatal("LayerCount should be > 0")
 	}
-	if m.NHead() <= 0 {
-		t.Fatal("NHead should be > 0")
+	if m.HeadCount() <= 0 {
+		t.Fatal("HeadCount should be > 0")
 	}
-	if m.NCtxTrain() <= 0 {
-		t.Fatal("NCtxTrain should be > 0")
+	if m.TrainingContextSize() <= 0 {
+		t.Fatal("TrainingContextSize should be > 0")
 	}
 	if m.Size() == 0 {
 		t.Fatal("Size should be > 0")
 	}
-	if m.NParams() == 0 {
-		t.Fatal("NParams should be > 0")
+	if m.ParameterCount() == 0 {
+		t.Fatal("ParameterCount should be > 0")
 	}
 
-	desc := m.Desc()
+	desc := m.Description()
 	if desc == "" {
-		t.Fatal("Desc is empty")
+		t.Fatal("Description is empty")
 	}
 
-	t.Logf("Desc: %s", desc)
-	t.Logf("NEmbd: %d, NLayer: %d, NHead: %d", m.NEmbd(), m.NLayer(), m.NHead())
-	t.Logf("NCtxTrain: %d, Size: %d bytes, NParams: %d", m.NCtxTrain(), m.Size(), m.NParams())
+	t.Logf("Description: %s", desc)
+	t.Logf("EmbeddingSize: %d, LayerCount: %d, HeadCount: %d", m.EmbeddingSize(), m.LayerCount(), m.HeadCount())
+	t.Logf("TrainingContextSize: %d, Size: %d bytes, ParameterCount: %d", m.TrainingContextSize(), m.Size(), m.ParameterCount())
 	t.Logf("RopeType: %d, RopeFreqScaleTrain: %f", m.RopeType(), m.RopeFreqScaleTrain())
 	t.Logf("HasEncoder: %v, HasDecoder: %v", m.HasEncoder(), m.HasDecoder())
 	t.Logf("IsRecurrent: %v, IsHybrid: %v, IsDiffusion: %v", m.IsRecurrent(), m.IsHybrid(), m.IsDiffusion())
@@ -210,19 +210,19 @@ func TestModelProperties(t *testing.T) {
 func TestModelMetadata(t *testing.T) {
 	m := requireModel(t)
 
-	count := m.MetaCount()
+	count := m.MetadataCount()
 	if count <= 0 {
-		t.Fatal("MetaCount should be > 0")
+		t.Fatal("MetadataCount should be > 0")
 	}
 	t.Logf("Metadata count: %d", count)
 
 	// Print first 5 metadata entries.
 	for i := 0; i < count && i < 5; i++ {
-		key, ok := m.MetaKeyByIndex(i)
+		key, ok := m.MetadataKeyAt(i)
 		if !ok {
 			continue
 		}
-		val, _ := m.MetaValStrByIndex(i)
+		val, _ := m.MetadataValueAt(i)
 		t.Logf("  [%d] %s = %s", i, key, val)
 	}
 }
@@ -265,17 +265,17 @@ func TestVocab(t *testing.T) {
 		t.Fatal("Vocab returned nil")
 	}
 
-	nTokens := v.NTokens()
+	nTokens := v.TokenCount()
 	if nTokens <= 0 {
-		t.Fatalf("NTokens = %d, want > 0", nTokens)
+		t.Fatalf("TokenCount = %d, want > 0", nTokens)
 	}
-	t.Logf("VocabType: %d, NTokens: %d", v.Type(), nTokens)
+	t.Logf("VocabType: %d, TokenCount: %d", v.Type(), nTokens)
 
 	// Special tokens.
 	bos := v.BOS()
 	eos := v.EOS()
 	t.Logf("BOS: %d, EOS: %d, EOT: %d, NL: %d, PAD: %d", bos, eos, v.EOT(), v.NL(), v.PAD())
-	t.Logf("AddBOS: %v, AddEOS: %v", v.GetAddBOS(), v.GetAddEOS())
+	t.Logf("AddBOS: %v, AddEOS: %v", v.AddBOS(), v.AddEOS())
 
 	// BOS should not be EOG.
 	if v.IsEOG(bos) {
@@ -332,7 +332,7 @@ func TestTokenizeEmpty(t *testing.T) {
 	t.Logf("Empty tokenization: %d tokens", len(tokens))
 }
 
-func TestTokenToPiece(t *testing.T) {
+func TestTokenText(t *testing.T) {
 	m := requireModel(t)
 	v := m.Vocab()
 
@@ -343,7 +343,7 @@ func TestTokenToPiece(t *testing.T) {
 
 	var pieces []string
 	for _, tok := range tokens {
-		piece := v.TokenToPiece(tok, false)
+		piece := v.TokenText(tok, false)
 		pieces = append(pieces, piece)
 	}
 	t.Logf("Pieces: %v", pieces)
@@ -359,8 +359,8 @@ func TestTokenAttributes(t *testing.T) {
 	v := m.Vocab()
 
 	bos := v.BOS()
-	attr := v.GetAttr(bos)
-	t.Logf("BOS token %d: attr=%d, score=%.4f, text=%q", bos, attr, v.GetScore(bos), v.GetText(bos))
+	attr := v.Attributes(bos)
+	t.Logf("BOS token %d: attr=%d, score=%.4f, text=%q", bos, attr, v.Score(bos), v.Text(bos))
 
 	if !v.IsControl(bos) {
 		t.Log("BOS is not marked as control (may be model-specific)")
@@ -374,22 +374,22 @@ func TestTokenAttributes(t *testing.T) {
 func TestNewContext(t *testing.T) {
 	m := requireModel(t)
 
-	ctx, err := NewContext(m, WithNCtx(512), WithNBatch(512), WithNThreads(4))
+	ctx, err := NewContext(m, WithContextSize(512), WithBatchSize(512), WithThreads(4))
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
 	defer ctx.Close()
 
-	if ctx.NCtx() == 0 {
-		t.Fatal("NCtx is 0")
+	if ctx.ContextSize() == 0 {
+		t.Fatal("ContextSize is 0")
 	}
-	if ctx.NBatch() == 0 {
-		t.Fatal("NBatch is 0")
+	if ctx.BatchSize() == 0 {
+		t.Fatal("BatchSize is 0")
 	}
 
-	t.Logf("NCtx: %d, NBatch: %d, NUBatch: %d, NSeqMax: %d",
-		ctx.NCtx(), ctx.NBatch(), ctx.NUBatch(), ctx.NSeqMax())
-	t.Logf("NThreads: %d, NThreadsBatch: %d", ctx.NThreads(), ctx.NThreadsBatch())
+	t.Logf("ContextSize: %d, BatchSize: %d, MicroBatchSize: %d, MaxSequences: %d",
+		ctx.ContextSize(), ctx.BatchSize(), ctx.MicroBatchSize(), ctx.MaxSequences())
+	t.Logf("ThreadCount: %d, BatchThreadCount: %d", ctx.ThreadCount(), ctx.BatchThreadCount())
 }
 
 func TestContextClosedModel(t *testing.T) {
@@ -403,7 +403,7 @@ func TestContextClosedModel(t *testing.T) {
 	}
 	m.Close()
 
-	_, err = NewContext(m, WithNCtx(512))
+	_, err = NewContext(m, WithContextSize(512))
 	if err == nil {
 		t.Fatal("expected error creating context from closed model")
 	}
@@ -412,7 +412,7 @@ func TestContextClosedModel(t *testing.T) {
 
 func TestContextCloseIdempotent(t *testing.T) {
 	m := requireModel(t)
-	ctx, err := NewContext(m, WithNCtx(512))
+	ctx, err := NewContext(m, WithContextSize(512))
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -422,15 +422,15 @@ func TestContextCloseIdempotent(t *testing.T) {
 
 func TestContextSetters(t *testing.T) {
 	m := requireModel(t)
-	ctx, err := NewContext(m, WithNCtx(512))
+	ctx, err := NewContext(m, WithContextSize(512))
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
 	defer ctx.Close()
 
-	ctx.SetNThreads(2, 2)
-	if ctx.NThreads() != 2 {
-		t.Errorf("NThreads = %d, want 2", ctx.NThreads())
+	ctx.SetThreads(2, 2)
+	if ctx.ThreadCount() != 2 {
+		t.Errorf("ThreadCount = %d, want 2", ctx.ThreadCount())
 	}
 
 	ctx.SetCausalAttn(true)
@@ -444,7 +444,7 @@ func TestContextSetters(t *testing.T) {
 
 func TestBatchGetOneAndDecode(t *testing.T) {
 	m := requireModel(t)
-	ctx, err := NewContext(m, WithNCtx(512), WithNBatch(512))
+	ctx, err := NewContext(m, WithContextSize(512), WithBatchSize(512))
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -461,12 +461,12 @@ func TestBatchGetOneAndDecode(t *testing.T) {
 		t.Fatalf("Decode: %v", err)
 	}
 
-	logits := ctx.GetLogitsIth(-1)
+	logits := ctx.LogitsAt(-1)
 	if logits == nil {
-		t.Fatal("GetLogitsIth returned nil")
+		t.Fatal("LogitsAt returned nil")
 	}
-	if len(logits) != v.NTokens() {
-		t.Fatalf("logits length = %d, want %d", len(logits), v.NTokens())
+	if len(logits) != v.TokenCount() {
+		t.Fatalf("logits length = %d, want %d", len(logits), v.TokenCount())
 	}
 	t.Logf("First 5 logits: %v", logits[:5])
 }
@@ -475,10 +475,10 @@ func TestBatchInit(t *testing.T) {
 	batch := BatchInit(512, 0, 1)
 	defer batch.Close()
 
-	if batch.NTokens() != 0 {
-		t.Fatalf("NTokens = %d, want 0", batch.NTokens())
+	if batch.TokenCount() != 0 {
+		t.Fatalf("TokenCount = %d, want 0", batch.TokenCount())
 	}
-	batch.SetNTokens(0)
+	batch.SetTokenCount(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -487,15 +487,15 @@ func TestBatchInit(t *testing.T) {
 
 func TestMemory(t *testing.T) {
 	m := requireModel(t)
-	ctx, err := NewContext(m, WithNCtx(512))
+	ctx, err := NewContext(m, WithContextSize(512))
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
 	defer ctx.Close()
 
-	mem := ctx.GetMemory()
+	mem := ctx.Memory()
 	if mem == nil {
-		t.Fatal("GetMemory returned nil")
+		t.Fatal("Memory returned nil")
 	}
 
 	t.Logf("CanShift: %v", mem.CanShift())
@@ -558,7 +558,7 @@ func TestSamplerChain(t *testing.T) {
 	t.Logf("Chain name: %s", name)
 
 	// Decode and sample.
-	ctx, err := NewContext(m, WithNCtx(512), WithNBatch(512))
+	ctx, err := NewContext(m, WithContextSize(512), WithBatchSize(512))
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -571,11 +571,11 @@ func TestSamplerChain(t *testing.T) {
 	}
 
 	token := chain.Sample(ctx, -1)
-	if token == TokenNull {
-		t.Fatal("Sample returned TokenNull")
+	if token == InvalidToken {
+		t.Fatal("Sample returned InvalidToken")
 	}
 
-	piece := v.TokenToPiece(token, false)
+	piece := v.TokenText(token, false)
 	t.Logf("Sampled token: %d (%q)", token, piece)
 }
 
@@ -587,7 +587,7 @@ func TestSamplerGreedy(t *testing.T) {
 	defer chain.Close()
 	chain.Add(NewGreedySampler())
 
-	ctx, err := NewContext(m, WithNCtx(512), WithNBatch(512))
+	ctx, err := NewContext(m, WithContextSize(512), WithBatchSize(512))
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -600,10 +600,10 @@ func TestSamplerGreedy(t *testing.T) {
 	}
 
 	token := chain.Sample(ctx, -1)
-	if token == TokenNull {
-		t.Fatal("Greedy sample returned TokenNull")
+	if token == InvalidToken {
+		t.Fatal("Greedy sample returned InvalidToken")
 	}
-	t.Logf("Greedy sampled: %d (%q)", token, v.TokenToPiece(token, false))
+	t.Logf("Greedy sampled: %d (%q)", token, v.TokenText(token, false))
 }
 
 func TestSamplerPenalties(t *testing.T) {
@@ -691,7 +691,7 @@ func TestLowLevelGenerate(t *testing.T) {
 	m := requireModel(t)
 	v := m.Vocab()
 
-	ctx, err := NewContext(m, WithNCtx(512), WithNBatch(512))
+	ctx, err := NewContext(m, WithContextSize(512), WithBatchSize(512))
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -745,7 +745,7 @@ func TestGreedyDeterminism(t *testing.T) {
 	v := m.Vocab()
 
 	generate := func() []Token {
-		ctx, err := NewContext(m, WithNCtx(512), WithNBatch(512))
+		ctx, err := NewContext(m, WithContextSize(512), WithBatchSize(512))
 		if err != nil {
 			t.Fatalf("NewContext: %v", err)
 		}
@@ -796,7 +796,7 @@ func TestGreedyDeterminism(t *testing.T) {
 
 func TestPerfContext(t *testing.T) {
 	m := requireModel(t)
-	ctx, err := NewContext(m, WithNCtx(512), WithNBatch(512))
+	ctx, err := NewContext(m, WithContextSize(512), WithBatchSize(512))
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -807,15 +807,15 @@ func TestPerfContext(t *testing.T) {
 	batch := BatchGetOne(tokens)
 	ctx.Decode(batch)
 
-	perf := ctx.PerfContext()
+	perf := ctx.Performance()
 	t.Logf("Perf: TStartMs=%.2f, TPEvalMs=%.2f, TEvalMs=%.2f, NPEval=%d, NEval=%d",
 		perf.TStartMs, perf.TPEvalMs, perf.TEvalMs, perf.NPEval, perf.NEval)
 
 	// Print should not crash.
-	ctx.PerfContextPrint()
+	ctx.PrintPerformance()
 
 	// Reset should not crash.
-	ctx.PerfContextReset()
+	ctx.ResetPerformance()
 }
 
 func TestPerfSampler(t *testing.T) {
@@ -823,11 +823,11 @@ func TestPerfSampler(t *testing.T) {
 	defer chain.Close()
 	chain.Add(NewGreedySampler())
 
-	perf := chain.PerfSampler()
+	perf := chain.Performance()
 	t.Logf("Sampler Perf: TSampleMs=%.2f, NSample=%d", perf.TSampleMs, perf.NSample)
 
-	chain.PerfSamplerPrint()
-	chain.PerfSamplerReset()
+	chain.PrintPerformance()
+	chain.ResetPerformance()
 }
 
 // ---------------------------------------------------------------------------
@@ -877,9 +877,9 @@ func TestSessionLifecycle(t *testing.T) {
 	}
 	defer s.Close()
 
-	vocabSize := s.GetVocabSize()
+	vocabSize := s.VocabSize()
 	if vocabSize <= 0 {
-		t.Fatalf("GetVocabSize = %d, want > 0", vocabSize)
+		t.Fatalf("VocabSize = %d, want > 0", vocabSize)
 	}
 	t.Logf("Session vocab size: %d", vocabSize)
 }
@@ -904,10 +904,10 @@ func TestSessionIngestDecodeAndSample(t *testing.T) {
 	}
 
 	token := s.Sample()
-	if token == TokenNull {
-		t.Fatal("Sample returned TokenNull")
+	if token == InvalidToken {
+		t.Fatal("Sample returned InvalidToken")
 	}
-	t.Logf("Sampled token: %d (%q)", token, v.TokenToPiece(token, false))
+	t.Logf("Sampled token: %d (%q)", token, v.TokenText(token, false))
 }
 
 func TestSessionMultiStep(t *testing.T) {
@@ -939,7 +939,7 @@ func TestSessionMultiStep(t *testing.T) {
 		if v.IsEOG(tok) {
 			break
 		}
-		piece := v.TokenToPiece(tok, false)
+		piece := v.TokenText(tok, false)
 		generated = append(generated, piece)
 		s.IngestTokens([]Token{tok}, true)
 	}
@@ -971,8 +971,8 @@ func TestSessionReset(t *testing.T) {
 	s.IngestTokens(tokens, true)
 	s.Decode()
 	tok := s.Sample()
-	if tok == TokenNull {
-		t.Fatal("Sample after reset returned TokenNull")
+	if tok == InvalidToken {
+		t.Fatal("Sample after reset returned InvalidToken")
 	}
 	t.Logf("Sample after reset: %d", tok)
 }
@@ -987,7 +987,7 @@ func TestSessionCloseIdempotent(t *testing.T) {
 	s.Close()
 }
 
-func TestSessionGetLogits(t *testing.T) {
+func TestSessionLogits(t *testing.T) {
 	m := requireModel(t)
 	v := m.Vocab()
 
@@ -1002,15 +1002,15 @@ func TestSessionGetLogits(t *testing.T) {
 	s.Decode()
 
 	// Get required size.
-	size := s.GetLogits(nil)
+	size := s.Logits(nil)
 	if size <= 0 {
-		t.Fatalf("GetLogits size = %d, want > 0", size)
+		t.Fatalf("Logits size = %d, want > 0", size)
 	}
 
 	logits := make([]float32, size)
-	n := s.GetLogits(logits)
+	n := s.Logits(logits)
 	if n != size {
-		t.Fatalf("GetLogits copied %d, want %d", n, size)
+		t.Fatalf("Logits copied %d, want %d", n, size)
 	}
 	t.Logf("Logits: size=%d, first 5: %v", n, logits[:5])
 }
@@ -1131,7 +1131,7 @@ func TestSessionStructuredDecoding(t *testing.T) {
 		if v.IsEOG(tok) {
 			break
 		}
-		piece := v.TokenToPiece(tok, false)
+		piece := v.TokenText(tok, false)
 		output = append(output, piece)
 		s.IngestTokens([]Token{tok}, true)
 	}
@@ -1152,7 +1152,7 @@ func TestStateSaveLoadMemory(t *testing.T) {
 	m := requireModel(t)
 	v := m.Vocab()
 
-	ctx, err := NewContext(m, WithNCtx(512), WithNBatch(512))
+	ctx, err := NewContext(m, WithContextSize(512), WithBatchSize(512))
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -1180,7 +1180,7 @@ func TestStateSaveLoadMemory(t *testing.T) {
 	gcCollect()
 
 	// Restore state into a fresh context.
-	ctx2, err := NewContext(m, WithNCtx(512), WithNBatch(512))
+	ctx2, err := NewContext(m, WithContextSize(512), WithBatchSize(512))
 	if err != nil {
 		t.Fatalf("NewContext for restore: %v", err)
 	}
@@ -1201,7 +1201,7 @@ func TestStateSaveLoadFile(t *testing.T) {
 	m := requireModel(t)
 	v := m.Vocab()
 
-	ctx, err := NewContext(m, WithNCtx(512), WithNBatch(512))
+	ctx, err := NewContext(m, WithContextSize(512), WithBatchSize(512))
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -1221,7 +1221,7 @@ func TestStateSaveLoadFile(t *testing.T) {
 	gcCollect()
 
 	// Load into fresh context.
-	ctx2, err := NewContext(m, WithNCtx(512), WithNBatch(512))
+	ctx2, err := NewContext(m, WithContextSize(512), WithBatchSize(512))
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -1398,11 +1398,11 @@ func TestConcurrentModelReads(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = m.NEmbd()
-			_ = m.NLayer()
-			_ = m.Desc()
+			_ = m.EmbeddingSize()
+			_ = m.LayerCount()
+			_ = m.Description()
 			_ = m.Size()
-			_ = m.NParams()
+			_ = m.ParameterCount()
 		}()
 	}
 	wg.Wait()
@@ -1417,7 +1417,7 @@ func TestConcurrentVocabReads(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = v.NTokens()
+			_ = v.TokenCount()
 			_ = v.BOS()
 			_ = v.EOS()
 			v.Tokenize("Hello concurrent", false, false)
@@ -1501,7 +1501,7 @@ func TestMirostatSampler(t *testing.T) {
 	m := requireModel(t)
 	v := m.Vocab()
 
-	s := NewMirostatSampler(v.NTokens(), 42, 5.0, 0.1, 100)
+	s := NewMirostatSampler(v.TokenCount(), 42, 5.0, 0.1, 100)
 	if s == nil {
 		t.Fatal("NewMirostatSampler returned nil")
 	}
@@ -1530,7 +1530,7 @@ func TestLogitBiasSampler(t *testing.T) {
 		{Token: v.BOS(), Bias: -100.0},
 		{Token: v.EOS(), Bias: -100.0},
 	}
-	s := NewLogitBiasSampler(v.NTokens(), biases)
+	s := NewLogitBiasSampler(v.TokenCount(), biases)
 	if s == nil {
 		t.Fatal("NewLogitBiasSampler returned nil")
 	}
@@ -1554,7 +1554,7 @@ func TestDRYSampler(t *testing.T) {
 	m := requireModel(t)
 	v := m.Vocab()
 
-	s := NewDRYSampler(v, m.NCtxTrain(), 0.8, 1.75, 2, 64, []string{"\n", ".", ",", "!", "?"})
+	s := NewDRYSampler(v, m.TrainingContextSize(), 0.8, 1.75, 2, 64, []string{"\n", ".", ",", "!", "?"})
 	if s == nil {
 		t.Fatal("NewDRYSampler returned nil")
 	}
@@ -1600,7 +1600,7 @@ func TestJSONSchemaToGrammar(t *testing.T) {
 
 func TestMemoryBreakdownPrint(t *testing.T) {
 	m := requireModel(t)
-	ctx, err := NewContext(m, WithNCtx(512))
+	ctx, err := NewContext(m, WithContextSize(512))
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -1616,7 +1616,7 @@ func TestMemoryBreakdownPrint(t *testing.T) {
 
 func TestContextModel(t *testing.T) {
 	m := requireModel(t)
-	ctx, err := NewContext(m, WithNCtx(512))
+	ctx, err := NewContext(m, WithContextSize(512))
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}

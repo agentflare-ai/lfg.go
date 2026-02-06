@@ -1,11 +1,7 @@
 package lfg
 
 /*
-typedef struct lfm_model lfm_model;
-typedef struct lfm_context lfm_context;
-typedef struct lfm_vocab lfm_vocab;
-typedef struct lfm_sampler lfm_sampler;
-#include "lfm_api.h"
+#include "lfg_api.h"
 #include <stdlib.h>
 */
 import "C"
@@ -15,7 +11,7 @@ import (
 	"unsafe"
 )
 
-// SamplingConfig mirrors lfm_sampling_config.
+// SamplingConfig mirrors lfg_sampling_config.
 type SamplingConfig struct {
 	Seed           uint32
 	NPrev          int32
@@ -33,19 +29,20 @@ type SamplingConfig struct {
 	MirostatEta    float32
 }
 
-// SessionConfig mirrors lfm_session_config.
+// SessionConfig mirrors lfg_session_config.
 type SessionConfig struct {
 	NThreads                int
 	NCtx                    int
 	NBatch                  int
 	EnableHealing           bool
 	StructuredCheckpointing bool
+	ReasoningBudget         int // 0 = disabled. Max tokens allowed for reasoning.
 	Sampling                SamplingConfig
 }
 
 // DefaultSamplingConfig returns the default sampling configuration.
 func DefaultSamplingConfig() SamplingConfig {
-	c := C.lfm_sampling_default_config()
+	c := C.lfg_sampling_default_config()
 	return SamplingConfig{
 		Seed:           uint32(c.seed),
 		NPrev:          int32(c.n_prev),
@@ -66,18 +63,19 @@ func DefaultSamplingConfig() SamplingConfig {
 
 // DefaultSessionConfig returns the default session configuration.
 func DefaultSessionConfig() SessionConfig {
-	c := C.lfm_session_default_config()
+	c := C.lfg_session_default_config()
 	return SessionConfig{
 		NThreads:                int(c.n_threads),
 		NCtx:                    int(c.n_ctx),
 		NBatch:                  int(c.n_batch),
 		EnableHealing:           bool(c.enable_healing),
 		StructuredCheckpointing: bool(c.structured_checkpointing),
+		ReasoningBudget:         int(c.reasoning_budget),
 		Sampling:                samplingConfigFromC(c.sampling),
 	}
 }
 
-func samplingConfigFromC(c C.lfm_sampling_config) SamplingConfig {
+func samplingConfigFromC(c C.lfg_sampling_config) SamplingConfig {
 	return SamplingConfig{
 		Seed:           uint32(c.seed),
 		NPrev:          int32(c.n_prev),
@@ -96,8 +94,8 @@ func samplingConfigFromC(c C.lfm_sampling_config) SamplingConfig {
 	}
 }
 
-func (sc *SamplingConfig) toC() C.lfm_sampling_config {
-	return C.lfm_sampling_config{
+func (sc *SamplingConfig) toC() C.lfg_sampling_config {
+	return C.lfg_sampling_config{
 		seed:            C.uint32_t(sc.Seed),
 		n_prev:          C.int32_t(sc.NPrev),
 		top_k:           C.int32_t(sc.TopK),
@@ -115,13 +113,14 @@ func (sc *SamplingConfig) toC() C.lfm_sampling_config {
 	}
 }
 
-func (cfg *SessionConfig) toC() C.lfm_session_config {
-	return C.lfm_session_config{
+func (cfg *SessionConfig) toC() C.lfg_session_config {
+	return C.lfg_session_config{
 		n_threads:                C.int(cfg.NThreads),
 		n_ctx:                    C.int(cfg.NCtx),
 		n_batch:                  C.int(cfg.NBatch),
 		enable_healing:           C.bool(cfg.EnableHealing),
 		structured_checkpointing: C.bool(cfg.StructuredCheckpointing),
+		reasoning_budget:         C.int(cfg.ReasoningBudget),
 		sampling:                 cfg.Sampling.toC(),
 	}
 }
@@ -164,6 +163,15 @@ func WithSessionStructuredCheckpointing(v bool) SessionOption {
 	}
 }
 
+// WithSessionReasoningBudget sets the maximum number of tokens allowed for reasoning.
+// 0 disables the budget (default). When set, the model will be forced to end reasoning
+// after this many tokens, and a soft bias is applied starting at 80% usage.
+func WithSessionReasoningBudget(n int) SessionOption {
+	return func(cfg *SessionConfig) {
+		cfg.ReasoningBudget = n
+	}
+}
+
 // WithSessionSampling sets the sampling configuration.
 func WithSessionSampling(sc SamplingConfig) SessionOption {
 	return func(cfg *SessionConfig) {
@@ -171,10 +179,10 @@ func WithSessionSampling(sc SamplingConfig) SessionOption {
 	}
 }
 
-// Session wraps the high-level lfm_session API.
+// Session wraps the high-level lfg_session API.
 type Session struct {
 	mu    sync.Mutex
-	c     *C.lfm_session
+	c     *C.lfg_session
 	model *Model // prevent GC
 }
 
@@ -194,7 +202,7 @@ func NewSession(model *Model, opts ...SessionOption) (*Session, error) {
 	}
 	cCfg := cfg.toC()
 
-	cs := C.lfm_session_create(model.c, &cCfg)
+	cs := C.lfg_session_create(model.c, &cCfg)
 	model.mu.RUnlock()
 
 	if cs == nil {
@@ -214,7 +222,7 @@ func (s *Session) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c != nil {
-		C.lfm_session_free(s.c)
+		C.lfg_session_free(s.c)
 		s.c = nil
 		runtime.SetFinalizer(s, nil)
 	}
@@ -228,7 +236,7 @@ func (s *Session) Reset() {
 	if s.c == nil {
 		return
 	}
-	C.lfm_session_reset(s.c)
+	C.lfg_session_reset(s.c)
 }
 
 // ConfigureStructured sets up structured decoding with a grammar or JSON schema.
@@ -249,7 +257,7 @@ func (s *Session) ConfigureStructured(grammarOrSchema, rootRule string) error {
 		defer C.free(unsafe.Pointer(cRoot))
 	}
 
-	ok := C.lfm_session_configure_structured(s.c, cGrammar, cRoot)
+	ok := C.lfg_session_configure_structured(s.c, cGrammar, cRoot)
 	if !bool(ok) {
 		if err := getLastError(); err != nil {
 			return err
@@ -257,6 +265,28 @@ func (s *Session) ConfigureStructured(grammarOrSchema, rootRule string) error {
 		return &Error{Code: ErrorInternal, Message: "failed to configure structured decoding"}
 	}
 	return nil
+}
+
+// ConfigureReasoning configures tokens that delimit a reasoning/thinking block.
+// Structured constraints are suspended while inside these blocks.
+func (s *Session) ConfigureReasoning(startTokens, endTokens []Token) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return
+	}
+
+	var startPtr, endPtr *C.lfg_token
+	if len(startTokens) > 0 {
+		startPtr = (*C.lfg_token)(unsafe.Pointer(&startTokens[0]))
+	}
+	if len(endTokens) > 0 {
+		endPtr = (*C.lfg_token)(unsafe.Pointer(&endTokens[0]))
+	}
+
+	C.lfg_session_configure_reasoning(s.c,
+		startPtr, C.size_t(len(startTokens)),
+		endPtr, C.size_t(len(endTokens)))
 }
 
 // IngestTokens feeds tokens into the session.
@@ -271,7 +301,7 @@ func (s *Session) IngestTokens(tokens []Token, updateSampler bool) error {
 		return nil
 	}
 
-	ok := C.lfm_session_ingest_tokens(s.c, (*C.lfm_token)(&tokens[0]), C.size_t(len(tokens)), C.bool(updateSampler))
+	ok := C.lfg_session_ingest_tokens(s.c, (*C.lfg_token)(unsafe.Pointer(&tokens[0])), C.size_t(len(tokens)), C.bool(updateSampler))
 	if !bool(ok) {
 		if err := getLastError(); err != nil {
 			return err
@@ -289,7 +319,7 @@ func (s *Session) Decode() error {
 		return &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
-	ok := C.lfm_session_decode(s.c)
+	ok := C.lfg_session_decode(s.c)
 	if !bool(ok) {
 		if err := getLastError(); err != nil {
 			return err
@@ -304,20 +334,20 @@ func (s *Session) Sample() Token {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == nil {
-		return TokenNull
+		return InvalidToken
 	}
-	return Token(C.lfm_session_sample(s.c))
+	return Token(C.lfg_session_sample(s.c))
 }
 
-// HealLastToken performs token healing on the last token.
-func (s *Session) HealLastToken() error {
+// HealToken performs token healing on the last token.
+func (s *Session) HealToken() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == nil {
 		return &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
-	ok := C.lfm_session_heal_last_token(s.c)
+	ok := C.lfg_session_heal_last_token(s.c)
 	if !bool(ok) {
 		if err := getLastError(); err != nil {
 			return err
@@ -327,33 +357,57 @@ func (s *Session) HealLastToken() error {
 	return nil
 }
 
-// GetLogits copies logits from the session into the provided buffer.
+// Logits copies logits from the session into the provided buffer.
 // If out is nil, returns the required buffer size.
-func (s *Session) GetLogits(out []float32) int {
+func (s *Session) Logits(out []float32) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == nil {
 		return 0
 	}
 	if len(out) == 0 {
-		return int(C.lfm_session_get_logits(s.c, nil, 0))
+		return int(C.lfg_session_get_logits(s.c, nil, 0))
 	}
-	return int(C.lfm_session_get_logits(s.c, (*C.float)(unsafe.Pointer(&out[0])), C.int32_t(len(out))))
+	return int(C.lfg_session_get_logits(s.c, (*C.float)(unsafe.Pointer(&out[0])), C.int32_t(len(out))))
 }
 
-// GetVocabSize returns the vocabulary size for this session.
-func (s *Session) GetVocabSize() int {
+// VocabSize returns the vocabulary size for this session.
+func (s *Session) VocabSize() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == nil {
 		return 0
 	}
-	return int(C.lfm_session_get_vocab_size(s.c))
+	return int(C.lfg_session_get_vocab_size(s.c))
 }
 
-// Checkpoint wraps an lfm_checkpoint.
+// ModelStats holds statistics about a loaded model.
+type ModelStats struct {
+	ParameterCount uint64
+	SizeBytes      uint64
+	VocabSize      int32
+	ContextSize    int32
+}
+
+// Stats returns model statistics using the convenience API.
+func (m *Model) Stats() ModelStats {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.c == nil {
+		return ModelStats{}
+	}
+	cs := C.lfg_model_get_stats(m.c)
+	return ModelStats{
+		ParameterCount: uint64(cs.n_params),
+		SizeBytes:      uint64(cs.size_bytes),
+		VocabSize:      int32(cs.n_vocab),
+		ContextSize:    int32(cs.n_ctx_train),
+	}
+}
+
+// Checkpoint wraps an lfg_checkpoint.
 type Checkpoint struct {
-	c       *C.lfm_checkpoint
+	c       *C.lfg_checkpoint
 	session *Session // prevent GC
 }
 
@@ -364,7 +418,7 @@ func (s *Session) CreateCheckpoint() *Checkpoint {
 	if s.c == nil {
 		return nil
 	}
-	cp := C.lfm_session_create_checkpoint(s.c)
+	cp := C.lfg_session_create_checkpoint(s.c)
 	if cp == nil {
 		return nil
 	}
@@ -376,7 +430,7 @@ func (s *Session) CreateCheckpoint() *Checkpoint {
 // Close frees the checkpoint. Safe to call multiple times.
 func (cp *Checkpoint) Close() {
 	if cp.c != nil {
-		C.lfm_checkpoint_free(cp.c)
+		C.lfg_checkpoint_free(cp.c)
 		cp.c = nil
 		runtime.SetFinalizer(cp, nil)
 	}
@@ -390,7 +444,7 @@ type CheckpointRestoreOptions struct {
 
 // DefaultCheckpointRestoreOptions returns the default restore options.
 func DefaultCheckpointRestoreOptions() CheckpointRestoreOptions {
-	c := C.lfm_checkpoint_restore_default_options()
+	c := C.lfg_checkpoint_restore_default_options()
 	return CheckpointRestoreOptions{
 		RestoreSamplerState: bool(c.restore_sampler_state),
 		RestoreGrammar:      bool(c.restore_grammar),
@@ -408,7 +462,7 @@ func (s *Session) RestoreCheckpoint(cp *Checkpoint) error {
 		return &Error{Code: ErrorInvalidArgument, Message: "checkpoint is nil"}
 	}
 
-	ok := C.lfm_session_restore_checkpoint(s.c, cp.c)
+	ok := C.lfg_session_restore_checkpoint(s.c, cp.c)
 	if !bool(ok) {
 		if err := getLastError(); err != nil {
 			return err
@@ -429,12 +483,12 @@ func (s *Session) RestoreCheckpointEx(cp *Checkpoint, opts CheckpointRestoreOpti
 		return &Error{Code: ErrorInvalidArgument, Message: "checkpoint is nil"}
 	}
 
-	cOpts := C.lfm_checkpoint_restore_options{
+	cOpts := C.lfg_checkpoint_restore_options{
 		restore_sampler_state: C.bool(opts.RestoreSamplerState),
 		restore_grammar:       C.bool(opts.RestoreGrammar),
 	}
 
-	ok := C.lfm_session_restore_checkpoint_ex(s.c, cp.c, &cOpts)
+	ok := C.lfg_session_restore_checkpoint_ex(s.c, cp.c, &cOpts)
 	if !bool(ok) {
 		if err := getLastError(); err != nil {
 			return err
@@ -451,7 +505,7 @@ func JSONSchemaToGrammar(jsonSchema string, forceGBNF bool) (string, error) {
 	defer C.free(unsafe.Pointer(cSchema))
 
 	// First pass: get required size.
-	n := C.lfm_json_schema_to_grammar(cSchema, C.bool(forceGBNF), nil, 0)
+	n := C.lfg_json_schema_to_grammar(cSchema, C.bool(forceGBNF), nil, 0)
 	if n < 0 {
 		if err := getLastError(); err != nil {
 			return "", err
@@ -463,7 +517,7 @@ func JSONSchemaToGrammar(jsonSchema string, forceGBNF bool) (string, error) {
 	}
 
 	buf := make([]byte, int(n)+1)
-	n = C.lfm_json_schema_to_grammar(cSchema, C.bool(forceGBNF), (*C.char)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
+	n = C.lfg_json_schema_to_grammar(cSchema, C.bool(forceGBNF), (*C.char)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
 	if n < 0 {
 		if err := getLastError(); err != nil {
 			return "", err

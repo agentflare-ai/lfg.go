@@ -1,11 +1,7 @@
 package lfg
 
 /*
-typedef struct lfm_model lfm_model;
-typedef struct lfm_context lfm_context;
-typedef struct lfm_vocab lfm_vocab;
-typedef struct lfm_sampler lfm_sampler;
-#include "lfm_inference.h"
+#include "lfg_inference.h"
 #include <stdlib.h>
 */
 import "C"
@@ -21,7 +17,7 @@ type ChatMessage struct {
 // If tmpl is empty, the model's default template is used (requires a model).
 // If addAssistant is true, the output ends with the assistant prompt prefix.
 func ApplyChatTemplate(tmpl string, messages []ChatMessage, addAssistant bool) (string, error) {
-	cMessages := make([]C.struct_lfm_chat_message, len(messages))
+	cMessages := make([]C.struct_lfg_chat_message, len(messages))
 	cStrings := make([]*C.char, 0, len(messages)*2)
 	defer func() {
 		for _, s := range cStrings {
@@ -43,19 +39,19 @@ func ApplyChatTemplate(tmpl string, messages []ChatMessage, addAssistant bool) (
 		defer C.free(unsafe.Pointer(cTmpl))
 	}
 
-	var msgPtr *C.struct_lfm_chat_message
+	var msgPtr *C.struct_lfg_chat_message
 	if len(cMessages) > 0 {
 		msgPtr = &cMessages[0]
 	}
 
 	// First pass: determine required size.
-	n := C.lfm_chat_apply_template(cTmpl, msgPtr, C.size_t(len(messages)), C.bool(addAssistant), nil, 0)
+	n := C.lfg_chat_apply_template(cTmpl, msgPtr, C.size_t(len(messages)), C.bool(addAssistant), nil, 0)
 	if n <= 0 {
 		return "", &Error{Code: ErrorInternal, Message: "failed to apply chat template"}
 	}
 
 	buf := make([]byte, int(n)+1) // +1 for null terminator space
-	n = C.lfm_chat_apply_template(cTmpl, msgPtr, C.size_t(len(messages)), C.bool(addAssistant), (*C.char)(unsafe.Pointer(&buf[0])), C.int32_t(len(buf)))
+	n = C.lfg_chat_apply_template(cTmpl, msgPtr, C.size_t(len(messages)), C.bool(addAssistant), (*C.char)(unsafe.Pointer(&buf[0])), C.int32_t(len(buf)))
 	if n <= 0 {
 		return "", &Error{Code: ErrorInternal, Message: "failed to apply chat template"}
 	}
@@ -66,7 +62,7 @@ func ApplyChatTemplate(tmpl string, messages []ChatMessage, addAssistant bool) (
 func ChatBuiltinTemplates() []string {
 	// Get count first with a small buffer.
 	var buf [64]*C.char
-	n := C.lfm_chat_builtin_templates(&buf[0], 64)
+	n := C.lfg_chat_builtin_templates(&buf[0], 64)
 	if n <= 0 {
 		return nil
 	}

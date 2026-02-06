@@ -1,11 +1,7 @@
 package lfg
 
 /*
-typedef struct lfm_model lfm_model;
-typedef struct lfm_context lfm_context;
-typedef struct lfm_vocab lfm_vocab;
-typedef struct lfm_sampler lfm_sampler;
-#include "lfm_inference.h"
+#include "lfg_inference.h"
 #include <stdlib.h>
 */
 import "C"
@@ -15,93 +11,126 @@ import (
 	"unsafe"
 )
 
+// ModelConfig holds Go-native model loading parameters.
+type ModelConfig struct {
+	GPULayers    int
+	SplitMode    SplitMode
+	MainGPU      int
+	VocabOnly    bool
+	Mmap         bool
+	Mlock        bool
+	CheckTensors bool
+	Progress     ProgressCallback
+}
+
 // ModelOption configures model loading parameters.
-type ModelOption func(*C.struct_lfm_model_params)
+type ModelOption func(*ModelConfig)
 
 // WithGPULayers sets the number of layers to offload to GPU.
 // A negative value offloads all layers.
 func WithGPULayers(n int) ModelOption {
-	return func(p *C.struct_lfm_model_params) {
-		p.n_gpu_layers = C.int32_t(n)
+	return func(cfg *ModelConfig) {
+		cfg.GPULayers = n
 	}
 }
 
 // WithSplitMode sets how the model is split across GPUs.
 func WithSplitMode(mode SplitMode) ModelOption {
-	return func(p *C.struct_lfm_model_params) {
-		p.split_mode = C.enum_lfm_split_mode(mode)
+	return func(cfg *ModelConfig) {
+		cfg.SplitMode = mode
 	}
 }
 
 // WithMainGPU sets the main GPU index for single-GPU mode.
 func WithMainGPU(gpu int) ModelOption {
-	return func(p *C.struct_lfm_model_params) {
-		p.main_gpu = C.int32_t(gpu)
+	return func(cfg *ModelConfig) {
+		cfg.MainGPU = gpu
 	}
 }
 
 // WithVocabOnly loads only the vocabulary, no weights.
 func WithVocabOnly(v bool) ModelOption {
-	return func(p *C.struct_lfm_model_params) {
-		p.vocab_only = C.bool(v)
+	return func(cfg *ModelConfig) {
+		cfg.VocabOnly = v
 	}
 }
 
 // WithMmap enables or disables memory-mapped file loading.
 func WithMmap(v bool) ModelOption {
-	return func(p *C.struct_lfm_model_params) {
-		p.use_mmap = C.bool(v)
+	return func(cfg *ModelConfig) {
+		cfg.Mmap = v
 	}
 }
 
 // WithMlock forces the system to keep the model in RAM.
 func WithMlock(v bool) ModelOption {
-	return func(p *C.struct_lfm_model_params) {
-		p.use_mlock = C.bool(v)
+	return func(cfg *ModelConfig) {
+		cfg.Mlock = v
 	}
 }
 
 // WithCheckTensors enables validation of model tensor data.
 func WithCheckTensors(v bool) ModelOption {
-	return func(p *C.struct_lfm_model_params) {
-		p.check_tensors = C.bool(v)
+	return func(cfg *ModelConfig) {
+		cfg.CheckTensors = v
 	}
 }
 
 // WithProgressCallback sets a callback for model loading progress.
 func WithProgressCallback(cb ProgressCallback) ModelOption {
-	return func(p *C.struct_lfm_model_params) {
-		id := registerProgressCallback(cb)
-		idPtr := new(uintptr)
-		*idPtr = id
-		p.progress_callback = getProgressTrampoline()
-		p.progress_callback_user_data = unsafe.Pointer(idPtr)
+	return func(cfg *ModelConfig) {
+		cfg.Progress = cb
 	}
 }
 
-// Model wraps an lfm_model pointer with thread-safe access.
+// Model wraps an lfg_model pointer with thread-safe access.
 type Model struct {
 	mu sync.RWMutex
-	c  *C.struct_lfm_model
+	c  *C.struct_lfg_model
 }
 
 // LoadModel loads a model from a GGUF file. Automatically initializes the backend.
 func LoadModel(path string, opts ...ModelOption) (*Model, error) {
 	ensureBackend()
 
-	params := C.lfm_model_default_params()
-	var cbIDPtr *uintptr
-	for _, opt := range opts {
-		opt(&params)
+	// Build Go config from defaults + options.
+	defaults := C.lfg_model_default_params()
+	cfg := ModelConfig{
+		GPULayers: int(defaults.n_gpu_layers),
+		SplitMode: SplitMode(defaults.split_mode),
+		MainGPU:   int(defaults.main_gpu),
+		VocabOnly: bool(defaults.vocab_only),
+		Mmap:      bool(defaults.use_mmap),
+		Mlock:     bool(defaults.use_mlock),
+		CheckTensors: bool(defaults.check_tensors),
 	}
-	if params.progress_callback_user_data != nil {
-		cbIDPtr = (*uintptr)(params.progress_callback_user_data)
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	// Convert to C params.
+	params := defaults
+	params.n_gpu_layers = C.int32_t(cfg.GPULayers)
+	params.split_mode = C.enum_lfg_split_mode(cfg.SplitMode)
+	params.main_gpu = C.int32_t(cfg.MainGPU)
+	params.vocab_only = C.bool(cfg.VocabOnly)
+	params.use_mmap = C.bool(cfg.Mmap)
+	params.use_mlock = C.bool(cfg.Mlock)
+	params.check_tensors = C.bool(cfg.CheckTensors)
+
+	var cbIDPtr *uintptr
+	if cfg.Progress != nil {
+		id := registerProgressCallback(cfg.Progress)
+		cbIDPtr = new(uintptr)
+		*cbIDPtr = id
+		params.progress_callback = getProgressTrampoline()
+		params.progress_callback_user_data = unsafe.Pointer(cbIDPtr)
 	}
 
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
-	cModel := C.lfm_model_load_from_file(cPath, params)
+	cModel := C.lfg_model_load_from_file(cPath, params)
 	if cbIDPtr != nil {
 		unregisterProgressCallback(*cbIDPtr)
 	}
@@ -122,7 +151,7 @@ func (m *Model) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.c != nil {
-		C.lfm_model_free(m.c)
+		C.lfg_model_free(m.c)
 		m.c = nil
 		runtime.SetFinalizer(m, nil)
 	}
@@ -136,88 +165,88 @@ func (m *Model) Vocab() *Vocab {
 	if m.c == nil {
 		return nil
 	}
-	cv := C.lfm_model_get_vocab(m.c)
+	cv := C.lfg_model_get_vocab(m.c)
 	return &Vocab{c: cv, model: m}
 }
 
-// NCtxTrain returns the context size the model was trained with.
-func (m *Model) NCtxTrain() int {
+// TrainingContextSize returns the context size the model was trained with.
+func (m *Model) TrainingContextSize() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
 		return 0
 	}
-	return int(C.lfm_model_n_ctx_train(m.c))
+	return int(C.lfg_model_n_ctx_train(m.c))
 }
 
-// NEmbd returns the embedding dimension.
-func (m *Model) NEmbd() int {
+// EmbeddingSize returns the embedding dimension.
+func (m *Model) EmbeddingSize() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
 		return 0
 	}
-	return int(C.lfm_model_n_embd(m.c))
+	return int(C.lfg_model_n_embd(m.c))
 }
 
-// NEmbdInp returns the input embedding dimension.
-func (m *Model) NEmbdInp() int {
+// InputEmbeddingSize returns the input embedding dimension.
+func (m *Model) InputEmbeddingSize() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
 		return 0
 	}
-	return int(C.lfm_model_n_embd_inp(m.c))
+	return int(C.lfg_model_n_embd_inp(m.c))
 }
 
-// NEmbdOut returns the output embedding dimension.
-func (m *Model) NEmbdOut() int {
+// OutputEmbeddingSize returns the output embedding dimension.
+func (m *Model) OutputEmbeddingSize() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
 		return 0
 	}
-	return int(C.lfm_model_n_embd_out(m.c))
+	return int(C.lfg_model_n_embd_out(m.c))
 }
 
-// NLayer returns the number of layers.
-func (m *Model) NLayer() int {
+// LayerCount returns the number of layers.
+func (m *Model) LayerCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
 		return 0
 	}
-	return int(C.lfm_model_n_layer(m.c))
+	return int(C.lfg_model_n_layer(m.c))
 }
 
-// NHead returns the number of attention heads.
-func (m *Model) NHead() int {
+// HeadCount returns the number of attention heads.
+func (m *Model) HeadCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
 		return 0
 	}
-	return int(C.lfm_model_n_head(m.c))
+	return int(C.lfg_model_n_head(m.c))
 }
 
-// NHeadKV returns the number of key/value attention heads.
-func (m *Model) NHeadKV() int {
+// KVHeadCount returns the number of key/value attention heads.
+func (m *Model) KVHeadCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
 		return 0
 	}
-	return int(C.lfm_model_n_head_kv(m.c))
+	return int(C.lfg_model_n_head_kv(m.c))
 }
 
-// NSWA returns the sliding window attention size.
-func (m *Model) NSWA() int {
+// SlidingWindowSize returns the sliding window attention size.
+func (m *Model) SlidingWindowSize() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
 		return 0
 	}
-	return int(C.lfm_model_n_swa(m.c))
+	return int(C.lfg_model_n_swa(m.c))
 }
 
 // RopeFreqScaleTrain returns the RoPE frequency scaling factor from training.
@@ -227,7 +256,7 @@ func (m *Model) RopeFreqScaleTrain() float32 {
 	if m.c == nil {
 		return 0
 	}
-	return float32(C.lfm_model_rope_freq_scale_train(m.c))
+	return float32(C.lfg_model_rope_freq_scale_train(m.c))
 }
 
 // RopeType returns the RoPE type used by the model.
@@ -237,7 +266,7 @@ func (m *Model) RopeType() RopeType {
 	if m.c == nil {
 		return RopeTypeNone
 	}
-	return RopeType(C.lfm_model_rope_type(m.c))
+	return RopeType(C.lfg_model_rope_type(m.c))
 }
 
 // Size returns the total size of all tensors in bytes.
@@ -247,28 +276,28 @@ func (m *Model) Size() uint64 {
 	if m.c == nil {
 		return 0
 	}
-	return uint64(C.lfm_model_size(m.c))
+	return uint64(C.lfg_model_size(m.c))
 }
 
-// NParams returns the total number of model parameters.
-func (m *Model) NParams() uint64 {
+// ParameterCount returns the total number of model parameters.
+func (m *Model) ParameterCount() uint64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
 		return 0
 	}
-	return uint64(C.lfm_model_n_params(m.c))
+	return uint64(C.lfg_model_n_params(m.c))
 }
 
-// Desc returns a string describing the model type.
-func (m *Model) Desc() string {
+// Description returns a string describing the model type.
+func (m *Model) Description() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
 		return ""
 	}
 	var buf [256]C.char
-	n := C.lfm_model_desc(m.c, &buf[0], 256)
+	n := C.lfg_model_desc(m.c, &buf[0], 256)
 	if n < 0 {
 		return ""
 	}
@@ -282,7 +311,7 @@ func (m *Model) HasEncoder() bool {
 	if m.c == nil {
 		return false
 	}
-	return bool(C.lfm_model_has_encoder(m.c))
+	return bool(C.lfg_model_has_encoder(m.c))
 }
 
 // HasDecoder returns true if the model contains a decoder.
@@ -292,18 +321,18 @@ func (m *Model) HasDecoder() bool {
 	if m.c == nil {
 		return false
 	}
-	return bool(C.lfm_model_has_decoder(m.c))
+	return bool(C.lfg_model_has_decoder(m.c))
 }
 
 // DecoderStartToken returns the token that starts decoder generation.
-// Returns TokenNull for non-encoder-decoder models.
+// Returns InvalidToken for non-encoder-decoder models.
 func (m *Model) DecoderStartToken() Token {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
-		return TokenNull
+		return InvalidToken
 	}
-	return Token(C.lfm_model_decoder_start_token(m.c))
+	return Token(C.lfg_model_decoder_start_token(m.c))
 }
 
 // IsRecurrent returns true if the model is recurrent (e.g., Mamba, RWKV).
@@ -313,7 +342,7 @@ func (m *Model) IsRecurrent() bool {
 	if m.c == nil {
 		return false
 	}
-	return bool(C.lfm_model_is_recurrent(m.c))
+	return bool(C.lfg_model_is_recurrent(m.c))
 }
 
 // IsHybrid returns true if the model is a hybrid architecture.
@@ -323,7 +352,7 @@ func (m *Model) IsHybrid() bool {
 	if m.c == nil {
 		return false
 	}
-	return bool(C.lfm_model_is_hybrid(m.c))
+	return bool(C.lfg_model_is_hybrid(m.c))
 }
 
 // IsDiffusion returns true if the model is diffusion-based.
@@ -333,11 +362,11 @@ func (m *Model) IsDiffusion() bool {
 	if m.c == nil {
 		return false
 	}
-	return bool(C.lfm_model_is_diffusion(m.c))
+	return bool(C.lfg_model_is_diffusion(m.c))
 }
 
-// MetaValStr returns a metadata value by key name.
-func (m *Model) MetaValStr(key string) (string, bool) {
+// Metadata returns a metadata value by key name.
+func (m *Model) Metadata(key string) (string, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
@@ -347,47 +376,47 @@ func (m *Model) MetaValStr(key string) (string, bool) {
 	defer C.free(unsafe.Pointer(cKey))
 
 	var buf [512]C.char
-	n := C.lfm_model_meta_val_str(m.c, cKey, &buf[0], 512)
+	n := C.lfg_model_meta_val_str(m.c, cKey, &buf[0], 512)
 	if n < 0 {
 		return "", false
 	}
 	return C.GoStringN(&buf[0], n), true
 }
 
-// MetaCount returns the number of metadata key/value pairs.
-func (m *Model) MetaCount() int {
+// MetadataCount returns the number of metadata key/value pairs.
+func (m *Model) MetadataCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
 		return 0
 	}
-	return int(C.lfm_model_meta_count(m.c))
+	return int(C.lfg_model_meta_count(m.c))
 }
 
-// MetaKeyByIndex returns the metadata key at the given index.
-func (m *Model) MetaKeyByIndex(i int) (string, bool) {
+// MetadataKeyAt returns the metadata key at the given index.
+func (m *Model) MetadataKeyAt(i int) (string, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
 		return "", false
 	}
 	var buf [256]C.char
-	n := C.lfm_model_meta_key_by_index(m.c, C.int32_t(i), &buf[0], 256)
+	n := C.lfg_model_meta_key_by_index(m.c, C.int32_t(i), &buf[0], 256)
 	if n < 0 {
 		return "", false
 	}
 	return C.GoStringN(&buf[0], n), true
 }
 
-// MetaValStrByIndex returns the metadata value at the given index.
-func (m *Model) MetaValStrByIndex(i int) (string, bool) {
+// MetadataValueAt returns the metadata value at the given index.
+func (m *Model) MetadataValueAt(i int) (string, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
 		return "", false
 	}
 	var buf [512]C.char
-	n := C.lfm_model_meta_val_str_by_index(m.c, C.int32_t(i), &buf[0], 512)
+	n := C.lfg_model_meta_val_str_by_index(m.c, C.int32_t(i), &buf[0], 512)
 	if n < 0 {
 		return "", false
 	}
@@ -407,31 +436,31 @@ func (m *Model) ChatTemplate(name string) (string, bool) {
 		cName = C.CString(name)
 		defer C.free(unsafe.Pointer(cName))
 	}
-	result := C.lfm_model_chat_template(m.c, cName)
+	result := C.lfg_model_chat_template(m.c, cName)
 	if result == nil {
 		return "", false
 	}
 	return C.GoString(result), true
 }
 
-// NClsOut returns the number of classifier outputs (only for classifier models).
-func (m *Model) NClsOut() uint32 {
+// ClassifierOutputCount returns the number of classifier outputs (only for classifier models).
+func (m *Model) ClassifierOutputCount() uint32 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
 		return 0
 	}
-	return uint32(C.lfm_model_n_cls_out(m.c))
+	return uint32(C.lfg_model_n_cls_out(m.c))
 }
 
-// ClsLabel returns the classifier label at the given index.
-func (m *Model) ClsLabel(i uint32) string {
+// ClassifierLabel returns the classifier label at the given index.
+func (m *Model) ClassifierLabel(i uint32) string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.c == nil {
 		return ""
 	}
-	result := C.lfm_model_cls_label(m.c, C.uint32_t(i))
+	result := C.lfg_model_cls_label(m.c, C.uint32_t(i))
 	if result == nil {
 		return ""
 	}

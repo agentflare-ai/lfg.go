@@ -1,11 +1,7 @@
 package lfg
 
 /*
-typedef struct lfm_model lfm_model;
-typedef struct lfm_context lfm_context;
-typedef struct lfm_vocab lfm_vocab;
-typedef struct lfm_sampler lfm_sampler;
-#include "lfm_inference.h"
+#include "lfg_inference.h"
 #include <stdlib.h>
 */
 import "C"
@@ -15,7 +11,7 @@ import "unsafe"
 // The adapter is valid as long as its parent model is not freed.
 // All adapters must be loaded before context creation.
 type AdapterLoRA struct {
-	c     *C.struct_lfm_adapter_lora
+	c     *C.struct_lfg_adapter_lora
 	model *Model // prevent GC of parent
 }
 
@@ -30,7 +26,7 @@ func LoadAdapterLoRA(model *Model, path string) (*AdapterLoRA, error) {
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
-	adapter := C.lfm_adapter_lora_init(model.c, cPath)
+	adapter := C.lfg_adapter_lora_init(model.c, cPath)
 	if adapter == nil {
 		if err := getLastError(); err != nil {
 			return nil, err
@@ -41,8 +37,8 @@ func LoadAdapterLoRA(model *Model, path string) (*AdapterLoRA, error) {
 	return &AdapterLoRA{c: adapter, model: model}, nil
 }
 
-// MetaValStr returns a metadata value by key name.
-func (a *AdapterLoRA) MetaValStr(key string) (string, bool) {
+// Metadata returns a metadata value by key name.
+func (a *AdapterLoRA) Metadata(key string) (string, bool) {
 	a.model.mu.RLock()
 	defer a.model.mu.RUnlock()
 	if a.c == nil {
@@ -52,61 +48,61 @@ func (a *AdapterLoRA) MetaValStr(key string) (string, bool) {
 	defer C.free(unsafe.Pointer(cKey))
 
 	var buf [512]C.char
-	n := C.lfm_adapter_meta_val_str(a.c, cKey, &buf[0], 512)
+	n := C.lfg_adapter_meta_val_str(a.c, cKey, &buf[0], 512)
 	if n < 0 {
 		return "", false
 	}
 	return C.GoStringN(&buf[0], n), true
 }
 
-// MetaCount returns the number of metadata key/value pairs.
-func (a *AdapterLoRA) MetaCount() int {
+// MetadataCount returns the number of metadata key/value pairs.
+func (a *AdapterLoRA) MetadataCount() int {
 	a.model.mu.RLock()
 	defer a.model.mu.RUnlock()
 	if a.c == nil {
 		return 0
 	}
-	return int(C.lfm_adapter_meta_count(a.c))
+	return int(C.lfg_adapter_meta_count(a.c))
 }
 
-// MetaKeyByIndex returns the metadata key at the given index.
-func (a *AdapterLoRA) MetaKeyByIndex(i int) (string, bool) {
+// MetadataKeyAt returns the metadata key at the given index.
+func (a *AdapterLoRA) MetadataKeyAt(i int) (string, bool) {
 	a.model.mu.RLock()
 	defer a.model.mu.RUnlock()
 	if a.c == nil {
 		return "", false
 	}
 	var buf [256]C.char
-	n := C.lfm_adapter_meta_key_by_index(a.c, C.int32_t(i), &buf[0], 256)
+	n := C.lfg_adapter_meta_key_by_index(a.c, C.int32_t(i), &buf[0], 256)
 	if n < 0 {
 		return "", false
 	}
 	return C.GoStringN(&buf[0], n), true
 }
 
-// MetaValStrByIndex returns the metadata value at the given index.
-func (a *AdapterLoRA) MetaValStrByIndex(i int) (string, bool) {
+// MetadataValueAt returns the metadata value at the given index.
+func (a *AdapterLoRA) MetadataValueAt(i int) (string, bool) {
 	a.model.mu.RLock()
 	defer a.model.mu.RUnlock()
 	if a.c == nil {
 		return "", false
 	}
 	var buf [512]C.char
-	n := C.lfm_adapter_meta_val_str_by_index(a.c, C.int32_t(i), &buf[0], 512)
+	n := C.lfg_adapter_meta_val_str_by_index(a.c, C.int32_t(i), &buf[0], 512)
 	if n < 0 {
 		return "", false
 	}
 	return C.GoStringN(&buf[0], n), true
 }
 
-// NInvocationTokens returns the number of invocation tokens if this is an aLoRA.
-func (a *AdapterLoRA) NInvocationTokens() uint64 {
+// InvocationTokenCount returns the number of invocation tokens if this is an aLoRA.
+func (a *AdapterLoRA) InvocationTokenCount() uint64 {
 	a.model.mu.RLock()
 	defer a.model.mu.RUnlock()
 	if a.c == nil {
 		return 0
 	}
-	return uint64(C.lfm_adapter_get_alora_n_invocation_tokens(a.c))
+	return uint64(C.lfg_adapter_get_alora_n_invocation_tokens(a.c))
 }
 
 // InvocationTokens returns the invocation tokens if this is an aLoRA.
@@ -116,21 +112,24 @@ func (a *AdapterLoRA) InvocationTokens() []Token {
 	if a.c == nil {
 		return nil
 	}
-	n := int(C.lfm_adapter_get_alora_n_invocation_tokens(a.c))
+	n := int(C.lfg_adapter_get_alora_n_invocation_tokens(a.c))
 	if n == 0 {
 		return nil
 	}
-	ptr := C.lfm_adapter_get_alora_invocation_tokens(a.c)
+	ptr := C.lfg_adapter_get_alora_invocation_tokens(a.c)
 	if ptr == nil {
 		return nil
 	}
+	cTokens := unsafe.Slice((*int32)(unsafe.Pointer(ptr)), n)
 	tokens := make([]Token, n)
-	copy(tokens, unsafe.Slice((*Token)(unsafe.Pointer(ptr)), n))
+	for i, t := range cTokens {
+		tokens[i] = Token(t)
+	}
 	return tokens
 }
 
-// SetAdapterLoRA adds a LoRA adapter to the context with the given scale.
-func (ctx *Context) SetAdapterLoRA(adapter *AdapterLoRA, scale float32) error {
+// SetLoRA adds a LoRA adapter to the context with the given scale.
+func (ctx *Context) SetLoRA(adapter *AdapterLoRA, scale float32) error {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
 	if ctx.c == nil {
@@ -139,15 +138,15 @@ func (ctx *Context) SetAdapterLoRA(adapter *AdapterLoRA, scale float32) error {
 	if adapter == nil || adapter.c == nil {
 		return &Error{Code: ErrorInvalidArgument, Message: "adapter is nil"}
 	}
-	rc := C.lfm_set_adapter_lora(ctx.c, adapter.c, C.float(scale))
+	rc := C.lfg_set_adapter_lora(ctx.c, adapter.c, C.float(scale))
 	if rc != 0 {
 		return &Error{Code: ErrorInternal, Message: "failed to set LoRA adapter"}
 	}
 	return nil
 }
 
-// RmAdapterLoRA removes a specific LoRA adapter from the context.
-func (ctx *Context) RmAdapterLoRA(adapter *AdapterLoRA) error {
+// RemoveLoRA removes a specific LoRA adapter from the context.
+func (ctx *Context) RemoveLoRA(adapter *AdapterLoRA) error {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
 	if ctx.c == nil {
@@ -156,21 +155,21 @@ func (ctx *Context) RmAdapterLoRA(adapter *AdapterLoRA) error {
 	if adapter == nil || adapter.c == nil {
 		return &Error{Code: ErrorInvalidArgument, Message: "adapter is nil"}
 	}
-	rc := C.lfm_rm_adapter_lora(ctx.c, adapter.c)
+	rc := C.lfg_rm_adapter_lora(ctx.c, adapter.c)
 	if rc != 0 {
 		return &Error{Code: ErrorInternal, Message: "adapter not present in context"}
 	}
 	return nil
 }
 
-// ClearAdapterLoRA removes all LoRA adapters from the context.
-func (ctx *Context) ClearAdapterLoRA() {
+// ClearLoRA removes all LoRA adapters from the context.
+func (ctx *Context) ClearLoRA() {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
 	if ctx.c == nil {
 		return
 	}
-	C.lfm_clear_adapter_lora(ctx.c)
+	C.lfg_clear_adapter_lora(ctx.c)
 }
 
 // ApplyControlVector applies a control vector to the context.
@@ -190,7 +189,7 @@ func (ctx *Context) ApplyControlVector(data []float32, nEmbd, ilStart, ilEnd int
 		dataLen = C.size_t(len(data))
 	}
 
-	rc := C.lfm_apply_adapter_cvec(ctx.c, dataPtr, dataLen, C.int32_t(nEmbd), C.int32_t(ilStart), C.int32_t(ilEnd))
+	rc := C.lfg_apply_adapter_cvec(ctx.c, dataPtr, dataLen, C.int32_t(nEmbd), C.int32_t(ilStart), C.int32_t(ilEnd))
 	if rc != 0 {
 		return &Error{Code: ErrorInternal, Message: "failed to apply control vector"}
 	}

@@ -79,7 +79,7 @@ func (s *Session) Generate(ctx context.Context, prompt string, maxTokens int) (<
 				break
 			}
 
-			piece := vocab.TokenToPiece(token, false)
+			piece := vocab.TokenText(token, false)
 			allTokens = append(allTokens, token)
 			allText += piece
 
