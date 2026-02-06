@@ -1,4 +1,4 @@
-.PHONY: build build-linux-amd64 build-linux-arm64 build-macos-arm64 clean
+.PHONY: build build-linux-amd64 build-linux-arm64 build-macos-arm64 build-windows-amd64 clean
 
 ZIG_CC := zig cc
 ZIG_CXX := zig c++
@@ -14,5 +14,8 @@ build-linux-arm64:
 build-macos-arm64:
 	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 CC="$(ZIG_CC)" CXX="$(ZIG_CXX)" go build -v -o lfg-macos-arm64 .
 
+build-windows-amd64:
+	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC="$(ZIG_CC) -target x86_64-windows-gnu" CXX="$(ZIG_CXX) -target x86_64-windows-gnu" go build -v -o lfg-windows-amd64.exe .
+
 clean:
-	rm -f lfg-linux-amd64 lfg-linux-arm64 lfg-macos-arm64
+	rm -f lfg-linux-amd64 lfg-linux-arm64 lfg-macos-arm64 lfg-windows-amd64.exe
