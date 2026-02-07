@@ -813,6 +813,67 @@ func (s *Session) LastEntropy() float32 {
 }
 
 // ---------------------------------------------------------------------------
+// Convenience Model Loader (lfg_api.h)
+// ---------------------------------------------------------------------------
+
+// ModelLoadConfig configures the convenience model loader.
+type ModelLoadConfig struct {
+	ModelPath  string
+	UseMmap    bool
+	UseMlock   bool
+	GPULayers  int
+}
+
+// DefaultModelLoadConfig returns the default model loading configuration.
+func DefaultModelLoadConfig() ModelLoadConfig {
+	c := C.lfg_model_load_default_config()
+	return ModelLoadConfig{
+		UseMmap:   bool(c.use_mmap),
+		UseMlock:  bool(c.use_mlock),
+		GPULayers: int(c.n_gpu_layers),
+	}
+}
+
+// LoadModelSimple loads a model using the simplified API from lfg_api.h.
+// This is a convenience alternative to LoadModel that takes fewer parameters
+// and reduces the setup to a single C call.
+func LoadModelSimple(path string, opts ...ModelOption) (*Model, error) {
+	ensureBackend()
+
+	defaults := DefaultModelLoadConfig()
+	cfg := ModelConfig{
+		Mmap:      defaults.UseMmap,
+		Mlock:     defaults.UseMlock,
+		GPULayers: defaults.GPULayers,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+
+	cCfg := C.lfg_model_load_config{
+		model_path:   cPath,
+		use_mmap:     C.bool(cfg.Mmap),
+		use_mlock:    C.bool(cfg.Mlock),
+		n_gpu_layers: C.int(cfg.GPULayers),
+	}
+
+	cModel := C.lfg_load_model(&cCfg)
+	if cModel == nil {
+		if err := getLastError(); err != nil {
+			return nil, err
+		}
+		return nil, &Error{Code: ErrorInternal, Message: "failed to load model"}
+	}
+
+	m := &Model{c: cModel}
+	runtime.SetFinalizer(m, func(m *Model) { m.Close() })
+	return m, nil
+}
+
+// ---------------------------------------------------------------------------
 // Embedding API
 // ---------------------------------------------------------------------------
 

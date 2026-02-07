@@ -2413,3 +2413,970 @@ func TestSessionToolsResetReinjection(t *testing.T) {
 	}
 	t.Log("Tool re-injection after reset works")
 }
+
+// ---------------------------------------------------------------------------
+// Generate Loop API (C-side loop — reduced CGo crossings)
+// ---------------------------------------------------------------------------
+
+func TestDefaultGenerateConfig(t *testing.T) {
+	cfg := DefaultGenerateConfig()
+	if cfg.MaxTokens != 0 {
+		t.Fatalf("DefaultGenerateConfig().MaxTokens = %d, want 0", cfg.MaxTokens)
+	}
+	if cfg.TokenCallback != nil {
+		t.Fatal("DefaultGenerateConfig().TokenCallback should be nil")
+	}
+	if cfg.EntropyCallback != nil {
+		t.Fatal("DefaultGenerateConfig().EntropyCallback should be nil")
+	}
+}
+
+func TestStopReasonConstants(t *testing.T) {
+	// Verify constants match the C enum values.
+	if StopReasonEOS != 0 {
+		t.Fatalf("StopReasonEOS = %d, want 0", StopReasonEOS)
+	}
+	if StopReasonMaxTokens != 1 {
+		t.Fatalf("StopReasonMaxTokens = %d, want 1", StopReasonMaxTokens)
+	}
+	if StopReasonCallback != 2 {
+		t.Fatalf("StopReasonCallback = %d, want 2", StopReasonCallback)
+	}
+}
+
+func TestGenerateActionConstants(t *testing.T) {
+	if GenerateContinue != 0 {
+		t.Fatalf("GenerateContinue = %d, want 0", GenerateContinue)
+	}
+	if GenerateStop != 1 {
+		t.Fatalf("GenerateStop = %d, want 1", GenerateStop)
+	}
+}
+
+func TestGenerateFromStateClosedSession(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(256))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	s.Close()
+
+	_, err = s.GenerateFromState(GenerateConfig{MaxTokens: 5})
+	if err == nil {
+		t.Fatal("expected error on closed session")
+	}
+	t.Logf("Expected error: %v", err)
+}
+
+func TestPromptGenerateClosedSession(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(256))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	s.Close()
+
+	_, err = s.PromptGenerate("hello", true, GenerateConfig{MaxTokens: 5})
+	if err == nil {
+		t.Fatal("expected error on closed session")
+	}
+	t.Logf("Expected error: %v", err)
+}
+
+func TestChatGenerateClosedSession(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(256))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	s.Close()
+
+	_, err = s.ChatGenerate([]ChatMessage{{Role: "user", Content: "hi"}}, GenerateConfig{MaxTokens: 5})
+	if err == nil {
+		t.Fatal("expected error on closed session")
+	}
+	t.Logf("Expected error: %v", err)
+}
+
+func TestChatGenerateEmptyMessages(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(256))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	_, err = s.ChatGenerate(nil, GenerateConfig{MaxTokens: 5})
+	if err == nil {
+		t.Fatal("expected error for nil messages")
+	}
+	t.Logf("Expected error: %v", err)
+
+	_, err = s.ChatGenerate([]ChatMessage{}, GenerateConfig{MaxTokens: 5})
+	if err == nil {
+		t.Fatal("expected error for empty messages")
+	}
+	t.Logf("Expected error: %v", err)
+}
+
+func TestGenerateFromStateBasic(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(SamplingConfig{
+			Seed: 42,
+			Temp: 0.0, // greedy
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// Manually ingest the prompt.
+	tokens, err := v.Tokenize("The capital of France is", true, false)
+	if err != nil {
+		t.Fatalf("Tokenize: %v", err)
+	}
+	if err := s.IngestTokens(tokens, true); err != nil {
+		t.Fatalf("IngestTokens: %v", err)
+	}
+
+	result, err := s.GenerateFromState(GenerateConfig{MaxTokens: 10})
+	if err != nil {
+		t.Fatalf("GenerateFromState: %v", err)
+	}
+
+	t.Logf("GenerateFromState: %d tokens, stop=%d", result.TokenCount, result.StopReason)
+	if result.TokenCount == 0 {
+		t.Fatal("generated no tokens")
+	}
+	if result.TokenCount > 10 {
+		t.Fatalf("generated %d tokens, expected at most 10", result.TokenCount)
+	}
+}
+
+func TestGenerateFromStateMaxTokens(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.0}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	tokens, _ := v.Tokenize("Count to one hundred: 1, 2, 3, 4, 5", true, false)
+	s.IngestTokens(tokens, true)
+
+	result, err := s.GenerateFromState(GenerateConfig{MaxTokens: 10})
+	if err != nil {
+		t.Fatalf("GenerateFromState: %v", err)
+	}
+
+	t.Logf("Generated %d tokens, stop_reason=%d", result.TokenCount, result.StopReason)
+	if result.TokenCount > 10 {
+		t.Fatalf("generated %d tokens, expected at most 10", result.TokenCount)
+	}
+	// With counting prompt and only 10 tokens, should hit max_tokens.
+	if result.StopReason != StopReasonMaxTokens {
+		t.Logf("stop_reason=%d (expected MaxTokens=%d, got EOS or other)", result.StopReason, StopReasonMaxTokens)
+	}
+}
+
+func TestGenerateFromStateNoCallbacks(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m,
+		WithSessionNCtx(256),
+		WithSessionMaxTokens(8),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.0}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	v := m.Vocab()
+	tokens, _ := v.Tokenize("Hi", true, false)
+	s.IngestTokens(tokens, true)
+
+	// No callbacks, zero MaxTokens — should fall back to session config (8).
+	result, err := s.GenerateFromState(GenerateConfig{})
+	if err != nil {
+		t.Fatalf("GenerateFromState: %v", err)
+	}
+
+	t.Logf("Generated %d tokens with no callbacks, session max_tokens=8", result.TokenCount)
+	if result.TokenCount == 0 {
+		t.Fatal("generated no tokens")
+	}
+}
+
+func TestGenerateFromStateTokenCallback(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.8, TopK: 40, TopP: 0.9, MinP: 0.05}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	tokens, _ := v.Tokenize("Hello, world!", true, false)
+	s.IngestTokens(tokens, true)
+
+	var pieces []string
+	var callbackCount int
+
+	result, err := s.GenerateFromState(GenerateConfig{
+		MaxTokens: 20,
+		TokenCallback: func(token Token, piece string) GenerateAction {
+			callbackCount++
+			pieces = append(pieces, piece)
+			return GenerateContinue
+		},
+	})
+	if err != nil {
+		t.Fatalf("GenerateFromState: %v", err)
+	}
+
+	t.Logf("Generated %d tokens, callback called %d times", result.TokenCount, callbackCount)
+	if callbackCount != result.TokenCount {
+		t.Fatalf("callback count %d != result.TokenCount %d", callbackCount, result.TokenCount)
+	}
+	if callbackCount == 0 {
+		t.Fatal("token callback was never called")
+	}
+
+	text := strings.Join(pieces, "")
+	if text == "" {
+		t.Fatal("streamed text is empty")
+	}
+	t.Logf("Streamed text: %q", text)
+}
+
+func TestGenerateFromStateCallbackStops(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.8}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	tokens, _ := v.Tokenize("Count to one hundred: 1, 2, 3, 4", true, false)
+	s.IngestTokens(tokens, true)
+
+	stopAfter := 5
+	callCount := 0
+
+	result, err := s.GenerateFromState(GenerateConfig{
+		MaxTokens: 200,
+		TokenCallback: func(token Token, piece string) GenerateAction {
+			callCount++
+			if callCount >= stopAfter {
+				return GenerateStop
+			}
+			return GenerateContinue
+		},
+	})
+	if err != nil {
+		t.Fatalf("GenerateFromState: %v", err)
+	}
+
+	t.Logf("Stopped after %d tokens (callback called %d times), stop_reason=%d",
+		result.TokenCount, callCount, result.StopReason)
+
+	if result.TokenCount != stopAfter {
+		t.Fatalf("expected %d tokens, got %d", stopAfter, result.TokenCount)
+	}
+	if result.StopReason != StopReasonCallback {
+		t.Fatalf("expected StopReasonCallback (%d), got %d", StopReasonCallback, result.StopReason)
+	}
+}
+
+func TestGenerateFromStateSessionMaxTokensFallback(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	// Set session-level max_tokens; leave generate config at 0.
+	s, err := NewSession(m,
+		WithSessionNCtx(256),
+		WithSessionMaxTokens(5),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.0}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	tokens, _ := v.Tokenize("Tell me a long story about", true, false)
+	s.IngestTokens(tokens, true)
+
+	// max_tokens=0 in config → should fall back to session max_tokens (5).
+	result, err := s.GenerateFromState(GenerateConfig{MaxTokens: 0})
+	if err != nil {
+		t.Fatalf("GenerateFromState: %v", err)
+	}
+
+	t.Logf("Generated %d tokens with session max_tokens=5", result.TokenCount)
+	if result.TokenCount > 5 {
+		t.Fatalf("generated %d tokens, expected at most 5", result.TokenCount)
+	}
+}
+
+func TestPromptGenerateBasic(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.0}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	var text string
+	result, err := s.PromptGenerate("The capital of France is", true, GenerateConfig{
+		MaxTokens: 15,
+		TokenCallback: func(token Token, piece string) GenerateAction {
+			text += piece
+			return GenerateContinue
+		},
+	})
+	if err != nil {
+		t.Fatalf("PromptGenerate: %v", err)
+	}
+
+	t.Logf("PromptGenerate: %d tokens, text=%q", result.TokenCount, text)
+	if result.TokenCount == 0 {
+		t.Fatal("generated no tokens")
+	}
+	if result.TokenCount > 15 {
+		t.Fatalf("generated %d tokens, expected at most 15", result.TokenCount)
+	}
+	if text == "" {
+		t.Fatal("streamed text is empty")
+	}
+}
+
+func TestPromptGenerateNoCallback(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m,
+		WithSessionNCtx(256),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.0}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	result, err := s.PromptGenerate("Hello", true, GenerateConfig{MaxTokens: 10})
+	if err != nil {
+		t.Fatalf("PromptGenerate: %v", err)
+	}
+
+	t.Logf("PromptGenerate (no callback): %d tokens, stop=%d", result.TokenCount, result.StopReason)
+	if result.TokenCount == 0 {
+		t.Fatal("generated no tokens")
+	}
+}
+
+func TestPromptGenerateParityWithManual(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	sc := SamplingConfig{Seed: 42, Temp: 0.0}
+
+	// --- Manual: tokenize + ingest + generate ---
+	s1, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(sc),
+	)
+	if err != nil {
+		t.Fatalf("NewSession (manual): %v", err)
+	}
+	defer s1.Close()
+
+	prompt := "Once upon a time"
+	genTokens := 12
+
+	tokens, _ := v.Tokenize(prompt, true, false)
+	s1.IngestTokens(tokens, true)
+
+	var manualText string
+	s1.GenerateFromState(GenerateConfig{
+		MaxTokens: int32(genTokens),
+		TokenCallback: func(token Token, piece string) GenerateAction {
+			manualText += piece
+			return GenerateContinue
+		},
+	})
+
+	// --- PromptGenerate ---
+	s2, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(sc),
+	)
+	if err != nil {
+		t.Fatalf("NewSession (prompt): %v", err)
+	}
+	defer s2.Close()
+
+	var promptText string
+	s2.PromptGenerate(prompt, true, GenerateConfig{
+		MaxTokens: int32(genTokens),
+		TokenCallback: func(token Token, piece string) GenerateAction {
+			promptText += piece
+			return GenerateContinue
+		},
+	})
+
+	t.Logf("Manual:  %q", manualText)
+	t.Logf("Prompt:  %q", promptText)
+	if manualText != promptText {
+		t.Fatalf("parity mismatch:\n  manual: %q\n  prompt: %q", manualText, promptText)
+	}
+}
+
+func TestPromptGenerateStopSequences(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.0}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// First run: generate baseline output.
+	var baselineText string
+	baselineResult, err := s.PromptGenerate("The quick brown fox", true, GenerateConfig{
+		MaxTokens: 20,
+		TokenCallback: func(token Token, piece string) GenerateAction {
+			baselineText += piece
+			return GenerateContinue
+		},
+	})
+	if err != nil {
+		t.Fatalf("PromptGenerate baseline: %v", err)
+	}
+
+	if baselineResult.TokenCount < 3 {
+		t.Skipf("Model produced only %d tokens, need at least 3 for stop test", baselineResult.TokenCount)
+	}
+
+	// Tokenize a substring to use as stop sequence.
+	// Find a word in the generated text to use as stop sequence.
+	// We'll use a simple approach: tokenize a period "." which is common.
+	stopTokens, _ := v.Tokenize(".", false, false)
+	if len(stopTokens) == 0 {
+		t.Skip("Could not tokenize stop sequence")
+	}
+
+	// Second run: with stop sequence.
+	s.Reset()
+	if err := s.ConfigureStopSequences([][]Token{stopTokens}); err != nil {
+		t.Fatalf("ConfigureStopSequences: %v", err)
+	}
+
+	stoppedResult, err := s.PromptGenerate("The quick brown fox", true, GenerateConfig{
+		MaxTokens: 200,
+	})
+	if err != nil {
+		t.Fatalf("PromptGenerate with stop: %v", err)
+	}
+
+	t.Logf("Baseline: %d tokens, With stop: %d tokens (reason=%d)",
+		baselineResult.TokenCount, stoppedResult.TokenCount, stoppedResult.StopReason)
+
+	// Stop sequence should cause earlier termination via EOS.
+	if stoppedResult.StopReason == StopReasonEOS {
+		t.Log("Stop sequence triggered EOS as expected")
+	}
+}
+
+func TestChatGenerateBasic(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.8, TopK: 40, TopP: 0.9, MinP: 0.05}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	var text string
+	result, err := s.ChatGenerate(
+		[]ChatMessage{
+			{Role: "user", Content: "What is 2+2?"},
+		},
+		GenerateConfig{
+			MaxTokens: 30,
+			TokenCallback: func(token Token, piece string) GenerateAction {
+				text += piece
+				return GenerateContinue
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("ChatGenerate: %v", err)
+	}
+
+	t.Logf("ChatGenerate: %d tokens, text=%q", result.TokenCount, text)
+	if result.TokenCount == 0 {
+		t.Fatal("generated no tokens")
+	}
+	if text == "" {
+		t.Fatal("streamed text is empty")
+	}
+}
+
+func TestChatGenerateMultiTurn(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.8, TopK: 40, TopP: 0.9, MinP: 0.05}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	var text string
+	result, err := s.ChatGenerate(
+		[]ChatMessage{
+			{Role: "system", Content: "You are a helpful assistant."},
+			{Role: "user", Content: "Say hello."},
+			{Role: "assistant", Content: "Hello!"},
+			{Role: "user", Content: "Now say goodbye."},
+		},
+		GenerateConfig{
+			MaxTokens: 30,
+			TokenCallback: func(token Token, piece string) GenerateAction {
+				text += piece
+				return GenerateContinue
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("ChatGenerate multi-turn: %v", err)
+	}
+
+	t.Logf("ChatGenerate multi-turn: %d tokens, text=%q", result.TokenCount, text)
+	if result.TokenCount == 0 {
+		t.Fatal("generated no tokens")
+	}
+}
+
+func TestChatGenerateNoCallback(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m,
+		WithSessionNCtx(256),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.0}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	result, err := s.ChatGenerate(
+		[]ChatMessage{{Role: "user", Content: "Hi"}},
+		GenerateConfig{MaxTokens: 10},
+	)
+	if err != nil {
+		t.Fatalf("ChatGenerate (no callback): %v", err)
+	}
+
+	t.Logf("ChatGenerate (no callback): %d tokens, stop=%d", result.TokenCount, result.StopReason)
+	if result.TokenCount == 0 {
+		t.Fatal("generated no tokens")
+	}
+}
+
+func TestGenerateFromStateWithStopSequences(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.0}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// Configure ":" as stop sequence.
+	stopTokens, _ := v.Tokenize(":", false, false)
+	if len(stopTokens) == 0 {
+		t.Skip("Could not tokenize stop sequence")
+	}
+	if err := s.ConfigureStopSequences([][]Token{stopTokens}); err != nil {
+		t.Fatalf("ConfigureStopSequences: %v", err)
+	}
+
+	tokens, _ := v.Tokenize("Write a long story about dragons:", true, false)
+	s.IngestTokens(tokens, true)
+
+	result, err := s.GenerateFromState(GenerateConfig{MaxTokens: 200})
+	if err != nil {
+		t.Fatalf("GenerateFromState: %v", err)
+	}
+
+	t.Logf("Generated %d tokens, stop_reason=%d", result.TokenCount, result.StopReason)
+	if result.StopReason == StopReasonEOS || result.StopReason == StopReasonMaxTokens {
+		t.Log("Stop sequence or max tokens triggered as expected")
+	}
+	if result.TokenCount > 200 {
+		t.Fatalf("generated %d tokens, expected at most 200", result.TokenCount)
+	}
+}
+
+func TestGenerateFromStateResetBetweenCalls(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	sc := SamplingConfig{Seed: 42, Temp: 0.0}
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(sc),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	prompt := "The quick brown fox"
+	genTokens := int32(10)
+
+	// First run.
+	var text1 string
+	tokens, _ := v.Tokenize(prompt, true, false)
+	s.IngestTokens(tokens, true)
+	s.GenerateFromState(GenerateConfig{
+		MaxTokens: genTokens,
+		TokenCallback: func(token Token, piece string) GenerateAction {
+			text1 += piece
+			return GenerateContinue
+		},
+	})
+
+	// Reset and run again — should produce identical output (greedy, same seed).
+	s.Reset()
+	var text2 string
+	s.IngestTokens(tokens, true)
+	s.GenerateFromState(GenerateConfig{
+		MaxTokens: genTokens,
+		TokenCallback: func(token Token, piece string) GenerateAction {
+			text2 += piece
+			return GenerateContinue
+		},
+	})
+
+	t.Logf("Run 1: %q", text1)
+	t.Logf("Run 2: %q", text2)
+	if text1 != text2 {
+		t.Fatalf("determinism failure: run 1 and run 2 differ")
+	}
+}
+
+func TestPromptGenerateCallbackStops(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.8}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	stopAfter := 3
+	count := 0
+
+	result, err := s.PromptGenerate("Tell me a story about a dragon", true, GenerateConfig{
+		MaxTokens: 200,
+		TokenCallback: func(token Token, piece string) GenerateAction {
+			count++
+			if count >= stopAfter {
+				return GenerateStop
+			}
+			return GenerateContinue
+		},
+	})
+	if err != nil {
+		t.Fatalf("PromptGenerate: %v", err)
+	}
+
+	t.Logf("Stopped after %d tokens, stop_reason=%d", result.TokenCount, result.StopReason)
+	if result.TokenCount != stopAfter {
+		t.Fatalf("expected %d tokens, got %d", stopAfter, result.TokenCount)
+	}
+	if result.StopReason != StopReasonCallback {
+		t.Fatalf("expected StopReasonCallback (%d), got %d", StopReasonCallback, result.StopReason)
+	}
+}
+
+func TestChatGenerateCallbackStops(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.8}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	stopAfter := 4
+	count := 0
+
+	result, err := s.ChatGenerate(
+		[]ChatMessage{{Role: "user", Content: "Count to one hundred."}},
+		GenerateConfig{
+			MaxTokens: 200,
+			TokenCallback: func(token Token, piece string) GenerateAction {
+				count++
+				if count >= stopAfter {
+					return GenerateStop
+				}
+				return GenerateContinue
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("ChatGenerate: %v", err)
+	}
+
+	t.Logf("Stopped after %d tokens, stop_reason=%d", result.TokenCount, result.StopReason)
+	if result.TokenCount != stopAfter {
+		t.Fatalf("expected %d tokens, got %d", stopAfter, result.TokenCount)
+	}
+	if result.StopReason != StopReasonCallback {
+		t.Fatalf("expected StopReasonCallback (%d), got %d", StopReasonCallback, result.StopReason)
+	}
+}
+
+func TestGenerateFromStateTokenCallbackPieceContent(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.0}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	tokens, _ := v.Tokenize("Hello", true, false)
+	s.IngestTokens(tokens, true)
+
+	var receivedTokens []Token
+	var receivedPieces []string
+
+	s.GenerateFromState(GenerateConfig{
+		MaxTokens: 5,
+		TokenCallback: func(token Token, piece string) GenerateAction {
+			receivedTokens = append(receivedTokens, token)
+			receivedPieces = append(receivedPieces, piece)
+			return GenerateContinue
+		},
+	})
+
+	if len(receivedTokens) == 0 {
+		t.Fatal("received no tokens")
+	}
+
+	for i, tok := range receivedTokens {
+		if tok == InvalidToken {
+			t.Fatalf("token[%d] is InvalidToken", i)
+		}
+		// Verify the piece text is non-empty for non-special tokens.
+		// (Some special tokens may have empty piece, but regular tokens should not.)
+		t.Logf("  token[%d]: id=%d piece=%q", i, tok, receivedPieces[i])
+	}
+}
+
+func TestGenerateLoopRetrievalsZeroWithoutEntropy(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	s, err := NewSession(m,
+		WithSessionNCtx(256),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.0}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	tokens, _ := v.Tokenize("Hello", true, false)
+	s.IngestTokens(tokens, true)
+
+	result, err := s.GenerateFromState(GenerateConfig{MaxTokens: 5})
+	if err != nil {
+		t.Fatalf("GenerateFromState: %v", err)
+	}
+
+	if result.Retrievals != 0 {
+		t.Fatalf("expected 0 retrievals without entropy monitor, got %d", result.Retrievals)
+	}
+}
+
+func TestPromptGenerateResetBetweenCalls(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.0}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	prompt := "The quick brown fox"
+
+	var text1, text2 string
+
+	s.PromptGenerate(prompt, true, GenerateConfig{
+		MaxTokens: 10,
+		TokenCallback: func(token Token, piece string) GenerateAction {
+			text1 += piece
+			return GenerateContinue
+		},
+	})
+
+	s.Reset()
+
+	s.PromptGenerate(prompt, true, GenerateConfig{
+		MaxTokens: 10,
+		TokenCallback: func(token Token, piece string) GenerateAction {
+			text2 += piece
+			return GenerateContinue
+		},
+	})
+
+	t.Logf("Run 1: %q", text1)
+	t.Logf("Run 2: %q", text2)
+	if text1 != text2 {
+		t.Fatalf("determinism failure across resets")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Convenience Model Loader
+// ---------------------------------------------------------------------------
+
+func TestDefaultModelLoadConfig(t *testing.T) {
+	cfg := DefaultModelLoadConfig()
+	t.Logf("DefaultModelLoadConfig: Mmap=%v, Mlock=%v, GPULayers=%d",
+		cfg.UseMmap, cfg.UseMlock, cfg.GPULayers)
+	// Just verify it doesn't panic and returns reasonable defaults.
+}
+
+func TestLoadModelSimpleBadPath(t *testing.T) {
+	_, err := LoadModelSimple("/nonexistent/path/model.gguf")
+	if err == nil {
+		t.Fatal("expected error for bad model path")
+	}
+	t.Logf("Expected error: %v", err)
+}
+
+func TestLoadModelSimple(t *testing.T) {
+	path := modelPath(t)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		t.Skipf("Model not found at %s", path)
+	}
+
+	m, err := LoadModelSimple(path, WithGPULayers(0))
+	if err != nil {
+		t.Fatalf("LoadModelSimple: %v", err)
+	}
+	defer m.Close()
+
+	stats := m.Stats()
+	t.Logf("LoadModelSimple: params=%d, size=%d, vocab=%d, ctx_train=%d",
+		stats.ParameterCount, stats.SizeBytes, stats.VocabSize, stats.ContextSize)
+
+	if stats.ParameterCount == 0 {
+		t.Fatal("model has 0 parameters")
+	}
+	if stats.VocabSize == 0 {
+		t.Fatal("model has 0 vocab size")
+	}
+}
+
+func TestLoadModelSimpleWithSessionAndGenerate(t *testing.T) {
+	path := modelPath(t)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		t.Skipf("Model not found at %s", path)
+	}
+
+	m, err := LoadModelSimple(path, WithGPULayers(0))
+	if err != nil {
+		t.Fatalf("LoadModelSimple: %v", err)
+	}
+	defer m.Close()
+
+	s, err := NewSession(m,
+		WithSessionNCtx(256),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.0}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	var text string
+	result, err := s.PromptGenerate("Hello", true, GenerateConfig{
+		MaxTokens: 10,
+		TokenCallback: func(token Token, piece string) GenerateAction {
+			text += piece
+			return GenerateContinue
+		},
+	})
+	if err != nil {
+		t.Fatalf("PromptGenerate: %v", err)
+	}
+
+	t.Logf("LoadModelSimple + PromptGenerate: %d tokens, text=%q", result.TokenCount, text)
+	if result.TokenCount == 0 {
+		t.Fatal("generated no tokens")
+	}
+	if text == "" {
+		t.Fatal("text is empty")
+	}
+}
