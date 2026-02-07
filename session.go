@@ -36,7 +36,8 @@ type SessionConfig struct {
 	NBatch                  int
 	EnableHealing           bool
 	StructuredCheckpointing bool
-	ReasoningBudget         int // 0 = disabled. Max tokens allowed for reasoning.
+	ReasoningBudget         int   // 0 = disabled. Max tokens allowed for reasoning.
+	MaxTokens               int32 // 0 = unlimited. Max tokens to generate per reset cycle.
 	Sampling                SamplingConfig
 }
 
@@ -71,6 +72,7 @@ func DefaultSessionConfig() SessionConfig {
 		EnableHealing:           bool(c.enable_healing),
 		StructuredCheckpointing: bool(c.structured_checkpointing),
 		ReasoningBudget:         int(c.reasoning_budget),
+		MaxTokens:               int32(c.max_tokens),
 		Sampling:                samplingConfigFromC(c.sampling),
 	}
 }
@@ -121,6 +123,7 @@ func (cfg *SessionConfig) toC() C.lfg_session_config {
 		enable_healing:           C.bool(cfg.EnableHealing),
 		structured_checkpointing: C.bool(cfg.StructuredCheckpointing),
 		reasoning_budget:         C.int(cfg.ReasoningBudget),
+		max_tokens:               C.int32_t(cfg.MaxTokens),
 		sampling:                 cfg.Sampling.toC(),
 	}
 }
@@ -169,6 +172,14 @@ func WithSessionStructuredCheckpointing(v bool) SessionOption {
 func WithSessionReasoningBudget(n int) SessionOption {
 	return func(cfg *SessionConfig) {
 		cfg.ReasoningBudget = n
+	}
+}
+
+// WithSessionMaxTokens sets the maximum number of tokens to generate per reset cycle.
+// 0 means unlimited (default).
+func WithSessionMaxTokens(n int32) SessionOption {
+	return func(cfg *SessionConfig) {
+		cfg.MaxTokens = n
 	}
 }
 
@@ -287,6 +298,50 @@ func (s *Session) ConfigureReasoning(startTokens, endTokens []Token) {
 	C.lfg_session_configure_reasoning(s.c,
 		startPtr, C.size_t(len(startTokens)),
 		endPtr, C.size_t(len(endTokens)))
+}
+
+// ConfigureStopSequences sets stop sequences for generation.
+// When any sequence is matched during sampling, generation returns EOS.
+// Pass nil or an empty slice to clear stop sequences.
+func (s *Session) ConfigureStopSequences(sequences [][]Token) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
+	}
+
+	if len(sequences) == 0 {
+		ok := C.lfg_session_configure_stop_sequences(s.c, nil, nil, 0)
+		if !bool(ok) {
+			return &Error{Code: ErrorInvalidArgument, Message: "failed to clear stop sequences"}
+		}
+		return nil
+	}
+
+	n := len(sequences)
+
+	// Allocate the pointer array in C memory so we don't violate CGO's
+	// "no Go pointer to Go pointer" rule.
+	cPtrs := (*[1 << 30]*C.lfg_token)(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof((*C.lfg_token)(nil)))))[:n:n]
+	defer C.free(unsafe.Pointer(&cPtrs[0]))
+
+	cLens := make([]C.size_t, n)
+	for i, seq := range sequences {
+		if len(seq) > 0 {
+			cPtrs[i] = (*C.lfg_token)(unsafe.Pointer(&seq[0]))
+		}
+		cLens[i] = C.size_t(len(seq))
+	}
+
+	ok := C.lfg_session_configure_stop_sequences(
+		s.c,
+		&cPtrs[0],
+		&cLens[0],
+		C.size_t(n))
+	if !bool(ok) {
+		return &Error{Code: ErrorInvalidArgument, Message: "failed to configure stop sequences"}
+	}
+	return nil
 }
 
 // IngestTokens feeds tokens into the session.
@@ -525,4 +580,272 @@ func JSONSchemaToGrammar(jsonSchema string, forceGBNF bool) (string, error) {
 		return "", &Error{Code: ErrorInternal, Message: "failed to convert JSON schema to grammar"}
 	}
 	return string(buf[:n]), nil
+}
+
+// ToolDesc describes a tool for embedding-based ranking.
+type ToolDesc struct {
+	Name        string // Tool name.
+	Description string // Human-readable description.
+	JSONSchema  string // Optional JSON schema for parameters.
+}
+
+// RegisterTools registers tools with the session for embedding-based ranking.
+// The session computes and caches embeddings for each tool description internally.
+// topK controls how many of the highest-ranked tools are injected into context
+// on the first decode call. Pass 0 to disable injection.
+// Returns the number of tools registered.
+func (s *Session) RegisterTools(tools []ToolDesc, topK int32) (int32, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return 0, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
+	}
+	if len(tools) == 0 {
+		return 0, &Error{Code: ErrorInvalidArgument, Message: "no tools provided"}
+	}
+
+	// Build C tool descriptors. Keep CStrings alive until the call returns.
+	cDescs := make([]C.lfg_tool_desc, len(tools))
+	cStrs := make([]*C.char, 0, len(tools)*3) // for deferred free
+	defer func() {
+		for _, p := range cStrs {
+			C.free(unsafe.Pointer(p))
+		}
+	}()
+
+	for i, t := range tools {
+		cName := C.CString(t.Name)
+		cStrs = append(cStrs, cName)
+		cDesc := C.CString(t.Description)
+		cStrs = append(cStrs, cDesc)
+		cDescs[i].name = cName
+		cDescs[i].description = cDesc
+		if t.JSONSchema != "" {
+			cSchema := C.CString(t.JSONSchema)
+			cStrs = append(cStrs, cSchema)
+			cDescs[i].json_schema = cSchema
+		}
+	}
+
+	n := C.lfg_session_register_tools(s.c, &cDescs[0], C.int32_t(len(tools)), C.int32_t(topK))
+	if n < 0 {
+		if err := getLastError(); err != nil {
+			return 0, err
+		}
+		return 0, &Error{Code: ErrorInternal, Message: "failed to register tools"}
+	}
+	return int32(n), nil
+}
+
+// ClearTools removes all registered tools and frees the tool ranking context.
+func (s *Session) ClearTools() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return
+	}
+	C.lfg_session_clear_tools(s.c)
+}
+
+// ---------------------------------------------------------------------------
+// Entropy Monitor API
+// ---------------------------------------------------------------------------
+
+// EntropyEvent represents a single entropy event from the ring buffer.
+type EntropyEvent struct {
+	Entropy      float32 // Raw Shannon entropy: H = -sum p_i log(p_i)
+	Normalized   float32 // entropy / log(n_vocab), range [0,1]
+	TopLogprob   float32 // Log probability of the sampled token
+	Token        Token   // The sampled token
+	NPast        int32   // Token position when event fired
+	CheckpointID int32   // Opaque ID for Rewind()
+	NEmbedding   int32   // Embedding dimension (for embedding output sizing)
+}
+
+// EntropyMonitorConfig configures the entropy monitor.
+type EntropyMonitorConfig struct {
+	Threshold      float32 // Normalized entropy threshold (0,1]. 0 = disabled.
+	CooldownTokens int32   // Min tokens between events.
+	RingSize       int32   // Ring buffer slots. 0 = default (4).
+}
+
+// DefaultEntropyMonitorConfig returns the default entropy monitor configuration.
+func DefaultEntropyMonitorConfig() EntropyMonitorConfig {
+	c := C.lfg_entropy_monitor_default_config()
+	return EntropyMonitorConfig{
+		Threshold:      float32(c.threshold),
+		CooldownTokens: int32(c.cooldown_tokens),
+		RingSize:       int32(c.ring_size),
+	}
+}
+
+// ConfigureEntropyMonitor configures the entropy monitor for this session.
+// Returns the embedding dimension (n_embd) on success — use this to size
+// the embedding buffer passed to EntropyPop.
+// Pass nil to disable the entropy monitor (returns 0, nil).
+func (s *Session) ConfigureEntropyMonitor(config *EntropyMonitorConfig) (int32, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return 0, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
+	}
+
+	if config == nil {
+		C.lfg_session_configure_entropy_monitor(s.c, nil)
+		return 0, nil
+	}
+
+	cConfig := C.lfg_entropy_monitor_config{
+		threshold:       C.float(config.Threshold),
+		cooldown_tokens: C.int32_t(config.CooldownTokens),
+		ring_size:       C.int32_t(config.RingSize),
+	}
+	nEmbd := C.lfg_session_configure_entropy_monitor(s.c, &cConfig)
+	if nEmbd <= 0 {
+		if err := getLastError(); err != nil {
+			return 0, err
+		}
+		return 0, &Error{Code: ErrorInternal, Message: "failed to configure entropy monitor"}
+	}
+	return int32(nEmbd), nil
+}
+
+// EntropyPop pops the next pending entropy event from the ring buffer.
+// If embeddingOut is non-nil, the embedding vector is copied into it (must be >= EntropyEvent.NEmbedding floats).
+// Pass nil for embeddingOut to skip embedding copy.
+// Returns the event and true if an event was available, or a zero event and false if no events are pending.
+func (s *Session) EntropyPop(embeddingOut []float32) (EntropyEvent, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return EntropyEvent{}, false
+	}
+
+	var cEvent C.lfg_entropy_event
+	var embdPtr *C.float
+	var embdCap C.int32_t
+	if len(embeddingOut) > 0 {
+		embdPtr = (*C.float)(unsafe.Pointer(&embeddingOut[0]))
+		embdCap = C.int32_t(len(embeddingOut))
+	}
+
+	ok := C.lfg_session_entropy_pop(s.c, &cEvent, embdPtr, embdCap)
+	if !bool(ok) {
+		return EntropyEvent{}, false
+	}
+
+	return EntropyEvent{
+		Entropy:      float32(cEvent.entropy),
+		Normalized:   float32(cEvent.normalized),
+		TopLogprob:   float32(cEvent.top_logprob),
+		Token:        Token(cEvent.token),
+		NPast:        int32(cEvent.n_past),
+		CheckpointID: int32(cEvent.checkpoint_id),
+		NEmbedding:   int32(cEvent.n_embd),
+	}, true
+}
+
+// EntropyPending returns the number of pending (unread) entropy events.
+func (s *Session) EntropyPending() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return 0
+	}
+	return int(C.lfg_session_entropy_pending(s.c))
+}
+
+// EntropyFlush discards all pending entropy events without reading them.
+func (s *Session) EntropyFlush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return
+	}
+	C.lfg_session_entropy_flush(s.c)
+}
+
+// EntropyCounter returns a pointer to an atomic write counter that is incremented
+// each time an entropy event is written to the ring buffer.
+// Callers can poll this with sync/atomic.LoadInt32 or use platform-specific wait mechanisms.
+// Returns nil if the session is closed or the entropy monitor is not configured.
+func (s *Session) EntropyCounter() *int32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return nil
+	}
+	p := C.lfg_session_entropy_counter(s.c)
+	if p == nil {
+		return nil
+	}
+	return (*int32)(unsafe.Pointer(p))
+}
+
+// Rewind rewinds the session to an entropy checkpoint. Truncates the KV cache
+// and resets the sampler. The checkpointID comes from EntropyEvent.CheckpointID.
+func (s *Session) Rewind(checkpointID int32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
+	}
+
+	ok := C.lfg_session_rewind(s.c, C.int32_t(checkpointID))
+	if !bool(ok) {
+		if err := getLastError(); err != nil {
+			return err
+		}
+		return &Error{Code: ErrorInternal, Message: "failed to rewind session"}
+	}
+	return nil
+}
+
+// LastEntropy returns the normalized entropy from the last Sample() call.
+// Returns -1 if no sample has been performed.
+func (s *Session) LastEntropy() float32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return -1
+	}
+	return float32(C.lfg_session_get_last_entropy(s.c))
+}
+
+// ---------------------------------------------------------------------------
+// Embedding API
+// ---------------------------------------------------------------------------
+
+// Embed computes a mean-pooled, L2-normalized embedding for the given text.
+// Returns the embedding vector on success. Allocates an embedding context on
+// the first call (reused across subsequent calls).
+func (s *Session) Embed(text string) ([]float32, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return nil, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
+	}
+
+	cText := C.CString(text)
+	defer C.free(unsafe.Pointer(cText))
+	cLen := C.int32_t(len(text))
+
+	// First call: get embedding dimension.
+	nEmbd := C.lfg_session_embed(s.c, cText, cLen, nil, 0)
+	if nEmbd <= 0 {
+		if err := getLastError(); err != nil {
+			return nil, err
+		}
+		return nil, &Error{Code: ErrorInternal, Message: "failed to compute embedding"}
+	}
+
+	out := make([]float32, int(nEmbd))
+	n := C.lfg_session_embed(s.c, cText, cLen, (*C.float)(unsafe.Pointer(&out[0])), C.int32_t(len(out)))
+	if n <= 0 {
+		if err := getLastError(); err != nil {
+			return nil, err
+		}
+		return nil, &Error{Code: ErrorInternal, Message: "failed to compute embedding"}
+	}
+	return out[:int(n)], nil
 }

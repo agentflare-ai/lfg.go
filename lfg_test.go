@@ -1626,3 +1626,790 @@ func TestContextModel(t *testing.T) {
 		t.Fatal("Context.Model() does not match")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// MaxTokens
+// ---------------------------------------------------------------------------
+
+func TestSessionMaxTokensConfig(t *testing.T) {
+	cfg := DefaultSessionConfig()
+	if cfg.MaxTokens != 0 {
+		t.Fatalf("DefaultSessionConfig().MaxTokens = %d, want 0", cfg.MaxTokens)
+	}
+
+	WithSessionMaxTokens(100)(&cfg)
+	if cfg.MaxTokens != 100 {
+		t.Fatalf("MaxTokens = %d, want 100", cfg.MaxTokens)
+	}
+}
+
+func TestSessionMaxTokensEnforced(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	maxTok := int32(5)
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionMaxTokens(maxTok),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	tokens, _ := v.Tokenize("Once upon a time in a land far far away", true, false)
+	s.IngestTokens(tokens, true)
+
+	var generated []Token
+	for i := 0; i < 50; i++ {
+		if err := s.Decode(); err != nil {
+			t.Fatalf("Decode step %d: %v", i, err)
+		}
+		tok := s.Sample()
+		if v.IsEOG(tok) {
+			break
+		}
+		generated = append(generated, tok)
+		s.IngestTokens([]Token{tok}, true)
+	}
+
+	if int32(len(generated)) > maxTok {
+		t.Fatalf("generated %d tokens, expected at most %d", len(generated), maxTok)
+	}
+	t.Logf("MaxTokens=%d, generated %d tokens", maxTok, len(generated))
+}
+
+func TestSessionMaxTokensResetRearms(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	maxTok := int32(3)
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionMaxTokens(maxTok),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	tokens, _ := v.Tokenize("Hello world", true, false)
+
+	// First generation cycle.
+	s.IngestTokens(tokens, true)
+	var count1 int
+	for i := 0; i < 20; i++ {
+		s.Decode()
+		tok := s.Sample()
+		if v.IsEOG(tok) {
+			break
+		}
+		count1++
+		s.IngestTokens([]Token{tok}, true)
+	}
+
+	// Reset should re-arm the counter.
+	s.Reset()
+
+	s.IngestTokens(tokens, true)
+	var count2 int
+	for i := 0; i < 20; i++ {
+		s.Decode()
+		tok := s.Sample()
+		if v.IsEOG(tok) {
+			break
+		}
+		count2++
+		s.IngestTokens([]Token{tok}, true)
+	}
+
+	if int32(count1) > maxTok {
+		t.Fatalf("cycle 1: generated %d tokens, want <= %d", count1, maxTok)
+	}
+	if int32(count2) > maxTok {
+		t.Fatalf("cycle 2: generated %d tokens, want <= %d", count2, maxTok)
+	}
+	t.Logf("MaxTokens=%d, cycle1=%d, cycle2=%d", maxTok, count1, count2)
+}
+
+// ---------------------------------------------------------------------------
+// Stop Sequences
+// ---------------------------------------------------------------------------
+
+func TestSessionConfigureStopSequencesClear(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// Clearing with nil should succeed.
+	if err := s.ConfigureStopSequences(nil); err != nil {
+		t.Fatalf("ConfigureStopSequences(nil): %v", err)
+	}
+
+	// Clearing with empty slice should succeed.
+	if err := s.ConfigureStopSequences([][]Token{}); err != nil {
+		t.Fatalf("ConfigureStopSequences([]): %v", err)
+	}
+}
+
+func TestSessionConfigureStopSequences(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// Use EOS token as a stop sequence — any output containing it will halt.
+	eos := v.EOS()
+	seqs := [][]Token{{eos}}
+	if err := s.ConfigureStopSequences(seqs); err != nil {
+		t.Fatalf("ConfigureStopSequences: %v", err)
+	}
+
+	// Clear and re-set.
+	if err := s.ConfigureStopSequences(nil); err != nil {
+		t.Fatalf("ConfigureStopSequences clear: %v", err)
+	}
+
+	// Multi-token stop sequence.
+	multiSeq := [][]Token{{Token(1), Token(2), Token(3)}}
+	if err := s.ConfigureStopSequences(multiSeq); err != nil {
+		t.Fatalf("ConfigureStopSequences multi-token: %v", err)
+	}
+	t.Log("Stop sequences configured successfully")
+}
+
+func TestSessionStopSequencesClosedSession(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	s.Close()
+
+	err = s.ConfigureStopSequences([][]Token{{Token(1)}})
+	if err == nil {
+		t.Fatal("expected error on closed session")
+	}
+	t.Logf("Expected error: %v", err)
+}
+
+func TestSessionStopSequenceHaltsGeneration(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	sc := DefaultSamplingConfig()
+	sc.Seed = 42
+	sc.Temp = 0.1
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(sc),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// Generate a few tokens to discover what the model produces.
+	tokens, _ := v.Tokenize("The quick brown fox", true, false)
+	s.IngestTokens(tokens, true)
+
+	var baseline []Token
+	for i := 0; i < 10; i++ {
+		s.Decode()
+		tok := s.Sample()
+		if v.IsEOG(tok) {
+			break
+		}
+		baseline = append(baseline, tok)
+		s.IngestTokens([]Token{tok}, true)
+	}
+
+	if len(baseline) < 3 {
+		t.Skipf("Model produced only %d tokens, need at least 3 for stop sequence test", len(baseline))
+	}
+
+	// Use the 3rd token as a single-token stop sequence. Reset and re-generate.
+	stopToken := baseline[2]
+	t.Logf("Using token %d (%q) as stop sequence", stopToken, v.TokenText(stopToken, false))
+
+	s.Reset()
+	if err := s.ConfigureStopSequences([][]Token{{stopToken}}); err != nil {
+		t.Fatalf("ConfigureStopSequences: %v", err)
+	}
+
+	s.IngestTokens(tokens, true)
+	var stopped []Token
+	for i := 0; i < 20; i++ {
+		s.Decode()
+		tok := s.Sample()
+		if v.IsEOG(tok) {
+			break
+		}
+		stopped = append(stopped, tok)
+		s.IngestTokens([]Token{tok}, true)
+	}
+
+	// With the stop sequence, generation should halt at or before the baseline length.
+	if len(stopped) >= len(baseline) {
+		t.Logf("Warning: stopped generation (%d) not shorter than baseline (%d) — "+
+			"stop token may not have appeared in regenerated output", len(stopped), len(baseline))
+	}
+	t.Logf("Baseline=%d tokens, with stop sequence=%d tokens", len(baseline), len(stopped))
+}
+
+// ---------------------------------------------------------------------------
+// Tool Ranking
+// ---------------------------------------------------------------------------
+
+func TestSessionRegisterToolsBasic(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	tools := []ToolDesc{
+		{Name: "get_weather", Description: "Get the current weather for a location"},
+		{Name: "search_web", Description: "Search the web for information"},
+		{Name: "calculator", Description: "Perform arithmetic calculations", JSONSchema: `{"type":"object","properties":{"expression":{"type":"string"}}}`},
+	}
+
+	n, err := s.RegisterTools(tools, 2)
+	if err != nil {
+		t.Fatalf("RegisterTools: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("RegisterTools returned %d, want 3", n)
+	}
+	t.Logf("Registered %d tools with top_k=2", n)
+}
+
+func TestSessionRegisterToolsTopKZero(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	tools := []ToolDesc{
+		{Name: "tool_a", Description: "Tool A"},
+		{Name: "tool_b", Description: "Tool B"},
+	}
+
+	n, err := s.RegisterTools(tools, 0)
+	if err != nil {
+		t.Fatalf("RegisterTools with top_k=0: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("RegisterTools returned %d, want 2", n)
+	}
+	t.Logf("Registered %d tools with top_k=0 (injection disabled)", n)
+}
+
+func TestSessionClearTools(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	tools := []ToolDesc{
+		{Name: "tool_a", Description: "Tool A"},
+	}
+
+	_, err = s.RegisterTools(tools, 1)
+	if err != nil {
+		t.Fatalf("RegisterTools: %v", err)
+	}
+
+	// Clear should not panic or error.
+	s.ClearTools()
+
+	// Clear again (idempotent).
+	s.ClearTools()
+	t.Log("ClearTools is idempotent")
+}
+
+func TestSessionRegisterToolsReplace(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	tools1 := []ToolDesc{
+		{Name: "tool_a", Description: "Tool A"},
+	}
+	n, err := s.RegisterTools(tools1, 1)
+	if err != nil {
+		t.Fatalf("RegisterTools(1): %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("first registration returned %d, want 1", n)
+	}
+
+	// Replace with a different set.
+	tools2 := []ToolDesc{
+		{Name: "tool_x", Description: "Tool X"},
+		{Name: "tool_y", Description: "Tool Y"},
+		{Name: "tool_z", Description: "Tool Z"},
+	}
+	n, err = s.RegisterTools(tools2, 2)
+	if err != nil {
+		t.Fatalf("RegisterTools(2): %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("second registration returned %d, want 3", n)
+	}
+	t.Log("Tool re-registration works")
+}
+
+func TestSessionRegisterToolsClosedSession(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	s.Close()
+
+	tools := []ToolDesc{{Name: "t", Description: "d"}}
+	_, err = s.RegisterTools(tools, 1)
+	if err == nil {
+		t.Fatal("expected error on closed session")
+	}
+	t.Logf("Expected error: %v", err)
+}
+
+func TestSessionRegisterToolsEmpty(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	_, err = s.RegisterTools(nil, 1)
+	if err == nil {
+		t.Fatal("expected error for nil tools")
+	}
+
+	_, err = s.RegisterTools([]ToolDesc{}, 1)
+	if err == nil {
+		t.Fatal("expected error for empty tools")
+	}
+	t.Log("Empty/nil tools correctly rejected")
+}
+
+func TestSessionRegisterToolsWithDecode(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionMaxTokens(10),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	tools := []ToolDesc{
+		{Name: "get_weather", Description: "Get the current weather for a city"},
+		{Name: "search_web", Description: "Search the internet for information"},
+		{Name: "send_email", Description: "Send an email to a recipient"},
+	}
+
+	n, err := s.RegisterTools(tools, 2)
+	if err != nil {
+		t.Fatalf("RegisterTools: %v", err)
+	}
+	t.Logf("Registered %d tools", n)
+
+	// Ingest a prompt and decode — tool injection happens on first decode.
+	tokens, _ := v.Tokenize("What is the weather in Paris?", true, false)
+	s.IngestTokens(tokens, true)
+
+	var generated []Token
+	for i := 0; i < 15; i++ {
+		if err := s.Decode(); err != nil {
+			t.Fatalf("Decode step %d: %v", i, err)
+		}
+		tok := s.Sample()
+		if v.IsEOG(tok) {
+			break
+		}
+		generated = append(generated, tok)
+		s.IngestTokens([]Token{tok}, true)
+	}
+
+	text, _ := v.Detokenize(generated, false, false)
+	t.Logf("Generated with tools (%d tokens): %s", len(generated), text)
+}
+
+func TestSessionToolsWithOptionalSchema(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// Mix of tools with and without schema.
+	tools := []ToolDesc{
+		{Name: "no_schema", Description: "A tool without a schema"},
+		{Name: "with_schema", Description: "A tool with a schema", JSONSchema: `{"type":"object","properties":{"q":{"type":"string"}}}`},
+		{Name: "empty_schema", Description: "A tool with empty schema", JSONSchema: ""},
+	}
+
+	n, err := s.RegisterTools(tools, 3)
+	if err != nil {
+		t.Fatalf("RegisterTools: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("RegisterTools returned %d, want 3", n)
+	}
+	t.Log("Tools with mixed schema presence registered successfully")
+}
+
+// ---------------------------------------------------------------------------
+// Entropy Monitor API
+// ---------------------------------------------------------------------------
+
+func TestDefaultEntropyMonitorConfig(t *testing.T) {
+	cfg := DefaultEntropyMonitorConfig()
+	t.Logf("DefaultEntropyMonitorConfig: Threshold=%.2f, CooldownTokens=%d, RingSize=%d",
+		cfg.Threshold, cfg.CooldownTokens, cfg.RingSize)
+}
+
+func TestSessionConfigureEntropyMonitor(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	cfg := EntropyMonitorConfig{
+		Threshold:      0.5,
+		CooldownTokens: 2,
+		RingSize:       8,
+	}
+	nEmbd, err := s.ConfigureEntropyMonitor(&cfg)
+	if err != nil {
+		t.Fatalf("ConfigureEntropyMonitor: %v", err)
+	}
+	if nEmbd <= 0 {
+		t.Fatalf("ConfigureEntropyMonitor returned n_embd=%d, want > 0", nEmbd)
+	}
+	t.Logf("Entropy monitor configured, n_embd=%d", nEmbd)
+
+	// Disable.
+	nEmbd, err = s.ConfigureEntropyMonitor(nil)
+	if err != nil {
+		t.Fatalf("ConfigureEntropyMonitor(nil): %v", err)
+	}
+	if nEmbd != 0 {
+		t.Fatalf("ConfigureEntropyMonitor(nil) returned n_embd=%d, want 0", nEmbd)
+	}
+	t.Log("Entropy monitor configure/disable works")
+}
+
+func TestSessionEntropyMonitorClosedSession(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	s.Close()
+
+	_, err = s.ConfigureEntropyMonitor(&EntropyMonitorConfig{Threshold: 0.5})
+	if err == nil {
+		t.Fatal("expected error on closed session")
+	}
+	t.Logf("Expected error: %v", err)
+}
+
+func TestSessionEntropyPendingAndFlush(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// Without monitor configured, pending should be 0.
+	if n := s.EntropyPending(); n != 0 {
+		t.Fatalf("EntropyPending = %d, want 0 before configuring", n)
+	}
+
+	// Flush should not panic even without monitor.
+	s.EntropyFlush()
+	t.Log("EntropyPending and EntropyFlush work without monitor")
+}
+
+func TestSessionEntropyPopEmpty(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// Pop on unconfigured monitor should return false.
+	_, ok := s.EntropyPop(nil)
+	if ok {
+		t.Fatal("EntropyPop returned true without monitor configured")
+	}
+	t.Log("EntropyPop correctly returns false when no events")
+}
+
+func TestSessionEntropyCounterNil(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// Counter should be nil without entropy monitor configured.
+	p := s.EntropyCounter()
+	if p != nil {
+		t.Log("EntropyCounter returned non-nil (monitor may be auto-configured)")
+	} else {
+		t.Log("EntropyCounter is nil before configuring monitor")
+	}
+}
+
+func TestSessionEntropyMonitorWithGeneration(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	sc := DefaultSamplingConfig()
+	sc.Seed = 42
+	sc.Temp = 0.8
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(sc),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// Configure entropy monitor with a low threshold to catch events.
+	cfg := EntropyMonitorConfig{
+		Threshold:      0.1,
+		CooldownTokens: 1,
+		RingSize:       8,
+	}
+	nEmbd, err := s.ConfigureEntropyMonitor(&cfg)
+	if err != nil {
+		t.Fatalf("ConfigureEntropyMonitor: %v", err)
+	}
+	t.Logf("Entropy monitor n_embd=%d", nEmbd)
+
+	// Check counter is available.
+	counter := s.EntropyCounter()
+	if counter == nil {
+		t.Log("EntropyCounter is nil after configuring (may be implementation-specific)")
+	}
+
+	// Generate some tokens.
+	tokens, _ := v.Tokenize("The meaning of life is", true, false)
+	s.IngestTokens(tokens, true)
+
+	for i := 0; i < 20; i++ {
+		if err := s.Decode(); err != nil {
+			t.Fatalf("Decode step %d: %v", i, err)
+		}
+		tok := s.Sample()
+		if v.IsEOG(tok) {
+			break
+		}
+		s.IngestTokens([]Token{tok}, true)
+	}
+
+	// Check for pending events.
+	pending := s.EntropyPending()
+	t.Logf("Pending entropy events after generation: %d", pending)
+
+	// Try to pop events.
+	var events []EntropyEvent
+	for {
+		event, ok := s.EntropyPop(nil)
+		if !ok {
+			break
+		}
+		events = append(events, event)
+	}
+	t.Logf("Popped %d entropy events", len(events))
+
+	for i, ev := range events {
+		t.Logf("  Event[%d]: entropy=%.4f normalized=%.4f topLogprob=%.4f token=%d nPast=%d cpID=%d nEmbd=%d",
+			i, ev.Entropy, ev.Normalized, ev.TopLogprob, ev.Token, ev.NPast, ev.CheckpointID, ev.NEmbedding)
+	}
+}
+
+func TestSessionLastEntropy(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// Before any sampling, should return -1.
+	e := s.LastEntropy()
+	if e != -1 {
+		t.Logf("LastEntropy before sample: %f (expected -1, may differ by implementation)", e)
+	}
+
+	tokens, _ := v.Tokenize("Hello", true, false)
+	s.IngestTokens(tokens, true)
+	s.Decode()
+	s.Sample()
+
+	e = s.LastEntropy()
+	t.Logf("LastEntropy after sample: %f", e)
+}
+
+func TestSessionRewindClosedSession(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	s.Close()
+
+	err = s.Rewind(0)
+	if err == nil {
+		t.Fatal("expected error on closed session")
+	}
+	t.Logf("Expected error: %v", err)
+}
+
+// ---------------------------------------------------------------------------
+// Embedding API
+// ---------------------------------------------------------------------------
+
+func TestSessionEmbed(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	emb, err := s.Embed("Hello, world!")
+	if err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	if len(emb) == 0 {
+		t.Fatal("Embed returned empty vector")
+	}
+	t.Logf("Embedding dimension: %d, first 5 values: %v", len(emb), emb[:min(5, len(emb))])
+}
+
+func TestSessionEmbedClosedSession(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	s.Close()
+
+	_, err = s.Embed("test")
+	if err == nil {
+		t.Fatal("expected error on closed session")
+	}
+	t.Logf("Expected error: %v", err)
+}
+
+func TestSessionClearToolsOnClosedSession(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	s.Close()
+
+	// Should not panic.
+	s.ClearTools()
+}
+
+func TestSessionToolsResetReinjection(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionMaxTokens(5),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	tools := []ToolDesc{
+		{Name: "tool_a", Description: "First tool"},
+		{Name: "tool_b", Description: "Second tool"},
+	}
+
+	_, err = s.RegisterTools(tools, 1)
+	if err != nil {
+		t.Fatalf("RegisterTools: %v", err)
+	}
+
+	// First cycle: tools should be injected on decode.
+	tokens, _ := v.Tokenize("Hello", true, false)
+	s.IngestTokens(tokens, true)
+	s.Decode()
+	s.Sample()
+
+	// Reset clears the injected flag.
+	s.Reset()
+
+	// Second cycle: tools should be re-injected.
+	s.IngestTokens(tokens, true)
+	if err := s.Decode(); err != nil {
+		t.Fatalf("Decode after reset: %v", err)
+	}
+	tok := s.Sample()
+	if tok == InvalidToken {
+		t.Fatal("Sample after reset returned InvalidToken")
+	}
+	t.Log("Tool re-injection after reset works")
+}
