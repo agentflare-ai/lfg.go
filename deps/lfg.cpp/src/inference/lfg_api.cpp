@@ -103,6 +103,15 @@ struct lfg_confidence_ring_slot {
 };
 
 // ---------------------------------------------------------------------------
+// Internal surprise monitor types (pre-allocated at configure time)
+// ---------------------------------------------------------------------------
+
+struct lfg_surprise_ring_slot {
+    lfg_surprise_event event;
+    float             *embedding;  // Points into surprise_embd_pool
+};
+
+// ---------------------------------------------------------------------------
 // Opaque session struct (flat C, pre-allocated buffers)
 // ---------------------------------------------------------------------------
 
@@ -140,12 +149,19 @@ struct lfg_session {
     // Generation counting (for max_tokens)
     int32_t generated_count;
 
-    // Stop sequences (flat storage)
+    // Stop sequences (flat token-level storage)
     lfg_token *stop_flat;          // all sequences concatenated
     size_t    *stop_offsets;       // start offset of each sequence
     size_t    *stop_lengths;       // length of each sequence
     size_t     stop_count;         // number of sequences
     size_t     stop_max_len;       // max sequence length (for lookback)
+    int32_t    last_stop_len;      // length of last matched stop seq (set by sample)
+
+    // Text-level stop strings (encoding-independent matching)
+    char     **stop_texts;         // malloc'd array of strdup'd strings
+    int32_t   *stop_text_lens;     // length of each string
+    int32_t    stop_text_count;    // number of strings
+    int32_t    stop_text_max_len;  // max string length (for buffer sizing)
 
     // Reasoning state tracking (mirrors old InferenceCore fields)
     bool   in_reasoning;
@@ -224,6 +240,25 @@ struct lfg_session {
     volatile int32_t          confidence_write_idx;
     int32_t                   confidence_read_idx;
     int32_t                   confidence_n_embd;
+
+    // Surprise monitor config (input novelty — high-surprise span detection during ingestion)
+    float                surprise_threshold;
+    int32_t              surprise_min_span;
+    bool                 surprise_active;
+
+    // Run tracker (zero-alloc hot path state)
+    int32_t              surprise_run_count;
+    float                surprise_run_surprise_sum;
+    float                surprise_run_max_surprise;
+    int32_t              surprise_run_start_pos;
+
+    // SPSC ring buffer (pre-allocated at configure time)
+    lfg_surprise_ring_slot *surprise_slots;
+    float                  *surprise_embd_pool;
+    int32_t                 surprise_ring_cap;
+    volatile int32_t        surprise_write_idx;
+    int32_t                 surprise_read_idx;
+    int32_t                 surprise_n_embd;
 };
 
 // ---------------------------------------------------------------------------
@@ -528,6 +563,47 @@ static void session_truncate_history(lfg_session *s, size_t new_size) {
     s->pending_sampler_accepts = 0;
 }
 
+// ---------------------------------------------------------------------------
+// Surprise monitor span tracking helpers
+// ---------------------------------------------------------------------------
+
+static void session_surprise_emit(lfg_session *s, int32_t end_pos) {
+    int32_t wi = s->surprise_write_idx;
+    int slot = wi % s->surprise_ring_cap;
+    lfg_surprise_ring_slot *rs = &s->surprise_slots[slot];
+    rs->event.mean_surprise = s->surprise_run_surprise_sum / s->surprise_run_count;
+    rs->event.max_surprise  = s->surprise_run_max_surprise;
+    rs->event.span_length   = s->surprise_run_count;
+    rs->event.start_pos     = s->surprise_run_start_pos;
+    rs->event.end_pos       = end_pos;
+    rs->event.n_embd        = s->surprise_n_embd;
+    rs->embedding           = nullptr;  // Lazy — computed in pop()
+    __atomic_store_n(&s->surprise_write_idx, wi + 1, __ATOMIC_RELEASE);
+}
+
+static void session_surprise_track(lfg_session *s, float surprise, int32_t pos) {
+    if (surprise >= s->surprise_threshold) {
+        if (s->surprise_run_count == 0) {
+            s->surprise_run_start_pos = pos;
+            s->surprise_run_max_surprise = surprise;
+        }
+        s->surprise_run_count++;
+        s->surprise_run_surprise_sum += surprise;
+        if (surprise > s->surprise_run_max_surprise)
+            s->surprise_run_max_surprise = surprise;
+    } else {
+        if (s->surprise_run_count >= s->surprise_min_span)
+            session_surprise_emit(s, pos);
+        s->surprise_run_count = 0;
+        s->surprise_run_surprise_sum = 0.0f;
+        s->surprise_run_max_surprise = 0.0f;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal ingestion
+// ---------------------------------------------------------------------------
+
 static bool session_ingest_internal(lfg_session *s, const lfg_token *tokens, size_t n_tokens, bool update_sampler) {
     if (!s->ctx) return false;
 
@@ -560,13 +636,64 @@ static bool session_ingest_internal(lfg_session *s, const lfg_token *tokens, siz
         batch.pos = s->pos_buf;
         batch.n_seq_id = nullptr;
         batch.seq_id = nullptr;
-        batch.logits = nullptr;
+
+        // Enable all-position logits when surprise monitor is active
+        if (s->surprise_active && n > 1) {
+            // Ensure logits_buf is large enough
+            if ((size_t)n > s->logits_buf_cap) {
+                s->logits_buf = (int8_t *)realloc(s->logits_buf, (size_t)n * sizeof(int8_t));
+                s->logits_buf_cap = (size_t)n;
+            }
+            for (int p = 0; p < n; ++p) s->logits_buf[p] = 1;
+            batch.logits = s->logits_buf;
+        } else {
+            batch.logits = nullptr;
+        }
 
         if (lfg_decode(s->ctx, batch) != 0) {
             spdlog::error("lfg_decode failed");
             return false;
         }
+
+        // --- Per-token surprise computation ---
+        if (s->surprise_active && n > 1) {
+            const lfg_vocab *vocab = lfg_model_get_vocab(s->model);
+            int n_vocab = lfg_vocab_n_tokens(vocab);
+            float log_v = logf((float)n_vocab);
+
+            // For position p in [0, n-2]: logits[p] predict tokens[i+p+1]
+            for (int p = 0; p < n - 1; ++p) {
+                if (i == 0 && p == 0) continue;  // skip BOS — no context
+
+                float *logits = lfg_get_logits_ith(s->ctx, p);
+                if (!logits) continue;
+                lfg_token next_tok = tokens[i + p + 1];
+
+                // 2-pass softmax: find max, sum exp, lookup P(next_tok)
+                float max_l = logits[0];
+                for (int v = 1; v < n_vocab; ++v)
+                    if (logits[v] > max_l) max_l = logits[v];
+                float sum_exp = 0.0f;
+                for (int v = 0; v < n_vocab; ++v)
+                    sum_exp += expf(logits[v] - max_l);
+                float p_tok = expf(logits[next_tok] - max_l) / sum_exp;
+                float surprise = (p_tok > 0.0f)
+                    ? (-logf(p_tok) / log_v) : 1.0f;
+
+                // Span tracking (same pattern as confidence, but inverted threshold)
+                session_surprise_track(s, surprise, s->n_past + p);
+            }
+        }
+
         s->n_past += n;
+    }
+
+    // Post-ingest: flush any in-progress surprise run
+    if (s->surprise_active && s->surprise_run_count >= s->surprise_min_span) {
+        session_surprise_emit(s, s->n_past);
+        s->surprise_run_count = 0;
+        s->surprise_run_surprise_sum = 0.0f;
+        s->surprise_run_max_surprise = 0.0f;
     }
 
     // Update sampler + history + offsets
@@ -752,6 +879,21 @@ LFG_API lfg_session * lfg_session_create(lfg_model * model, const lfg_session_co
     s->confidence_read_idx = 0;
     s->confidence_n_embd = 0;
 
+    // Surprise monitor (all nullptr/zero — allocated in configure_surprise_monitor)
+    s->surprise_threshold = 0.0f;
+    s->surprise_min_span = 3;
+    s->surprise_active = false;
+    s->surprise_run_count = 0;
+    s->surprise_run_surprise_sum = 0.0f;
+    s->surprise_run_max_surprise = 0.0f;
+    s->surprise_run_start_pos = 0;
+    s->surprise_slots = nullptr;
+    s->surprise_embd_pool = nullptr;
+    s->surprise_ring_cap = 0;
+    s->surprise_write_idx = 0;
+    s->surprise_read_idx = 0;
+    s->surprise_n_embd = 0;
+
     session_rebuild_sampler(s);
 
     return s;
@@ -776,6 +918,11 @@ LFG_API void lfg_session_free(lfg_session * session) {
     free(session->stop_flat);
     free(session->stop_offsets);
     free(session->stop_lengths);
+    for (int32_t i = 0; i < session->stop_text_count; i++) {
+        free(session->stop_texts[i]);
+    }
+    free(session->stop_texts);
+    free(session->stop_text_lens);
     free(session->pos_buf);
     free(session->logits_buf);
 
@@ -796,6 +943,13 @@ LFG_API void lfg_session_free(lfg_session * session) {
 
     free(session->confidence_slots);
     free(session->confidence_embd_pool);
+
+    // Surprise monitor
+    session->surprise_write_idx = 0;
+    session->surprise_read_idx = 0;
+
+    free(session->surprise_slots);
+    free(session->surprise_embd_pool);
 
     free(session);
 }
@@ -846,6 +1000,15 @@ LFG_API void lfg_session_reset(lfg_session * session) {
         session->confidence_run_count = 0;
         session->confidence_run_entropy_sum = 0.0f;
         session->confidence_run_min_entropy = 1.0f;
+    }
+
+    // Surprise monitor reset
+    if (session->surprise_active) {
+        session->surprise_write_idx = 0;
+        session->surprise_read_idx = 0;
+        session->surprise_run_count = 0;
+        session->surprise_run_surprise_sum = 0.0f;
+        session->surprise_run_max_surprise = 0.0f;
     }
 }
 
@@ -969,6 +1132,44 @@ LFG_API bool lfg_session_configure_stop_sequences(
     }
     session->stop_count = count;
     session->stop_max_len = max_len;
+
+    return true;
+}
+
+LFG_API bool lfg_session_configure_stop_strings(
+        lfg_session * session,
+        const char * const * strings,
+        int32_t n_strings) {
+    if (!session) return false;
+
+    // Free old storage
+    for (int32_t i = 0; i < session->stop_text_count; i++) {
+        free(session->stop_texts[i]);
+    }
+    free(session->stop_texts);
+    free(session->stop_text_lens);
+    session->stop_texts = nullptr;
+    session->stop_text_lens = nullptr;
+    session->stop_text_count = 0;
+    session->stop_text_max_len = 0;
+
+    if (n_strings <= 0 || !strings) return true;
+
+    session->stop_texts = (char **)malloc(n_strings * sizeof(char *));
+    session->stop_text_lens = (int32_t *)malloc(n_strings * sizeof(int32_t));
+
+    int32_t count = 0;
+    int32_t max_len = 0;
+    for (int32_t i = 0; i < n_strings; i++) {
+        if (!strings[i] || strings[i][0] == '\0') continue;
+        int32_t len = (int32_t)std::strlen(strings[i]);
+        session->stop_texts[count] = strdup(strings[i]);
+        session->stop_text_lens[count] = len;
+        if (len > max_len) max_len = len;
+        count++;
+    }
+    session->stop_text_count = count;
+    session->stop_text_max_len = max_len;
 
     return true;
 }
@@ -1293,6 +1494,7 @@ LFG_API lfg_token lfg_session_sample(lfg_session * session) {
             if (seq[slen - 1] != token) continue;
 
             if (slen == 1) {
+                session->last_stop_len = 1;
                 return lfg_vocab_eos(lfg_model_get_vocab(session->model));
             }
 
@@ -1302,6 +1504,7 @@ LFG_API lfg_token lfg_session_sample(lfg_session * session) {
 
             const lfg_token *tail = session->token_history.data + hist_len - (slen - 1);
             if (std::memcmp(tail, seq, (slen - 1) * sizeof(lfg_token)) == 0) {
+                session->last_stop_len = (int32_t)slen;
                 return lfg_vocab_eos(lfg_model_get_vocab(session->model));
             }
         }
@@ -1769,8 +1972,8 @@ LFG_API void lfg_session_clear_tools(lfg_session * session) {
     session_free_tool_entries(session);
     session->tool_top_k = 0;
     session->tools_injected = false;
-    // Only free tool_ctx if entropy/confidence monitor isn't using it
-    if (session->tool_ctx && !session->entropy_active && !session->confidence_active) {
+    // Only free tool_ctx if entropy/confidence/surprise monitor isn't using it
+    if (session->tool_ctx && !session->entropy_active && !session->confidence_active && !session->surprise_active) {
         lfg_free(session->tool_ctx);
         session->tool_ctx = nullptr;
     }
@@ -2086,6 +2289,116 @@ LFG_API volatile int32_t * lfg_session_confidence_counter(lfg_session * session)
 }
 
 // ---------------------------------------------------------------------------
+// Surprise Monitor API
+// ---------------------------------------------------------------------------
+
+LFG_API lfg_surprise_monitor_config lfg_surprise_monitor_default_config(void) {
+    lfg_surprise_monitor_config cfg{};
+    cfg.threshold = 0.5f;
+    cfg.min_span = 3;
+    cfg.ring_size = 8;
+    return cfg;
+}
+
+LFG_API int32_t lfg_session_configure_surprise_monitor(
+    lfg_session * session, const lfg_surprise_monitor_config * config) {
+    if (!session) return 0;
+
+    // Pass NULL to disable
+    if (!config) {
+        session->surprise_active = false;
+        return 0;
+    }
+
+    if (!session_ensure_embed_ctx(session)) {
+        lfg_set_last_error(LFG_ERROR_INTERNAL,
+            "%s: failed to create embedding context", __func__);
+        return 0;
+    }
+
+    int32_t cap = config->ring_size > 0 ? config->ring_size : 8;
+    int32_t min_span = config->min_span > 0 ? config->min_span : 3;
+    int32_t n_embd = lfg_model_n_embd(session->model);
+
+    // Free previous allocations
+    free(session->surprise_slots);
+    free(session->surprise_embd_pool);
+
+    // One-time allocation of ring buffer + embedding pool
+    session->surprise_slots     = (lfg_surprise_ring_slot *)calloc(cap, sizeof(lfg_surprise_ring_slot));
+    session->surprise_embd_pool = (float *)calloc(cap * n_embd, sizeof(float));
+
+    // Wire each slot's embedding pointer to pool
+    for (int32_t i = 0; i < cap; ++i) {
+        session->surprise_slots[i].embedding = session->surprise_embd_pool + (i * n_embd);
+    }
+
+    session->surprise_ring_cap     = cap;
+    session->surprise_n_embd       = n_embd;
+    session->surprise_write_idx    = 0;
+    session->surprise_read_idx     = 0;
+    session->surprise_threshold    = config->threshold;
+    session->surprise_min_span     = min_span;
+    session->surprise_run_count    = 0;
+    session->surprise_run_surprise_sum = 0.0f;
+    session->surprise_run_max_surprise = 0.0f;
+    session->surprise_run_start_pos    = 0;
+    session->surprise_active       = true;
+
+    return n_embd;
+}
+
+LFG_API bool lfg_session_surprise_pop(lfg_session * session,
+                                       lfg_surprise_event * event_out,
+                                       float * embd_out, int32_t embd_cap) {
+    if (!session || !session->surprise_slots) return false;
+
+    int32_t wi = __atomic_load_n(&session->surprise_write_idx, __ATOMIC_ACQUIRE);
+    if (session->surprise_read_idx >= wi) return false;
+
+    int slot = session->surprise_read_idx % session->surprise_ring_cap;
+    lfg_surprise_ring_slot *rs = &session->surprise_slots[slot];
+
+    // Lazy embedding: compute on pop if caller wants it and we haven't yet
+    if (embd_out && embd_cap >= session->surprise_n_embd && !rs->embedding) {
+        float *slot_embd = session->surprise_embd_pool + (slot * session->surprise_n_embd);
+        bool got = compute_query_embedding(session, slot_embd);
+        if (got) {
+            rs->embedding = slot_embd;
+        } else {
+            rs->event.n_embd = 0;
+        }
+    }
+
+    if (event_out) *event_out = rs->event;
+
+    if (embd_out && rs->embedding && rs->event.n_embd > 0) {
+        int32_t n = rs->event.n_embd < embd_cap ? rs->event.n_embd : embd_cap;
+        std::memcpy(embd_out, rs->embedding, n * sizeof(float));
+    }
+
+    session->surprise_read_idx++;
+    return true;
+}
+
+LFG_API int32_t lfg_session_surprise_pending(lfg_session * session) {
+    if (!session || !session->surprise_slots) return 0;
+    int32_t wi = __atomic_load_n(&session->surprise_write_idx, __ATOMIC_ACQUIRE);
+    int32_t pending = wi - session->surprise_read_idx;
+    return pending > 0 ? pending : 0;
+}
+
+LFG_API void lfg_session_surprise_flush(lfg_session * session) {
+    if (!session) return;
+    session->surprise_read_idx = __atomic_load_n(&session->surprise_write_idx, __ATOMIC_ACQUIRE);
+}
+
+LFG_API volatile int32_t * lfg_session_surprise_counter(lfg_session * session) {
+    if (!session) return nullptr;
+    return &session->surprise_write_idx;
+}
+
+// ---------------------------------------------------------------------------
 // Embedding API
 // ---------------------------------------------------------------------------
 
@@ -2154,6 +2467,8 @@ LFG_API lfg_generate_config lfg_generate_default_config(void) {
     cfg.entropy_cb_data = nullptr;
     cfg.confidence_cb = nullptr;
     cfg.confidence_cb_data = nullptr;
+    cfg.surprise_cb = nullptr;
+    cfg.surprise_cb_data = nullptr;
     return cfg;
 }
 
@@ -2183,12 +2498,77 @@ LFG_API lfg_generate_result lfg_session_generate(
         conf_embd_buf = (float *)alloca(session->confidence_n_embd * sizeof(float));
     }
 
+    // Drain surprise events from prompt ingestion (before generation loop)
+    if (config.surprise_cb && session->surprise_active) {
+        float *surp_embd_buf = nullptr;
+        if (session->surprise_n_embd > 0) {
+            surp_embd_buf = (float *)alloca(session->surprise_n_embd * sizeof(float));
+        }
+        lfg_surprise_event sev;
+        while (lfg_session_surprise_pop(session, &sev, surp_embd_buf, session->surprise_n_embd)) {
+            config.surprise_cb(&sev, sev.n_embd > 0 ? surp_embd_buf : nullptr,
+                               config.surprise_cb_data);
+            result.n_surprise_spans++;
+        }
+    } else if (session->surprise_active) {
+        lfg_session_surprise_flush(session);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stop look-ahead buffer (token-level + text-level).
+    // Holds back the last N tokens before emitting them through the callback.
+    // Token-level: suppresses prefix tokens when sample() fires a stop seq.
+    // Text-level: matches accumulated piece text against stop strings.
+    // -----------------------------------------------------------------------
+    struct stop_slot {
+        lfg_token token;
+        int32_t   piece_len;
+        char      piece[256];
+    };
+
+    // Buffer capacity: max of token-level need and text-level need
+    int32_t tok_buf_need = (session->stop_max_len > 1)
+        ? (int32_t)(session->stop_max_len - 1) : 0;
+    int32_t txt_buf_need = session->stop_text_max_len;  // worst case: 1 char/token
+    int32_t stop_buf_cap = (tok_buf_need > txt_buf_need) ? tok_buf_need : txt_buf_need;
+    if (!config.token_cb) stop_buf_cap = 0;
+
+    stop_slot *stop_buf = nullptr;
+    int32_t stop_buf_count = 0;
+
+    if (stop_buf_cap > 0) {
+        // Allocate cap+1 slots for push-before-emit ordering
+        stop_buf = (stop_slot *)alloca((stop_buf_cap + 1) * sizeof(stop_slot));
+    }
+
+    session->last_stop_len = 0;
+
     for (int32_t i = 0; i < max_tokens; ++i) {
         lfg_session_decode(session);
         lfg_token tok = lfg_session_sample(session);
 
         if (lfg_vocab_is_eog(vocab, tok)) {
-            result.stop_reason = LFG_STOP_EOS;
+            // Flush buffered tokens, discarding stop sequence prefix tokens
+            if (stop_buf_count > 0) {
+                int32_t discard = (session->last_stop_len > 1)
+                    ? (session->last_stop_len - 1) : 0;
+                int32_t flush_n = stop_buf_count - discard;
+                if (flush_n < 0) flush_n = 0;
+                for (int32_t j = 0; j < flush_n; j++) {
+                    lfg_generate_action action = config.token_cb(
+                        stop_buf[j].token, stop_buf[j].piece,
+                        stop_buf[j].piece_len, config.token_cb_data);
+                    if (action == LFG_GENERATE_STOP) {
+                        result.stop_reason = LFG_STOP_CALLBACK;
+                        stopped = true;
+                        break;
+                    }
+                }
+                stop_buf_count = 0;
+            }
+            if (!stopped) {
+                result.stop_reason = LFG_STOP_EOS;
+            }
             stopped = true;
             break;
         }
@@ -2222,6 +2602,7 @@ LFG_API lfg_generate_result lfg_session_generate(
                         }
                         result.n_retrievals++;
                         lfg_session_entropy_flush(session);
+                        stop_buf_count = 0;  // Rewound — buffered tokens are invalid
                         continue;  // re-decode from injected position
                     }
                 }
@@ -2243,8 +2624,102 @@ LFG_API lfg_generate_result lfg_session_generate(
 
         result.n_tokens = i + 1;
 
-        // Token callback (for streaming)
-        if (config.token_cb) {
+        // Token callback with stop look-ahead buffering (token + text level)
+        if (stop_buf_cap > 0) {
+            // Convert token to piece text
+            int32_t n = lfg_token_to_piece(vocab, tok, piece_buf, sizeof(piece_buf), 0, false);
+            if (n < 0) n = 0;
+
+            // Push new token into buffer (may temporarily exceed cap)
+            stop_buf[stop_buf_count].token = tok;
+            stop_buf[stop_buf_count].piece_len = n;
+            std::memcpy(stop_buf[stop_buf_count].piece, piece_buf, n);
+            stop_buf[stop_buf_count].piece[n] = '\0';
+            stop_buf_count++;
+
+            // Text-level stop matching: check if buffered text contains any stop string.
+            // Uses strstr (not suffix match) because BPE tokens can include trailing
+            // characters after the stop text (e.g. ">\n" instead of just ">").
+            if (session->stop_text_count > 0) {
+                // Concatenate piece texts from buffer
+                char match_buf[1024];
+                int32_t match_len = 0;
+                for (int32_t j = 0; j < stop_buf_count && match_len < (int32_t)sizeof(match_buf) - 256; j++) {
+                    std::memcpy(match_buf + match_len, stop_buf[j].piece, stop_buf[j].piece_len);
+                    match_len += stop_buf[j].piece_len;
+                }
+                match_buf[match_len] = '\0';
+
+                for (int32_t s = 0; s < session->stop_text_count; s++) {
+                    const char *found = std::strstr(match_buf, session->stop_texts[s]);
+                    if (!found) continue;
+
+                    // Stop string found — emit tokens before it, discard from it onward
+                    int32_t emit_chars = (int32_t)(found - match_buf);
+
+                    // Find token boundary: count whole tokens that fit before emit_chars
+                    int32_t chars_so_far = 0;
+                    int32_t flush_n = 0;
+                    for (int32_t j = 0; j < stop_buf_count; j++) {
+                        if (chars_so_far + stop_buf[j].piece_len <= emit_chars) {
+                            chars_so_far += stop_buf[j].piece_len;
+                            flush_n = j + 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Flush safe whole tokens
+                    for (int32_t j = 0; j < flush_n && !stopped; j++) {
+                        lfg_generate_action action = config.token_cb(
+                            stop_buf[j].token, stop_buf[j].piece,
+                            stop_buf[j].piece_len, config.token_cb_data);
+                        if (action == LFG_GENERATE_STOP) {
+                            result.stop_reason = LFG_STOP_CALLBACK;
+                            stopped = true;
+                        }
+                    }
+
+                    // Emit safe prefix of partially-matched boundary token
+                    if (!stopped && flush_n < stop_buf_count && chars_so_far < emit_chars) {
+                        int32_t safe_chars = emit_chars - chars_so_far;
+                        lfg_generate_action action = config.token_cb(
+                            stop_buf[flush_n].token,
+                            stop_buf[flush_n].piece,
+                            safe_chars, config.token_cb_data);
+                        if (action == LFG_GENERATE_STOP) {
+                            result.stop_reason = LFG_STOP_CALLBACK;
+                            stopped = true;
+                        }
+                    }
+
+                    if (!stopped) result.stop_reason = LFG_STOP_EOS;
+                    stopped = true;
+                    stop_buf_count = 0;
+                    break;
+                }
+                if (stopped) break;
+            }
+
+            // If buffer exceeds capacity, emit oldest token (confirmed safe)
+            while (stop_buf_count > stop_buf_cap) {
+                lfg_generate_action action = config.token_cb(
+                    stop_buf[0].token, stop_buf[0].piece,
+                    stop_buf[0].piece_len, config.token_cb_data);
+                if (action == LFG_GENERATE_STOP) {
+                    result.stop_reason = LFG_STOP_CALLBACK;
+                    stopped = true;
+                    break;
+                }
+                if (stop_buf_count > 1) {
+                    std::memmove(stop_buf, stop_buf + 1,
+                                 (stop_buf_count - 1) * sizeof(stop_slot));
+                }
+                stop_buf_count--;
+            }
+            if (stopped) break;
+        } else if (config.token_cb) {
+            // No buffering needed — emit directly
             int32_t n = lfg_token_to_piece(vocab, tok, piece_buf, sizeof(piece_buf), 0, false);
             if (n < 0) n = 0;
             lfg_generate_action action = config.token_cb(tok, piece_buf, n, config.token_cb_data);
@@ -2256,6 +2731,20 @@ LFG_API lfg_generate_result lfg_session_generate(
         }
 
         lfg_session_ingest_tokens(session, &tok, 1, false);
+    }
+
+    // Flush remaining buffered tokens on non-EOS stop (max_tokens)
+    if (stop_buf_count > 0 && !stopped) {
+        for (int32_t j = 0; j < stop_buf_count; j++) {
+            lfg_generate_action action = config.token_cb(
+                stop_buf[j].token, stop_buf[j].piece,
+                stop_buf[j].piece_len, config.token_cb_data);
+            if (action == LFG_GENERATE_STOP) {
+                result.stop_reason = LFG_STOP_CALLBACK;
+                stopped = true;
+                break;
+            }
+        }
     }
 
     if (!stopped) {
@@ -2499,7 +2988,37 @@ LFG_API lfg_generate_result lfg_session_chat_generate(
     lfg_session_ingest_tokens(session, tokens, n, false);
     free(tokens);
 
-    // 7. Generate
+    // 7. Auto-configure text stop string for the EOS token's text representation.
+    //    The generate loop already stops on the special EOS token, but small
+    //    models sometimes generate the TEXT version (e.g. "<|im_end|>" spelled
+    //    out as regular tokens) which doesn't trigger EOG detection.  Using a
+    //    text-level stop string catches the text form regardless of how the
+    //    tokenizer splits it.
+    if (session->stop_text_count == 0) {
+        lfg_token eos = lfg_vocab_eos(vocab);
+        char eos_text[64];
+        int32_t eos_len = lfg_token_to_piece(vocab, eos, eos_text, sizeof(eos_text), 0, true);
+        if (eos_len > 0) {
+            eos_text[eos_len] = '\0';
+            // Models sometimes generate a "closing tag" variant of the EOS
+            // token text, e.g. "</|im_end|>" instead of "<|im_end|>".  Add
+            // both variants so the text stop catches either form.
+            if (eos_text[0] == '<' && eos_len + 1 < (int32_t)sizeof(eos_text)) {
+                char close_text[66];
+                close_text[0] = '<';
+                close_text[1] = '/';
+                std::memcpy(close_text + 2, eos_text + 1, eos_len - 1);
+                close_text[eos_len + 1] = '\0';
+                const char *strs[] = { eos_text, close_text };
+                lfg_session_configure_stop_strings(session, strs, 2);
+            } else {
+                const char *strs[] = { eos_text };
+                lfg_session_configure_stop_strings(session, strs, 1);
+            }
+        }
+    }
+
+    // 8. Generate
     return lfg_session_generate(session, config);
 }
 
