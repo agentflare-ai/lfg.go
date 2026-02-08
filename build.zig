@@ -749,6 +749,12 @@ fn addExecutables(
     addCommonExeLinks(bench_confidence, target, framework_path, private_framework_path, sysroot);
     b.installArtifact(bench_confidence);
 
+    const bench_surprise = addExe(b, target, optimize, "bench-surprise-overhead", &[_][]const u8{"src/eval/bench_surprise_overhead.cpp"}, spdlog_include, cxx_flags, framework_path, private_framework_path);
+    bench_surprise.linkLibrary(lfg_core);
+    bench_surprise.linkLibrary(ggml);
+    addCommonExeLinks(bench_surprise, target, framework_path, private_framework_path, sysroot);
+    b.installArtifact(bench_surprise);
+
     const llama_struct = addExe(b, target, optimize, "llama-structured-compare", &[_][]const u8{
         "src/eval/llama_structured_compare.cpp",
         "src/inference/json_schema_to_grammar.cpp",
@@ -855,10 +861,12 @@ fn addTests(
         "test_tool_ranker",
         "test_entropy_monitor",
         "test_confidence_monitor",
+        "test_surprise_monitor",
         "test_generate_loop",
         "test_structured_generate",
         "test_chat_integration",
         "test_tool_injection",
+        "test_tool_chat_integration",
     };
 
     const test_files = [_][]const u8{
@@ -892,10 +900,12 @@ fn addTests(
         "src/tests/test_tool_ranker.cpp",
         "src/tests/test_entropy_monitor.cpp",
         "src/tests/test_confidence_monitor.cpp",
+        "src/tests/test_surprise_monitor.cpp",
         "src/tests/test_generate_loop.cpp",
         "src/tests/test_structured_generate.cpp",
         "src/tests/test_chat_integration.cpp",
         "src/tests/test_tool_injection.cpp",
+        "src/tests/test_tool_chat_integration.cpp",
     };
 
     var test_step = b.step("test", "Build and run tests");
