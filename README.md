@@ -178,9 +178,10 @@ result, err := session.GenerateFromState(lfg.GenerateConfig{
 
 ```go
 lfg.GenerateConfig{
-	MaxTokens:       256,           // 0 = use session config
-	TokenCallback:   func(...) ..., // called per token (optional)
-	EntropyCallback: func(...) ..., // called on high entropy (optional)
+	MaxTokens:          256,           // 0 = use session config
+	TokenCallback:      func(...) ..., // called per token (optional)
+	EntropyCallback:    func(...) ..., // called on high entropy (optional)
+	ConfidenceCallback: func(...) ..., // called on confident span end (optional)
 }
 ```
 
@@ -233,3 +234,46 @@ The library is organized around these core types:
 - **`Context`** / **`Batch`** / **`Sampler`** - Low-level building blocks
 
 The C-side generate loop (`ChatGenerate`, `PromptGenerate`, `GenerateFromState`) is the recommended way to generate text. It runs the entire decode+sample+ingest loop in C with a single CGo crossing, compared to the channel-based `Generate` which makes 3 CGo calls per token.
+
+### Entropy Monitor
+
+Detect high-entropy tokens during generation and optionally inject context:
+
+```go
+// Configure the entropy monitor.
+cfg := lfg.EntropyMonitorConfig{Threshold: 0.5, CooldownTokens: 2, RingSize: 8}
+nEmbd, _ := session.ConfigureEntropyMonitor(&cfg)
+
+// Use EntropyCallback in GenerateConfig for automatic rewind+inject.
+result, _ := session.PromptGenerate("prompt", true, lfg.GenerateConfig{
+    MaxTokens: 256,
+    EntropyCallback: func(event lfg.EntropyEvent, embedding []float32) string {
+        return "injected context" // or "" to skip
+    },
+})
+// result.Retrievals = number of rewind+inject cycles
+
+// Or poll manually: EntropyPop, EntropyPending, EntropyFlush, EntropyCounter
+```
+
+### Confidence Monitor
+
+Detect sustained low-entropy spans (where the model is confident). The inverse of the entropy monitor — fires events when confident spans **end**:
+
+```go
+// Configure the confidence monitor.
+cfg := lfg.ConfidenceMonitorConfig{Threshold: 0.3, MinSpan: 5, RingSize: 4}
+nEmbd, _ := session.ConfigureConfidenceMonitor(&cfg)
+
+// Use ConfidenceCallback in GenerateConfig for real-time notifications.
+result, _ := session.PromptGenerate("prompt", true, lfg.GenerateConfig{
+    MaxTokens: 256,
+    ConfidenceCallback: func(event lfg.ConfidenceEvent, embedding []float32) {
+        fmt.Printf("Confident span: %d tokens, mean entropy %.3f\n",
+            event.SpanLength, event.MeanEntropy)
+    },
+})
+// result.ConfidenceSpans = number of confidence events fired
+
+// Or poll manually: ConfidencePop, ConfidencePending, ConfidenceFlush, ConfidenceCounter
+```

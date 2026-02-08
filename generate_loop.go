@@ -8,6 +8,8 @@ package lfg
 // Types must match exactly what cgo generates (no const qualifiers).
 extern int goGenerateTokenCB(int32_t token, char *piece, int32_t piece_len, void *user_data);
 extern char * goGenerateEntropyCB(lfg_entropy_event *event, float *embedding, void *user_data);
+extern void goGenerateConfidenceCB(lfg_confidence_event *event, float *embedding, void *user_data);
+extern void goGenerateSurpriseCB(lfg_surprise_event *event, float *embedding, void *user_data);
 
 // C trampolines matching the callback typedefs.
 static lfg_generate_action c_token_trampoline(lfg_token token, const char *piece, int32_t piece_len, void *user_data) {
@@ -18,12 +20,28 @@ static const char * c_entropy_trampoline(const lfg_entropy_event *event, const f
     return (const char *)goGenerateEntropyCB((lfg_entropy_event *)event, (float *)embedding, user_data);
 }
 
+static void c_confidence_trampoline(const lfg_confidence_event *event, const float *embedding, void *user_data) {
+    goGenerateConfidenceCB((lfg_confidence_event *)event, (float *)embedding, user_data);
+}
+
+static void c_surprise_trampoline(const lfg_surprise_event *event, const float *embedding, void *user_data) {
+    goGenerateSurpriseCB((lfg_surprise_event *)event, (float *)embedding, user_data);
+}
+
 static lfg_generate_token_cb get_token_trampoline(void) {
     return c_token_trampoline;
 }
 
 static lfg_generate_entropy_cb get_entropy_trampoline(void) {
     return c_entropy_trampoline;
+}
+
+static lfg_generate_confidence_cb get_confidence_trampoline(void) {
+    return c_confidence_trampoline;
+}
+
+static lfg_generate_surprise_cb get_surprise_trampoline(void) {
+    return c_surprise_trampoline;
 }
 */
 import "C"
@@ -64,18 +82,32 @@ type TokenCallback func(token Token, piece string) GenerateAction
 // or empty string to skip this event and continue generating.
 type EntropyCallback func(event EntropyEvent, embedding []float32) string
 
+// ConfidenceCallback is called when a sustained low-entropy span ends.
+// event contains span metrics, embedding is the mean-pooled embedding (may be nil).
+// Informational only — no return value needed (unlike EntropyCallback, no rewind).
+type ConfidenceCallback func(event ConfidenceEvent, embedding []float32)
+
+// SurpriseCallback is called when a sustained high-surprise span is detected during prompt ingestion.
+// event contains surprise metrics, embedding is the mean-pooled embedding (may be nil).
+// Informational only — no return value needed.
+type SurpriseCallback func(event SurpriseEvent, embedding []float32)
+
 // GenerateConfig configures a C-side generate loop.
 type GenerateConfig struct {
-	MaxTokens       int32           // Hard token limit. 0 = use session config.
-	TokenCallback   TokenCallback   // Per-token callback (optional).
-	EntropyCallback EntropyCallback // Entropy threshold callback (optional).
+	MaxTokens          int32              // Hard token limit. 0 = use session config.
+	TokenCallback      TokenCallback      // Per-token callback (optional).
+	EntropyCallback    EntropyCallback    // Entropy threshold callback (optional).
+	ConfidenceCallback ConfidenceCallback // Confidence span callback (optional).
+	SurpriseCallback   SurpriseCallback   // Surprise span callback (optional).
 }
 
 // GenerateLoopResult holds the result from a C-side generate loop.
 type GenerateLoopResult struct {
-	TokenCount int        // Number of tokens generated.
-	Retrievals int        // Number of entropy-triggered rewind+inject cycles.
-	StopReason StopReason // Why generation stopped.
+	TokenCount      int        // Number of tokens generated.
+	Retrievals      int        // Number of entropy-triggered rewind+inject cycles.
+	ConfidenceSpans int        // Number of confidence events fired.
+	SurpriseEvents  int        // Number of surprise events from prompt ingestion (0 or 1).
+	StopReason      StopReason // Why generation stopped.
 }
 
 // DefaultGenerateConfig returns a zero-valued generate configuration.
@@ -88,9 +120,11 @@ func DefaultGenerateConfig() GenerateConfig {
 // ---------------------------------------------------------------------------
 
 type generateHandle struct {
-	tokenCB   TokenCallback
-	entropyCB EntropyCallback
-	cStrings  []unsafe.Pointer // CStrings allocated by entropy callback, freed after generate.
+	tokenCB      TokenCallback
+	entropyCB    EntropyCallback
+	confidenceCB ConfidenceCallback
+	surpriseCB   SurpriseCallback
+	cStrings     []unsafe.Pointer // CStrings allocated by entropy callback, freed after generate.
 }
 
 var (
@@ -181,6 +215,65 @@ func goGenerateEntropyCB(event *C.lfg_entropy_event, embedding *C.float, userDat
 	return cs
 }
 
+//export goGenerateConfidenceCB
+func goGenerateConfidenceCB(event *C.lfg_confidence_event, embedding *C.float, userData unsafe.Pointer) {
+	if userData == nil {
+		return
+	}
+	id := *(*uintptr)(userData)
+	genCBMu.Lock()
+	h, ok := genCBMap[id]
+	genCBMu.Unlock()
+	if !ok || h.confidenceCB == nil {
+		return
+	}
+
+	goEvent := ConfidenceEvent{
+		MeanEntropy: float32(event.mean_entropy),
+		MinEntropy:  float32(event.min_entropy),
+		SpanLength:  int32(event.span_length),
+		StartPos:    int32(event.start_pos),
+		EndPos:      int32(event.end_pos),
+		NEmbedding:  int32(event.n_embd),
+	}
+
+	var goEmbed []float32
+	if embedding != nil && goEvent.NEmbedding > 0 {
+		goEmbed = unsafe.Slice((*float32)(unsafe.Pointer(embedding)), goEvent.NEmbedding)
+	}
+
+	h.confidenceCB(goEvent, goEmbed)
+}
+
+//export goGenerateSurpriseCB
+func goGenerateSurpriseCB(event *C.lfg_surprise_event, embedding *C.float, userData unsafe.Pointer) {
+	if userData == nil {
+		return
+	}
+	id := *(*uintptr)(userData)
+	genCBMu.Lock()
+	h, ok := genCBMap[id]
+	genCBMu.Unlock()
+	if !ok || h.surpriseCB == nil {
+		return
+	}
+
+	goEvent := SurpriseEvent{
+		MeanSurprise:     float32(event.mean_surprise),
+		MaxSurprise:      float32(event.max_surprise),
+		NAboveThreshold:  int32(event.n_above_threshold),
+		NTokensEvaluated: int32(event.n_tokens_evaluated),
+		NEmbedding:       int32(event.n_embd),
+	}
+
+	var goEmbed []float32
+	if embedding != nil && goEvent.NEmbedding > 0 {
+		goEmbed = unsafe.Slice((*float32)(unsafe.Pointer(embedding)), goEvent.NEmbedding)
+	}
+
+	h.surpriseCB(goEvent, goEmbed)
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -197,13 +290,15 @@ func prepareGenerate(config *GenerateConfig) (func(), C.lfg_generate_config) {
 
 	cCfg.max_tokens = C.int32_t(config.MaxTokens)
 
-	if config.TokenCallback == nil && config.EntropyCallback == nil {
+	if config.TokenCallback == nil && config.EntropyCallback == nil && config.ConfidenceCallback == nil && config.SurpriseCallback == nil {
 		return func() {}, cCfg
 	}
 
 	h := &generateHandle{
-		tokenCB:   config.TokenCallback,
-		entropyCB: config.EntropyCallback,
+		tokenCB:      config.TokenCallback,
+		entropyCB:    config.EntropyCallback,
+		confidenceCB: config.ConfidenceCallback,
+		surpriseCB:   config.SurpriseCallback,
 	}
 	id := registerGenerateHandle(h)
 
@@ -218,6 +313,14 @@ func prepareGenerate(config *GenerateConfig) (func(), C.lfg_generate_config) {
 		cCfg.entropy_cb = C.get_entropy_trampoline()
 		cCfg.entropy_cb_data = unsafe.Pointer(idPtr)
 	}
+	if config.ConfidenceCallback != nil {
+		cCfg.confidence_cb = C.get_confidence_trampoline()
+		cCfg.confidence_cb_data = unsafe.Pointer(idPtr)
+	}
+	if config.SurpriseCallback != nil {
+		cCfg.surprise_cb = C.get_surprise_trampoline()
+		cCfg.surprise_cb_data = unsafe.Pointer(idPtr)
+	}
 
 	cleanup := func() {
 		for _, p := range h.cStrings {
@@ -231,9 +334,11 @@ func prepareGenerate(config *GenerateConfig) (func(), C.lfg_generate_config) {
 
 func resultFromC(r C.lfg_generate_result) GenerateLoopResult {
 	return GenerateLoopResult{
-		TokenCount: int(r.n_tokens),
-		Retrievals: int(r.n_retrievals),
-		StopReason: StopReason(r.stop_reason),
+		TokenCount:      int(r.n_tokens),
+		Retrievals:      int(r.n_retrievals),
+		ConfidenceSpans: int(r.n_confidence_spans),
+		SurpriseEvents:  int(r.n_surprise_events),
+		StopReason:      StopReason(r.stop_reason),
 	}
 }
 

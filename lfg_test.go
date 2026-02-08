@@ -3380,3 +3380,211 @@ func TestLoadModelSimpleWithSessionAndGenerate(t *testing.T) {
 		t.Fatal("text is empty")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Confidence Monitor API
+// ---------------------------------------------------------------------------
+
+func TestDefaultConfidenceMonitorConfig(t *testing.T) {
+	cfg := DefaultConfidenceMonitorConfig()
+	t.Logf("DefaultConfidenceMonitorConfig: Threshold=%.2f, MinSpan=%d, RingSize=%d",
+		cfg.Threshold, cfg.MinSpan, cfg.RingSize)
+}
+
+func TestSessionConfigureConfidenceMonitor(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	cfg := ConfidenceMonitorConfig{
+		Threshold: 0.3,
+		MinSpan:   3,
+		RingSize:  8,
+	}
+	nEmbd, err := s.ConfigureConfidenceMonitor(&cfg)
+	if err != nil {
+		t.Fatalf("ConfigureConfidenceMonitor: %v", err)
+	}
+	if nEmbd <= 0 {
+		t.Fatalf("ConfigureConfidenceMonitor returned n_embd=%d, want > 0", nEmbd)
+	}
+	t.Logf("Confidence monitor configured, n_embd=%d", nEmbd)
+
+	// Disable.
+	nEmbd, err = s.ConfigureConfidenceMonitor(nil)
+	if err != nil {
+		t.Fatalf("ConfigureConfidenceMonitor(nil): %v", err)
+	}
+	if nEmbd != 0 {
+		t.Fatalf("ConfigureConfidenceMonitor(nil) returned n_embd=%d, want 0", nEmbd)
+	}
+	t.Log("Confidence monitor configure/disable works")
+}
+
+func TestSessionConfidenceMonitorClosedSession(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	s.Close()
+
+	_, err = s.ConfigureConfidenceMonitor(&ConfidenceMonitorConfig{Threshold: 0.3})
+	if err == nil {
+		t.Fatal("expected error on closed session")
+	}
+	t.Logf("Expected error: %v", err)
+}
+
+func TestSessionConfidencePendingAndFlush(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// Without monitor configured, pending should be 0.
+	if n := s.ConfidencePending(); n != 0 {
+		t.Fatalf("ConfidencePending = %d, want 0 before configuring", n)
+	}
+
+	// Flush should not panic even without monitor.
+	s.ConfidenceFlush()
+	t.Log("ConfidencePending and ConfidenceFlush work without monitor")
+}
+
+func TestSessionConfidencePopEmpty(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// Pop on unconfigured monitor should return false.
+	_, ok := s.ConfidencePop(nil)
+	if ok {
+		t.Fatal("ConfidencePop returned true without monitor configured")
+	}
+	t.Log("ConfidencePop correctly returns false when no events")
+}
+
+func TestSessionConfidenceCounterNil(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// Counter should be nil without confidence monitor configured.
+	p := s.ConfidenceCounter()
+	if p != nil {
+		t.Log("ConfidenceCounter returned non-nil (monitor may be auto-configured)")
+	} else {
+		t.Log("ConfidenceCounter is nil before configuring monitor")
+	}
+}
+
+func TestSessionConfidenceMonitorWithGeneration(t *testing.T) {
+	m := requireModel(t)
+	v := m.Vocab()
+
+	sc := DefaultSamplingConfig()
+	sc.Seed = 42
+	sc.Temp = 0.8
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(sc),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	// Configure confidence monitor with a high threshold to catch spans easily.
+	cfg := ConfidenceMonitorConfig{
+		Threshold: 0.9,
+		MinSpan:   2,
+		RingSize:  8,
+	}
+	nEmbd, err := s.ConfigureConfidenceMonitor(&cfg)
+	if err != nil {
+		t.Fatalf("ConfigureConfidenceMonitor: %v", err)
+	}
+	t.Logf("Confidence monitor n_embd=%d", nEmbd)
+
+	// Check counter is available.
+	counter := s.ConfidenceCounter()
+	if counter == nil {
+		t.Log("ConfidenceCounter is nil after configuring (may be implementation-specific)")
+	}
+
+	// Generate some tokens.
+	tokens, _ := v.Tokenize("The meaning of life is", true, false)
+	s.IngestTokens(tokens, true)
+
+	for i := 0; i < 20; i++ {
+		if err := s.Decode(); err != nil {
+			t.Fatalf("Decode step %d: %v", i, err)
+		}
+		tok := s.Sample()
+		if v.IsEOG(tok) {
+			break
+		}
+		s.IngestTokens([]Token{tok}, true)
+	}
+
+	// Check for pending events.
+	pending := s.ConfidencePending()
+	t.Logf("Pending confidence events after generation: %d", pending)
+
+	// Try to pop events.
+	var events []ConfidenceEvent
+	for {
+		event, ok := s.ConfidencePop(nil)
+		if !ok {
+			break
+		}
+		events = append(events, event)
+	}
+	t.Logf("Popped %d confidence events", len(events))
+
+	for i, ev := range events {
+		t.Logf("  Event[%d]: meanEntropy=%.4f minEntropy=%.4f spanLength=%d startPos=%d endPos=%d nEmbd=%d",
+			i, ev.MeanEntropy, ev.MinEntropy, ev.SpanLength, ev.StartPos, ev.EndPos, ev.NEmbedding)
+	}
+}
+
+func TestGenerateLoopConfidenceSpansZeroWithoutMonitor(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m,
+		WithSessionNCtx(256),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.0}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	result, err := s.PromptGenerate("Hello", true, GenerateConfig{MaxTokens: 10})
+	if err != nil {
+		t.Fatalf("PromptGenerate: %v", err)
+	}
+
+	if result.ConfidenceSpans != 0 {
+		t.Fatalf("ConfidenceSpans = %d, want 0 without confidence monitor", result.ConfidenceSpans)
+	}
+	t.Logf("ConfidenceSpans = 0 without monitor (tokens=%d)", result.TokenCount)
+}

@@ -813,6 +813,277 @@ func (s *Session) LastEntropy() float32 {
 }
 
 // ---------------------------------------------------------------------------
+// Confidence Monitor API (inverse entropy — sustained low-entropy span detection)
+// ---------------------------------------------------------------------------
+
+// ConfidenceEvent represents a sustained low-entropy span detected by the confidence monitor.
+type ConfidenceEvent struct {
+	MeanEntropy float32 // Average normalized entropy over the span.
+	MinEntropy  float32 // Minimum normalized entropy in the span.
+	SpanLength  int32   // Number of consecutive low-entropy tokens.
+	StartPos    int32   // Token position at span start.
+	EndPos      int32   // Token position at span end.
+	NEmbedding  int32   // Embedding dimension (for embedding output sizing).
+}
+
+// ConfidenceMonitorConfig configures the confidence monitor.
+type ConfidenceMonitorConfig struct {
+	Threshold        float32 // Normalized entropy ceiling (0,1]. Tokens below this are "confident".
+	MinSpan          int32   // Min consecutive tokens to emit event. 0 = default (5).
+	RingSize         int32   // Ring buffer slots. 0 = default (4).
+	IgnoreReasoning  bool    // Skip reasoning tokens (treat as run-breaker).
+}
+
+// DefaultConfidenceMonitorConfig returns the default confidence monitor configuration.
+func DefaultConfidenceMonitorConfig() ConfidenceMonitorConfig {
+	c := C.lfg_confidence_monitor_default_config()
+	return ConfidenceMonitorConfig{
+		Threshold:       float32(c.threshold),
+		MinSpan:         int32(c.min_span),
+		RingSize:        int32(c.ring_size),
+		IgnoreReasoning: bool(c.ignore_reasoning),
+	}
+}
+
+// ConfigureConfidenceMonitor configures the confidence monitor for this session.
+// Returns the embedding dimension (n_embd) on success — use this to size
+// the embedding buffer passed to ConfidencePop.
+// Pass nil to disable the confidence monitor (returns 0, nil).
+func (s *Session) ConfigureConfidenceMonitor(config *ConfidenceMonitorConfig) (int32, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return 0, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
+	}
+
+	if config == nil {
+		C.lfg_session_configure_confidence_monitor(s.c, nil)
+		return 0, nil
+	}
+
+	cConfig := C.lfg_confidence_monitor_config{
+		threshold:        C.float(config.Threshold),
+		min_span:         C.int32_t(config.MinSpan),
+		ring_size:        C.int32_t(config.RingSize),
+		ignore_reasoning: C.bool(config.IgnoreReasoning),
+	}
+	nEmbd := C.lfg_session_configure_confidence_monitor(s.c, &cConfig)
+	if nEmbd <= 0 {
+		if err := getLastError(); err != nil {
+			return 0, err
+		}
+		return 0, &Error{Code: ErrorInternal, Message: "failed to configure confidence monitor"}
+	}
+	return int32(nEmbd), nil
+}
+
+// ConfidencePop pops the next pending confidence event from the ring buffer.
+// If embeddingOut is non-nil, the embedding vector is copied into it (must be >= ConfidenceEvent.NEmbedding floats).
+// Pass nil for embeddingOut to skip embedding copy.
+// Returns the event and true if an event was available, or a zero event and false if no events are pending.
+func (s *Session) ConfidencePop(embeddingOut []float32) (ConfidenceEvent, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return ConfidenceEvent{}, false
+	}
+
+	var cEvent C.lfg_confidence_event
+	var embdPtr *C.float
+	var embdCap C.int32_t
+	if len(embeddingOut) > 0 {
+		embdPtr = (*C.float)(unsafe.Pointer(&embeddingOut[0]))
+		embdCap = C.int32_t(len(embeddingOut))
+	}
+
+	ok := C.lfg_session_confidence_pop(s.c, &cEvent, embdPtr, embdCap)
+	if !bool(ok) {
+		return ConfidenceEvent{}, false
+	}
+
+	return ConfidenceEvent{
+		MeanEntropy: float32(cEvent.mean_entropy),
+		MinEntropy:  float32(cEvent.min_entropy),
+		SpanLength:  int32(cEvent.span_length),
+		StartPos:    int32(cEvent.start_pos),
+		EndPos:      int32(cEvent.end_pos),
+		NEmbedding:  int32(cEvent.n_embd),
+	}, true
+}
+
+// ConfidencePending returns the number of pending (unread) confidence events.
+func (s *Session) ConfidencePending() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return 0
+	}
+	return int(C.lfg_session_confidence_pending(s.c))
+}
+
+// ConfidenceFlush discards all pending confidence events without reading them.
+func (s *Session) ConfidenceFlush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return
+	}
+	C.lfg_session_confidence_flush(s.c)
+}
+
+// ConfidenceCounter returns a pointer to an atomic write counter that is incremented
+// each time a confidence event is written to the ring buffer.
+// Returns nil if the session is closed or the confidence monitor is not configured.
+func (s *Session) ConfidenceCounter() *int32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return nil
+	}
+	p := C.lfg_session_confidence_counter(s.c)
+	if p == nil {
+		return nil
+	}
+	return (*int32)(unsafe.Pointer(p))
+}
+
+// ---------------------------------------------------------------------------
+// Surprise Monitor API (input novelty — high-surprise span detection during ingestion)
+// ---------------------------------------------------------------------------
+
+// SurpriseEvent represents an aggregate surprise result after prompt ingestion.
+// Summarizes how surprising the entire input was to the model.
+type SurpriseEvent struct {
+	MeanSurprise     float32 // Average normalized surprise across above-threshold tokens.
+	MaxSurprise      float32 // Maximum normalized surprise.
+	NAboveThreshold  int32   // Count of tokens above threshold.
+	NTokensEvaluated int32   // Total tokens evaluated (prompt minus BOS).
+	NEmbedding       int32   // Embedding dimension (for embedding output sizing).
+}
+
+// SurpriseMonitorConfig configures the surprise monitor.
+type SurpriseMonitorConfig struct {
+	Threshold       float32 // Normalized surprise floor (0,1]. Above = surprising.
+	IgnoreReasoning bool    // Skip reasoning tokens during surprise evaluation.
+}
+
+// DefaultSurpriseMonitorConfig returns the default surprise monitor configuration.
+func DefaultSurpriseMonitorConfig() SurpriseMonitorConfig {
+	c := C.lfg_surprise_monitor_default_config()
+	return SurpriseMonitorConfig{
+		Threshold:       float32(c.threshold),
+		IgnoreReasoning: bool(c.ignore_reasoning),
+	}
+}
+
+// ConfigureSurpriseMonitor configures the surprise monitor for this session.
+// Returns the embedding dimension (n_embd) on success — use this to size
+// the embedding buffer passed to SurprisePop.
+// Pass nil to disable the surprise monitor (returns 0, nil).
+func (s *Session) ConfigureSurpriseMonitor(config *SurpriseMonitorConfig) (int32, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return 0, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
+	}
+
+	if config == nil {
+		C.lfg_session_configure_surprise_monitor(s.c, nil)
+		return 0, nil
+	}
+
+	cConfig := C.lfg_surprise_monitor_config{
+		threshold:        C.float(config.Threshold),
+		ignore_reasoning: C.bool(config.IgnoreReasoning),
+	}
+	nEmbd := C.lfg_session_configure_surprise_monitor(s.c, &cConfig)
+	if nEmbd <= 0 {
+		if err := getLastError(); err != nil {
+			return 0, err
+		}
+		return 0, &Error{Code: ErrorInternal, Message: "failed to configure surprise monitor"}
+	}
+	return int32(nEmbd), nil
+}
+
+// SurprisePop pops the next pending surprise event from the ring buffer.
+// If embeddingOut is non-nil, the embedding vector is copied into it (must be >= SurpriseEvent.NEmbedding floats).
+// Pass nil for embeddingOut to skip embedding copy.
+// Returns the event and true if an event was available, or a zero event and false if no events are pending.
+func (s *Session) SurprisePop(embeddingOut []float32) (SurpriseEvent, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return SurpriseEvent{}, false
+	}
+
+	var cEvent C.lfg_surprise_event
+	var embdPtr *C.float
+	var embdCap C.int32_t
+	if len(embeddingOut) > 0 {
+		embdPtr = (*C.float)(unsafe.Pointer(&embeddingOut[0]))
+		embdCap = C.int32_t(len(embeddingOut))
+	}
+
+	ok := C.lfg_session_surprise_pop(s.c, &cEvent, embdPtr, embdCap)
+	if !bool(ok) {
+		return SurpriseEvent{}, false
+	}
+
+	return SurpriseEvent{
+		MeanSurprise:     float32(cEvent.mean_surprise),
+		MaxSurprise:      float32(cEvent.max_surprise),
+		NAboveThreshold:  int32(cEvent.n_above_threshold),
+		NTokensEvaluated: int32(cEvent.n_tokens_evaluated),
+		NEmbedding:       int32(cEvent.n_embd),
+	}, true
+}
+
+// ConfigureStopStrings sets text-based stop strings for generation.
+// Unlike token-level stop sequences, text stops are encoding-independent
+// (same text always matches regardless of how the tokenizer splits it).
+// Pass nil or an empty slice to clear stop strings.
+func (s *Session) ConfigureStopStrings(strings []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == nil {
+		return &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
+	}
+
+	if len(strings) == 0 {
+		ok := C.lfg_session_configure_stop_strings(s.c, nil, 0)
+		if !bool(ok) {
+			return &Error{Code: ErrorInvalidArgument, Message: "failed to clear stop strings"}
+		}
+		return nil
+	}
+
+	n := len(strings)
+
+	// Allocate the pointer array in C memory to avoid "Go ptr to Go ptr".
+	cPtrs := (*[1 << 30]*C.char)(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof((*C.char)(nil)))))[:n:n]
+	defer C.free(unsafe.Pointer(&cPtrs[0]))
+
+	cStrs := make([]*C.char, n)
+	for i, s := range strings {
+		cs := C.CString(s)
+		cPtrs[i] = cs
+		cStrs[i] = cs
+	}
+	defer func() {
+		for _, p := range cStrs {
+			C.free(unsafe.Pointer(p))
+		}
+	}()
+
+	ok := C.lfg_session_configure_stop_strings(s.c, &cPtrs[0], C.int32_t(n))
+	if !bool(ok) {
+		return &Error{Code: ErrorInvalidArgument, Message: "failed to configure stop strings"}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // Convenience Model Loader (lfg_api.h)
 // ---------------------------------------------------------------------------
 
@@ -887,21 +1158,19 @@ func (s *Session) Embed(text string) ([]float32, error) {
 		return nil, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
+	// Get embedding dimension from the model. The C API requires a valid
+	// output buffer on every call (it does not support a nil/0 query pattern).
+	nEmbd := int(C.lfg_model_n_embd(s.model.c))
+	if nEmbd <= 0 {
+		return nil, &Error{Code: ErrorInternal, Message: "model has no embedding dimension"}
+	}
+
 	cText := C.CString(text)
 	defer C.free(unsafe.Pointer(cText))
 	cLen := C.int32_t(len(text))
 
-	// First call: get embedding dimension.
-	nEmbd := C.lfg_session_embed(s.c, cText, cLen, nil, 0)
-	if nEmbd <= 0 {
-		if err := getLastError(); err != nil {
-			return nil, err
-		}
-		return nil, &Error{Code: ErrorInternal, Message: "failed to compute embedding"}
-	}
-
-	out := make([]float32, int(nEmbd))
-	n := C.lfg_session_embed(s.c, cText, cLen, (*C.float)(unsafe.Pointer(&out[0])), C.int32_t(len(out)))
+	out := make([]float32, nEmbd)
+	n := C.lfg_session_embed(s.c, cText, cLen, (*C.float)(unsafe.Pointer(&out[0])), C.int32_t(nEmbd))
 	if n <= 0 {
 		if err := getLastError(); err != nil {
 			return nil, err
