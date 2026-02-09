@@ -52,7 +52,7 @@ func TestStoredMessageDisplay(t *testing.T) {
 		text: `[stored] "Paris is the capital" (5t)`,
 	})
 	m.activeTab = 1
-	m.memViewport.SetContent(renderMemoryContent(m.memoryEntries))
+	m.memViewport.SetContent(renderMemoryContent(m.memoryEntries, m.memViewport.Width))
 
 	view := m.View()
 	if !strings.Contains(view, "Paris is the capital") {
@@ -77,6 +77,7 @@ func TestQuit(t *testing.T) {
 func TestStreamingDisplay(t *testing.T) {
 	m := TestableModel()
 	m.streaming = "Hello world"
+	m.thinkingDone = true // no thinking block — generation is regular text
 
 	view := m.View()
 	if !strings.Contains(view, "Hello world") {
@@ -158,6 +159,9 @@ func TestStripThinking(t *testing.T) {
 		{"multiple blocks", "<think>a</think>Hello<think>b</think> world", "Hello world"},
 		{"empty", "", ""},
 		{"nested tags", "<think>outer<think>inner</think>rest", "rest"},
+		{"leading thinking", "I should respond carefully</think>Hello!", "Hello!"},
+		{"leading thinking only", "reasoning here</think>", ""},
+		{"leading then normal", "reasoning</think>Hello<think>more</think> world", "Hello world"},
 	}
 
 	for _, tt := range tests {
@@ -173,6 +177,7 @@ func TestStripThinking(t *testing.T) {
 func TestStreamingDisplayWithThinking(t *testing.T) {
 	m := TestableModel()
 	m.streaming = "<think>let me reason about this</think>The answer is 42"
+	m.thinkingDone = true
 
 	view := m.View()
 	if !strings.Contains(view, "The answer is 42") {
@@ -193,6 +198,36 @@ func TestStreamingDisplayThinkingOnly(t *testing.T) {
 	}
 	if !strings.Contains(view, "Thinking...") {
 		t.Fatal("should show 'Thinking...' when only thinking tokens received")
+	}
+}
+
+func TestStreamingDisplayLeadingThinking(t *testing.T) {
+	// Chat template adds <think> to prompt, so generated text starts mid-thinking.
+	m := TestableModel()
+	m.streaming = "I should respond carefully</think>The answer is 42"
+	m.thinkingDone = true
+
+	view := m.View()
+	if !strings.Contains(view, "The answer is 42") {
+		t.Fatal("stripped response not found in view")
+	}
+	if strings.Contains(view, "I should respond carefully") {
+		t.Fatal("leading thinking content should not appear in view")
+	}
+}
+
+func TestStreamingDisplayLeadingThinkingPending(t *testing.T) {
+	// Before </think> arrives, should show "Thinking..."
+	m := TestableModel()
+	m.streaming = "I am still reasoning about this"
+	m.thinkingDone = false
+
+	view := m.View()
+	if strings.Contains(view, "I am still reasoning") {
+		t.Fatal("thinking content should not appear in view")
+	}
+	if !strings.Contains(view, "Thinking...") {
+		t.Fatal("should show 'Thinking...' while waiting for </think>")
 	}
 }
 

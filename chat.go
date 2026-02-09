@@ -1,11 +1,11 @@
+//go:build (darwin && arm64) || (linux && amd64) || (linux && arm64)
+
 package lfg
 
-/*
-#include "lfg_inference.h"
-#include <stdlib.h>
-*/
-import "C"
-import "unsafe"
+import (
+	"runtime"
+	"unsafe"
+)
 
 // ChatMessage represents a single message in a chat conversation.
 type ChatMessage struct {
@@ -17,41 +17,45 @@ type ChatMessage struct {
 // If tmpl is empty, the model's default template is used (requires a model).
 // If addAssistant is true, the output ends with the assistant prompt prefix.
 func ApplyChatTemplate(tmpl string, messages []ChatMessage, addAssistant bool) (string, error) {
-	cMessages := make([]C.struct_lfg_chat_message, len(messages))
-	cStrings := make([]*C.char, 0, len(messages)*2)
-	defer func() {
-		for _, s := range cStrings {
-			C.free(unsafe.Pointer(s))
-		}
-	}()
+	registerChatFuncs()
+
+	// Build cChatMessage array with Go byte slices for strings.
+	cMessages := make([]cChatMessage, len(messages))
+	keepAlive := make([][]byte, 0, len(messages)*2)
 
 	for i, msg := range messages {
-		cRole := C.CString(msg.Role)
-		cContent := C.CString(msg.Content)
-		cStrings = append(cStrings, cRole, cContent)
-		cMessages[i].role = cRole
-		cMessages[i].content = cContent
+		roleBytes := cString(msg.Role)
+		contentBytes := cString(msg.Content)
+		keepAlive = append(keepAlive, roleBytes, contentBytes)
+		cMessages[i].Role = cStringPtr(roleBytes)
+		cMessages[i].Content = cStringPtr(contentBytes)
 	}
 
-	var cTmpl *C.char
+	var tmplPtr uintptr
+	var tmplBytes []byte
 	if tmpl != "" {
-		cTmpl = C.CString(tmpl)
-		defer C.free(unsafe.Pointer(cTmpl))
+		tmplBytes = cString(tmpl)
+		tmplPtr = cStringPtr(tmplBytes)
 	}
 
-	var msgPtr *C.struct_lfg_chat_message
+	var msgPtr uintptr
 	if len(cMessages) > 0 {
-		msgPtr = &cMessages[0]
+		msgPtr = uintptr(unsafe.Pointer(&cMessages[0]))
 	}
 
 	// First pass: determine required size.
-	n := C.lfg_chat_apply_template(cTmpl, msgPtr, C.size_t(len(messages)), C.bool(addAssistant), nil, 0)
+	n := _lfg_chat_apply_template(tmplPtr, msgPtr, uintptr(len(messages)), addAssistant, 0, 0)
+	runtime.KeepAlive(keepAlive)
+	runtime.KeepAlive(tmplBytes)
 	if n <= 0 {
 		return "", &Error{Code: ErrorInternal, Message: "failed to apply chat template"}
 	}
 
 	buf := make([]byte, int(n)+1) // +1 for null terminator space
-	n = C.lfg_chat_apply_template(cTmpl, msgPtr, C.size_t(len(messages)), C.bool(addAssistant), (*C.char)(unsafe.Pointer(&buf[0])), C.int32_t(len(buf)))
+	n = _lfg_chat_apply_template(tmplPtr, msgPtr, uintptr(len(messages)), addAssistant, uintptr(unsafe.Pointer(&buf[0])), int32(len(buf)))
+	runtime.KeepAlive(keepAlive)
+	runtime.KeepAlive(tmplBytes)
+	runtime.KeepAlive(cMessages)
 	if n <= 0 {
 		return "", &Error{Code: ErrorInternal, Message: "failed to apply chat template"}
 	}
@@ -60,15 +64,16 @@ func ApplyChatTemplate(tmpl string, messages []ChatMessage, addAssistant bool) (
 
 // ChatBuiltinTemplates returns a list of built-in chat template names.
 func ChatBuiltinTemplates() []string {
+	registerChatFuncs()
 	// Get count first with a small buffer.
-	var buf [64]*C.char
-	n := C.lfg_chat_builtin_templates(&buf[0], 64)
+	var buf [64]uintptr
+	n := _lfg_chat_builtin_templates(uintptr(unsafe.Pointer(&buf[0])), 64)
 	if n <= 0 {
 		return nil
 	}
 	result := make([]string, n)
 	for i := 0; i < int(n); i++ {
-		result[i] = C.GoString(buf[i])
+		result[i] = goString(buf[i])
 	}
 	return result
 }

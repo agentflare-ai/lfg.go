@@ -1,10 +1,7 @@
+//go:build (darwin && arm64) || (linux && amd64) || (linux && arm64)
+
 package lfg
 
-/*
-#include "lfg_inference.h"
-#include <stdlib.h>
-*/
-import "C"
 import (
 	"runtime"
 	"sync"
@@ -14,13 +11,13 @@ import (
 // Sampler wraps an lfg_sampler pointer with thread-safe access.
 type Sampler struct {
 	mu    sync.Mutex
-	c     *C.struct_lfg_sampler
+	c     uintptr
 	owned bool // false if ownership was transferred to a chain
 }
 
 // newSampler wraps a C sampler pointer.
-func newSampler(c *C.struct_lfg_sampler) *Sampler {
-	if c == nil {
+func newSampler(c uintptr) *Sampler {
+	if c == 0 {
 		return nil
 	}
 	s := &Sampler{c: c, owned: true}
@@ -33,9 +30,10 @@ func newSampler(c *C.struct_lfg_sampler) *Sampler {
 func (s *Sampler) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c != nil && s.owned {
-		C.lfg_sampler_free(s.c)
-		s.c = nil
+	if s.c != 0 && s.owned {
+		registerSamplerFuncs()
+		_lfg_sampler_free(s.c)
+		s.c = 0
 		runtime.SetFinalizer(s, nil)
 	}
 }
@@ -44,65 +42,71 @@ func (s *Sampler) Close() {
 func (s *Sampler) Name() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return ""
 	}
-	return C.GoString(C.lfg_sampler_name(s.c))
+	registerSamplerFuncs()
+	return goString(_lfg_sampler_name(s.c))
 }
 
 // Accept notifies the sampler that a token has been selected.
 func (s *Sampler) Accept(token Token) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return
 	}
-	C.lfg_sampler_accept(s.c, C.lfg_token(token))
+	registerSamplerFuncs()
+	_lfg_sampler_accept(s.c, int32(token))
 }
 
 // Reset resets the sampler state.
 func (s *Sampler) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return
 	}
-	C.lfg_sampler_reset(s.c)
+	registerSamplerFuncs()
+	_lfg_sampler_reset(s.c)
 }
 
 // Clone creates a copy of the sampler.
 func (s *Sampler) Clone() *Sampler {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return nil
 	}
-	return newSampler(C.lfg_sampler_clone(s.c))
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_clone(s.c))
 }
 
 // GetSeed returns the seed used by the sampler, or RandomSeed if not applicable.
 func (s *Sampler) GetSeed() uint32 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return RandomSeed
 	}
-	return uint32(C.lfg_sampler_get_seed(s.c))
+	registerSamplerFuncs()
+	return _lfg_sampler_get_seed(s.c)
 }
 
 // Sample samples and accepts a token from the idx-th output of the last evaluation.
 func (s *Sampler) Sample(ctx *Context, idx int) Token {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil || ctx == nil {
+	if s.c == 0 || ctx == nil {
 		return InvalidToken
 	}
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return InvalidToken
 	}
-	return Token(C.lfg_sampler_sample(s.c, ctx.c, C.int32_t(idx)))
+	registerSamplerFuncs()
+	return Token(_lfg_sampler_sample(s.c, ctx.c, int32(idx)))
 }
 
 // --- Sampler Chain ---
@@ -110,47 +114,51 @@ func (s *Sampler) Sample(ctx *Context, idx int) Token {
 // NewSamplerChain creates a new sampler chain.
 // If noPerf is true, performance timings are not measured.
 func NewSamplerChain(noPerf bool) *Sampler {
-	params := C.lfg_sampler_chain_default_params()
-	params.no_perf = C.bool(noPerf)
-	return newSampler(C.lfg_sampler_chain_init(params))
+	registerSamplerFuncs()
+	params := _lfg_sampler_chain_default_params()
+	params.NoPerf = boolToByte(noPerf)
+	return newSampler(_lfg_sampler_chain_init(params))
 }
 
 // Add appends a sampler to the chain. The chain takes ownership of the sampler.
 func (s *Sampler) Add(child *Sampler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil || child == nil {
+	if s.c == 0 || child == nil {
 		return
 	}
 	child.mu.Lock()
 	defer child.mu.Unlock()
-	if child.c == nil {
+	if child.c == 0 {
 		return
 	}
-	C.lfg_sampler_chain_add(s.c, child.c)
+	registerSamplerFuncs()
+	_lfg_sampler_chain_add(s.c, child.c)
 	child.owned = false
 	runtime.SetFinalizer(child, nil)
 }
 
 // ChainGet returns the sampler at index i in the chain.
 // If i == -1, returns the chain itself (useful to check if it's a chain).
-func (s *Sampler) ChainGet(i int) *C.struct_lfg_sampler {
+func (s *Sampler) ChainGet(i int) uintptr {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
-		return nil
+	if s.c == 0 {
+		return 0
 	}
-	return C.lfg_sampler_chain_get(s.c, C.int32_t(i))
+	registerSamplerFuncs()
+	return _lfg_sampler_chain_get(s.c, int32(i))
 }
 
 // ChainN returns the total number of samplers in the chain.
 func (s *Sampler) ChainN() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return 0
 	}
-	return int(C.lfg_sampler_chain_n(s.c))
+	registerSamplerFuncs()
+	return int(_lfg_sampler_chain_n(s.c))
 }
 
 // ChainRemove removes and returns the sampler at index i from the chain.
@@ -158,11 +166,12 @@ func (s *Sampler) ChainN() int {
 func (s *Sampler) ChainRemove(i int) *Sampler {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return nil
 	}
-	removed := C.lfg_sampler_chain_remove(s.c, C.int32_t(i))
-	if removed == nil {
+	registerSamplerFuncs()
+	removed := _lfg_sampler_chain_remove(s.c, int32(i))
+	if removed == 0 {
 		return nil
 	}
 	return newSampler(removed)
@@ -172,150 +181,173 @@ func (s *Sampler) ChainRemove(i int) *Sampler {
 
 // NewGreedySampler creates a greedy sampler (always picks the highest probability token).
 func NewGreedySampler() *Sampler {
-	return newSampler(C.lfg_sampler_init_greedy())
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_greedy())
 }
 
 // NewDistSampler creates a distribution-based sampler.
 // Use RandomSeed for a random seed.
 func NewDistSampler(seed uint32) *Sampler {
-	return newSampler(C.lfg_sampler_init_dist(C.uint32_t(seed)))
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_dist(seed))
 }
 
 // NewTopKSampler creates a top-K sampler. Setting k <= 0 makes it a noop.
 func NewTopKSampler(k int) *Sampler {
-	return newSampler(C.lfg_sampler_init_top_k(C.int32_t(k)))
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_top_k(int32(k)))
 }
 
 // NewTopPSampler creates a nucleus (top-p) sampler.
 func NewTopPSampler(p float32, minKeep int) *Sampler {
-	return newSampler(C.lfg_sampler_init_top_p(C.float(p), C.size_t(minKeep)))
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_top_p(p, uintptr(minKeep)))
 }
 
 // NewMinPSampler creates a minimum-P sampler.
 func NewMinPSampler(p float32, minKeep int) *Sampler {
-	return newSampler(C.lfg_sampler_init_min_p(C.float(p), C.size_t(minKeep)))
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_min_p(p, uintptr(minKeep)))
 }
 
 // NewTypicalSampler creates a locally typical sampler.
 func NewTypicalSampler(p float32, minKeep int) *Sampler {
-	return newSampler(C.lfg_sampler_init_typical(C.float(p), C.size_t(minKeep)))
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_typical(p, uintptr(minKeep)))
 }
 
 // NewTempSampler creates a temperature sampler.
 // When t <= 0, the max logit is kept and the rest are set to -inf.
 func NewTempSampler(t float32) *Sampler {
-	return newSampler(C.lfg_sampler_init_temp(C.float(t)))
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_temp(t))
 }
 
 // NewTempExtSampler creates a dynamic temperature (entropy) sampler.
 func NewTempExtSampler(t, delta, exponent float32) *Sampler {
-	return newSampler(C.lfg_sampler_init_temp_ext(C.float(t), C.float(delta), C.float(exponent)))
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_temp_ext(t, delta, exponent))
 }
 
 // NewXTCSampler creates an XTC sampler.
 func NewXTCSampler(p, t float32, minKeep int, seed uint32) *Sampler {
-	return newSampler(C.lfg_sampler_init_xtc(C.float(p), C.float(t), C.size_t(minKeep), C.uint32_t(seed)))
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_xtc(p, t, uintptr(minKeep), seed))
 }
 
 // NewTopNSigmaSampler creates a Top-n sigma sampler.
 func NewTopNSigmaSampler(n float32) *Sampler {
-	return newSampler(C.lfg_sampler_init_top_n_sigma(C.float(n)))
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_top_n_sigma(n))
 }
 
 // NewMirostatSampler creates a Mirostat 1.0 sampler.
 func NewMirostatSampler(nVocab int, seed uint32, tau, eta float32, m int) *Sampler {
-	return newSampler(C.lfg_sampler_init_mirostat(
-		C.int32_t(nVocab), C.uint32_t(seed), C.float(tau), C.float(eta), C.int32_t(m)))
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_mirostat(int32(nVocab), seed, tau, eta, int32(m)))
 }
 
 // NewMirostatV2Sampler creates a Mirostat 2.0 sampler.
 func NewMirostatV2Sampler(seed uint32, tau, eta float32) *Sampler {
-	return newSampler(C.lfg_sampler_init_mirostat_v2(C.uint32_t(seed), C.float(tau), C.float(eta)))
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_mirostat_v2(seed, tau, eta))
 }
 
 // NewGrammarSampler creates a GBNF grammar sampler.
 // Returns nil if grammar parsing fails.
 func NewGrammarSampler(vocab *Vocab, grammarStr, grammarRoot string) *Sampler {
-	cStr := C.CString(grammarStr)
-	defer C.free(unsafe.Pointer(cStr))
-	cRoot := C.CString(grammarRoot)
-	defer C.free(unsafe.Pointer(cRoot))
-	return newSampler(C.lfg_sampler_init_grammar(vocab.c, cStr, cRoot))
+	registerSamplerFuncs()
+	strBytes := cString(grammarStr)
+	rootBytes := cString(grammarRoot)
+	result := _lfg_sampler_init_grammar(vocab.c, cStringPtr(strBytes), cStringPtr(rootBytes))
+	runtime.KeepAlive(strBytes)
+	runtime.KeepAlive(rootBytes)
+	return newSampler(result)
 }
 
 // NewPenaltiesSampler creates a repetition/frequency/presence penalty sampler.
 func NewPenaltiesSampler(penaltyLastN int, penaltyRepeat, penaltyFreq, penaltyPresent float32) *Sampler {
-	return newSampler(C.lfg_sampler_init_penalties(
-		C.int32_t(penaltyLastN), C.float(penaltyRepeat), C.float(penaltyFreq), C.float(penaltyPresent)))
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_penalties(int32(penaltyLastN), penaltyRepeat, penaltyFreq, penaltyPresent))
 }
 
 // NewDRYSampler creates a DRY (Don't Repeat Yourself) sampler.
 func NewDRYSampler(vocab *Vocab, nCtxTrain int, multiplier, base float32, allowedLength, penaltyLastN int, seqBreakers []string) *Sampler {
-	cBreakers := make([]*C.char, len(seqBreakers))
+	registerSamplerFuncs()
+
+	// Build an array of uintptr (char*) for seqBreakers.
+	// With purego, no "Go ptr to Go ptr" rule applies.
+	breakerBytes := make([][]byte, len(seqBreakers))
+	breakerPtrs := make([]uintptr, len(seqBreakers))
 	for i, s := range seqBreakers {
-		cBreakers[i] = C.CString(s)
-	}
-	defer func() {
-		for _, p := range cBreakers {
-			C.free(unsafe.Pointer(p))
-		}
-	}()
-
-	var breakersPtr **C.char
-	if len(cBreakers) > 0 {
-		breakersPtr = &cBreakers[0]
+		breakerBytes[i] = cString(s)
+		breakerPtrs[i] = cStringPtr(breakerBytes[i])
 	}
 
-	return newSampler(C.lfg_sampler_init_dry(
+	var breakersPtr uintptr
+	if len(breakerPtrs) > 0 {
+		breakersPtr = uintptr(unsafe.Pointer(&breakerPtrs[0]))
+	}
+
+	result := _lfg_sampler_init_dry(
 		vocab.c,
-		C.int32_t(nCtxTrain),
-		C.float(multiplier),
-		C.float(base),
-		C.int32_t(allowedLength),
-		C.int32_t(penaltyLastN),
+		int32(nCtxTrain),
+		multiplier,
+		base,
+		int32(allowedLength),
+		int32(penaltyLastN),
 		breakersPtr,
-		C.size_t(len(seqBreakers))))
+		uintptr(len(seqBreakers)))
+	runtime.KeepAlive(breakerBytes)
+	runtime.KeepAlive(breakerPtrs)
+	return newSampler(result)
 }
 
 // NewAdaptivePSampler creates an adaptive-p sampler.
 func NewAdaptivePSampler(target, decay float32, seed uint32) *Sampler {
-	return newSampler(C.lfg_sampler_init_adaptive_p(C.float(target), C.float(decay), C.uint32_t(seed)))
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_adaptive_p(target, decay, seed))
 }
 
 // NewLogitBiasSampler creates a logit bias sampler.
 func NewLogitBiasSampler(nVocab int, biases []LogitBias) *Sampler {
+	registerSamplerFuncs()
 	if len(biases) == 0 {
-		return newSampler(C.lfg_sampler_init_logit_bias(C.int32_t(nVocab), 0, nil))
+		return newSampler(_lfg_sampler_init_logit_bias(int32(nVocab), 0, 0))
 	}
-	cBiases := make([]C.struct_lfg_logit_bias, len(biases))
+	cBiases := make([]cLogitBias, len(biases))
 	for i, b := range biases {
-		cBiases[i].token = C.lfg_token(b.Token)
-		cBiases[i].bias = C.float(b.Bias)
+		cBiases[i].Token = int32(b.Token)
+		cBiases[i].Bias = b.Bias
 	}
-	return newSampler(C.lfg_sampler_init_logit_bias(
-		C.int32_t(nVocab), C.int32_t(len(biases)), &cBiases[0]))
+	return newSampler(_lfg_sampler_init_logit_bias(
+		int32(nVocab), int32(len(biases)), uintptr(unsafe.Pointer(&cBiases[0]))))
 }
 
 // NewInfillSampler creates an infill sampler for fill-in-the-middle completion.
 func NewInfillSampler(vocab *Vocab) *Sampler {
-	return newSampler(C.lfg_sampler_init_infill(vocab.c))
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_infill(vocab.c))
 }
 
 // NewPrefixSampler creates a sampler that masks tokens not matching the given prefix.
 func NewPrefixSampler(vocab *Vocab, prefix string) *Sampler {
-	cPrefix := C.CString(prefix)
-	defer C.free(unsafe.Pointer(cPrefix))
-	return newSampler(C.lfg_sampler_init_prefix(vocab.c, cPrefix))
+	registerSamplerFuncs()
+	prefixBytes := cString(prefix)
+	result := _lfg_sampler_init_prefix(vocab.c, cStringPtr(prefixBytes))
+	runtime.KeepAlive(prefixBytes)
+	return newSampler(result)
 }
 
 // PrefixSet updates the prefix for an existing prefix sampler.
 func (s *Sampler) PrefixSet(prefix string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return
 	}
-	cPrefix := C.CString(prefix)
-	defer C.free(unsafe.Pointer(cPrefix))
-	C.lfg_sampler_prefix_set(s.c, cPrefix)
+	registerSamplerFuncs()
+	prefixBytes := cString(prefix)
+	_lfg_sampler_prefix_set(s.c, cStringPtr(prefixBytes))
+	runtime.KeepAlive(prefixBytes)
 }

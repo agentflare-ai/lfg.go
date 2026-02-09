@@ -695,10 +695,9 @@ int32_t lfg_chat_apply_template(
 
         if (add_ass) {
             ss << "<role>ASSISTANT</role>";
-
-            if (tmpl == LFG_CHAT_TEMPLATE_BAILING_THINK) {
-                ss << "<think>";
-            }
+            // Note: bailing-think models generate <think> on their own.
+            // Do NOT inject it here — the reasoning gate only detects
+            // start tokens from generated output, not ingested prompt.
         }
     } else if (tmpl == LFG_CHAT_TEMPLATE_BAILING2) {
         // Bailing2 (Ling 2.0) template

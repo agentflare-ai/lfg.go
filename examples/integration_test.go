@@ -1501,8 +1501,9 @@ func TestTUIStreamingTokenDisplay(t *testing.T) {
 	tuiModel := TestableModel()
 	tuiModel.loaded = true
 
-	// Simulate streaming plain text tokens.
+	// Simulate streaming plain text tokens (thinking already done).
 	tuiModel.streaming = "Hello from the agent!"
+	tuiModel.thinkingDone = true
 
 	view := tuiModel.View()
 	if !strings.Contains(view, "Hello from the agent!") {
@@ -1525,7 +1526,7 @@ func TestTUIMessageTypes(t *testing.T) {
 		{role: "system", text: "[recall] Retrieved 2 items"},
 		{role: "stored", text: `[stored] "important fact" (5t)`},
 	}
-	tuiModel.memViewport.SetContent(renderMemoryContent(tuiModel.memoryEntries))
+	tuiModel.memViewport.SetContent(renderMemoryContent(tuiModel.memoryEntries, tuiModel.memViewport.Width))
 
 	// Check chat tab (tab 0).
 	chatView := tuiModel.View()
