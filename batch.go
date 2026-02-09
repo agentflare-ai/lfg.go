@@ -1,17 +1,12 @@
+//go:build (darwin && arm64) || (linux && amd64) || (linux && arm64)
+
 package lfg
 
-/*
-#include "lfg_inference.h"
-*/
-import "C"
-import (
-	"runtime"
-	"unsafe"
-)
+import "runtime"
 
 // Batch wraps an lfg_batch for submitting tokens to encode/decode.
 type Batch struct {
-	c     C.struct_lfg_batch
+	c     cBatch
 	owned bool // true if allocated via BatchInit (needs BatchFree)
 }
 
@@ -22,7 +17,8 @@ func BatchGetOne(tokens []Token) Batch {
 	if len(tokens) == 0 {
 		return Batch{}
 	}
-	b := C.lfg_batch_get_one((*C.lfg_token)(cTokenPtr(tokens)), C.int32_t(len(tokens)))
+	registerBatchFuncs()
+	b := _lfg_batch_get_one(tokenPtr(tokens), int32(len(tokens)))
 	return Batch{c: b, owned: false}
 }
 
@@ -31,7 +27,8 @@ func BatchGetOne(tokens []Token) Batch {
 // If embd > 0, embeddings storage is allocated instead of token storage.
 // Must be freed with Close().
 func BatchInit(nTokens, embd, nSeqMax int) *Batch {
-	b := C.lfg_batch_init(C.int32_t(nTokens), C.int32_t(embd), C.int32_t(nSeqMax))
+	registerBatchFuncs()
+	b := _lfg_batch_init(int32(nTokens), int32(embd), int32(nSeqMax))
 	batch := &Batch{c: b, owned: true}
 	runtime.SetFinalizer(batch, func(b *Batch) { b.Close() })
 	return batch
@@ -40,7 +37,8 @@ func BatchInit(nTokens, embd, nSeqMax int) *Batch {
 // Close frees the batch if it was allocated with BatchInit.
 func (b *Batch) Close() {
 	if b.owned {
-		C.lfg_batch_free(b.c)
+		registerBatchFuncs()
+		_lfg_batch_free(b.c)
 		b.owned = false
 		runtime.SetFinalizer(b, nil)
 	}
@@ -48,12 +46,12 @@ func (b *Batch) Close() {
 
 // TokenCount returns the number of tokens in the batch.
 func (b *Batch) TokenCount() int {
-	return int(b.c.n_tokens)
+	return int(b.c.NTokens)
 }
 
 // SetTokenCount sets the number of tokens in the batch.
 func (b *Batch) SetTokenCount(n int) {
-	b.c.n_tokens = C.int32_t(n)
+	b.c.NTokens = int32(n)
 }
 
 // Decode processes a batch of tokens using the decoder with KV cache.
@@ -61,10 +59,11 @@ func (b *Batch) SetTokenCount(n int) {
 func (ctx *Context) Decode(batch Batch) error {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "context is closed"}
 	}
-	rc := C.lfg_decode(ctx.c, batch.c)
+	registerBatchFuncs()
+	rc := _lfg_decode(ctx.c, batch.c)
 	if rc != 0 {
 		switch rc {
 		case 1:
@@ -88,10 +87,11 @@ func (ctx *Context) Decode(batch Batch) error {
 func (ctx *Context) Encode(batch Batch) error {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "context is closed"}
 	}
-	rc := C.lfg_encode(ctx.c, batch.c)
+	registerBatchFuncs()
+	rc := _lfg_encode(ctx.c, batch.c)
 	if rc != 0 {
 		if err := getLastError(); err != nil {
 			return err
@@ -99,14 +99,4 @@ func (ctx *Context) Encode(batch Batch) error {
 		return &Error{Code: ErrorInternal, Message: "encode failed"}
 	}
 	return nil
-}
-
-// cTokenPtr returns an unsafe pointer to the first element of a Token slice,
-// cast to *C.lfg_token. Both Token (int32) and C.lfg_token (int32_t) are the
-// same size and layout.
-func cTokenPtr(tokens []Token) *C.lfg_token {
-	if len(tokens) == 0 {
-		return nil
-	}
-	return (*C.lfg_token)(unsafe.Pointer(&tokens[0]))
 }

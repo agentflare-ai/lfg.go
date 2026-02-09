@@ -45,7 +45,7 @@ func (s *Session) Generate(ctx context.Context, prompt string, maxTokens int) (<
 
 		// Ingest prompt tokens.
 		s.mu.Lock()
-		if s.c == nil {
+		if s.c == 0 {
 			s.mu.Unlock()
 			resultCh <- GenerateResult{Err: &Error{Code: ErrorInvalidArgument, Message: "session is closed"}}
 			return

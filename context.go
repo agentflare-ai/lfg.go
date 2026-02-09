@@ -1,9 +1,7 @@
+//go:build (darwin && arm64) || (linux && amd64) || (linux && arm64)
+
 package lfg
 
-/*
-#include "lfg_inference.h"
-*/
-import "C"
 import (
 	"runtime"
 	"sync"
@@ -137,40 +135,48 @@ func WithNoPerf(v bool) ContextOption {
 	}
 }
 
+// byteToBool converts a C struct bool byte field to a Go bool.
+func byteToBool(b byte) bool {
+	return b != 0
+}
+
 // Context wraps an lfg_context pointer with thread-safe access.
 type Context struct {
 	mu    sync.RWMutex
-	c     *C.struct_lfg_context
-	model *Model // prevent GC of parent
+	c     uintptr // *lfg_context (C pointer as uintptr)
+	model *Model  // prevent GC of parent
 }
 
 // NewContext creates a new inference context from a model. Automatically initializes the backend.
 func NewContext(model *Model, opts ...ContextOption) (*Context, error) {
 	ensureBackend()
+	registerContextFuncs()
+	registerModelFuncs()
+	registerVocabFuncs()
 
 	model.mu.RLock()
-	if model.c == nil {
+	if model.c == 0 {
 		model.mu.RUnlock()
 		return nil, &Error{Code: ErrorInvalidArgument, Message: "model is closed"}
 	}
 
-	defaults := C.lfg_context_default_params()
+	defaults := _lfg_context_default_params()
 	cfg := ContextConfig{
-		ContextSize:    uint32(defaults.n_ctx),
-		BatchSize:      uint32(defaults.n_batch),
-		MicroBatchSize: uint32(defaults.n_ubatch),
-		MaxSequences:   uint32(defaults.n_seq_max),
-		Threads:        int(defaults.n_threads),
-		ThreadsBatch:   int(defaults.n_threads_batch),
-		RopeScaling:    RopeScalingType(defaults.rope_scaling_type),
-		PoolingType:    PoolingType(defaults.pooling_type),
-		AttentionType:  AttentionType(defaults.attention_type),
-		FlashAttnType:  FlashAttnType(defaults.flash_attn_type),
-		RopeFreqBase:   float32(defaults.rope_freq_base),
-		RopeFreqScale:  float32(defaults.rope_freq_scale),
-		Embeddings:     bool(defaults.embeddings),
-		OffloadKQV:     bool(defaults.offload_kqv),
-		NoPerf:         bool(defaults.no_perf),
+		ContextSize:    defaults.NCtx,
+		BatchSize:      defaults.NBatch,
+		MicroBatchSize: defaults.NUBatch,
+		MaxSequences:   defaults.NSeqMax,
+		Threads:        int(defaults.NThreads),
+		ThreadsBatch:   int(defaults.NThreadsBatch),
+		RopeScaling:    RopeScalingType(defaults.RopeScalingType),
+		PoolingType:    PoolingType(defaults.PoolingType),
+		AttentionType:  AttentionType(defaults.AttentionType),
+		FlashAttnType:  FlashAttnType(defaults.FlashAttnType),
+		RopeFreqBase:   defaults.RopeFreqBase,
+		RopeFreqScale:  defaults.RopeFreqScale,
+		Embeddings:     byteToBool(defaults.Embeddings),
+		OffloadKQV:     byteToBool(defaults.OffloadKQV),
+		NoPerf:         byteToBool(defaults.NoPerf),
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -178,26 +184,26 @@ func NewContext(model *Model, opts ...ContextOption) (*Context, error) {
 
 	// Convert Go config back to C params.
 	params := defaults
-	params.n_ctx = C.uint32_t(cfg.ContextSize)
-	params.n_batch = C.uint32_t(cfg.BatchSize)
-	params.n_ubatch = C.uint32_t(cfg.MicroBatchSize)
-	params.n_seq_max = C.uint32_t(cfg.MaxSequences)
-	params.n_threads = C.int32_t(cfg.Threads)
-	params.n_threads_batch = C.int32_t(cfg.ThreadsBatch)
-	params.rope_scaling_type = C.enum_lfg_rope_scaling_type(cfg.RopeScaling)
-	params.pooling_type = C.enum_lfg_pooling_type(cfg.PoolingType)
-	params.attention_type = C.enum_lfg_attention_type(cfg.AttentionType)
-	params.flash_attn_type = C.enum_lfg_flash_attn_type(cfg.FlashAttnType)
-	params.rope_freq_base = C.float(cfg.RopeFreqBase)
-	params.rope_freq_scale = C.float(cfg.RopeFreqScale)
-	params.embeddings = C.bool(cfg.Embeddings)
-	params.offload_kqv = C.bool(cfg.OffloadKQV)
-	params.no_perf = C.bool(cfg.NoPerf)
+	params.NCtx = cfg.ContextSize
+	params.NBatch = cfg.BatchSize
+	params.NUBatch = cfg.MicroBatchSize
+	params.NSeqMax = cfg.MaxSequences
+	params.NThreads = int32(cfg.Threads)
+	params.NThreadsBatch = int32(cfg.ThreadsBatch)
+	params.RopeScalingType = int32(cfg.RopeScaling)
+	params.PoolingType = int32(cfg.PoolingType)
+	params.AttentionType = int32(cfg.AttentionType)
+	params.FlashAttnType = int32(cfg.FlashAttnType)
+	params.RopeFreqBase = cfg.RopeFreqBase
+	params.RopeFreqScale = cfg.RopeFreqScale
+	params.Embeddings = boolToByte(cfg.Embeddings)
+	params.OffloadKQV = boolToByte(cfg.OffloadKQV)
+	params.NoPerf = boolToByte(cfg.NoPerf)
 
-	cCtx := C.lfg_init_from_model(model.c, params)
+	cCtx := _lfg_init_from_model(model.c, params)
 	model.mu.RUnlock()
 
-	if cCtx == nil {
+	if cCtx == 0 {
 		if err := getLastError(); err != nil {
 			return nil, err
 		}
@@ -213,9 +219,10 @@ func NewContext(model *Model, opts ...ContextOption) (*Context, error) {
 func (ctx *Context) Close() error {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c != nil {
-		C.lfg_free(ctx.c)
-		ctx.c = nil
+	if ctx.c != 0 {
+		registerContextFuncs()
+		_lfg_free(ctx.c)
+		ctx.c = 0
 		runtime.SetFinalizer(ctx, nil)
 	}
 	return nil
@@ -230,130 +237,143 @@ func (ctx *Context) Model() *Model {
 func (ctx *Context) ContextSize() uint32 {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return 0
 	}
-	return uint32(C.lfg_n_ctx(ctx.c))
+	registerContextFuncs()
+	return _lfg_n_ctx(ctx.c)
 }
 
 // SequenceContextSize returns the per-sequence context size.
 func (ctx *Context) SequenceContextSize() uint32 {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return 0
 	}
-	return uint32(C.lfg_n_ctx_seq(ctx.c))
+	registerContextFuncs()
+	return _lfg_n_ctx_seq(ctx.c)
 }
 
 // BatchSize returns the actual batch size.
 func (ctx *Context) BatchSize() uint32 {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return 0
 	}
-	return uint32(C.lfg_n_batch(ctx.c))
+	registerContextFuncs()
+	return _lfg_n_batch(ctx.c)
 }
 
 // MicroBatchSize returns the actual micro-batch size.
 func (ctx *Context) MicroBatchSize() uint32 {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return 0
 	}
-	return uint32(C.lfg_n_ubatch(ctx.c))
+	registerContextFuncs()
+	return _lfg_n_ubatch(ctx.c)
 }
 
 // MaxSequences returns the maximum number of sequences.
 func (ctx *Context) MaxSequences() uint32 {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return 0
 	}
-	return uint32(C.lfg_n_seq_max(ctx.c))
+	registerContextFuncs()
+	return _lfg_n_seq_max(ctx.c)
 }
 
 // SetThreads sets the number of threads for generation and batch processing.
 func (ctx *Context) SetThreads(nThreads, nThreadsBatch int) {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return
 	}
-	C.lfg_set_n_threads(ctx.c, C.int32_t(nThreads), C.int32_t(nThreadsBatch))
+	registerContextFuncs()
+	_lfg_set_n_threads(ctx.c, int32(nThreads), int32(nThreadsBatch))
 }
 
 // ThreadCount returns the number of threads used for generation.
 func (ctx *Context) ThreadCount() int {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return 0
 	}
-	return int(C.lfg_n_threads(ctx.c))
+	registerContextFuncs()
+	return int(_lfg_n_threads(ctx.c))
 }
 
 // BatchThreadCount returns the number of threads used for batch processing.
 func (ctx *Context) BatchThreadCount() int {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return 0
 	}
-	return int(C.lfg_n_threads_batch(ctx.c))
+	registerContextFuncs()
+	return int(_lfg_n_threads_batch(ctx.c))
 }
 
 // SetEmbeddings sets whether the context outputs embeddings.
 func (ctx *Context) SetEmbeddings(v bool) {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return
 	}
-	C.lfg_set_embeddings(ctx.c, C.bool(v))
+	registerContextFuncs()
+	_lfg_set_embeddings(ctx.c, v)
 }
 
 // SetCausalAttn sets whether to use causal attention.
 func (ctx *Context) SetCausalAttn(v bool) {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return
 	}
-	C.lfg_set_causal_attn(ctx.c, C.bool(v))
+	registerContextFuncs()
+	_lfg_set_causal_attn(ctx.c, v)
 }
 
 // SetWarmup sets whether the model is in warmup mode.
 func (ctx *Context) SetWarmup(v bool) {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return
 	}
-	C.lfg_set_warmup(ctx.c, C.bool(v))
+	registerContextFuncs()
+	_lfg_set_warmup(ctx.c, v)
 }
 
 // Synchronize waits until all computations are finished.
 func (ctx *Context) Synchronize() {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return
 	}
-	C.lfg_synchronize(ctx.c)
+	registerContextFuncs()
+	_lfg_synchronize(ctx.c)
 }
 
-// PoolingType returns the pooling type of the context.
+// GetPoolingType returns the pooling type of the context.
 func (ctx *Context) GetPoolingType() PoolingType {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return PoolingTypeUnspecified
 	}
-	return PoolingType(C.lfg_pooling_type(ctx.c))
+	registerContextFuncs()
+	return PoolingType(_lfg_pooling_type(ctx.c))
 }
 
 // Logits returns all output logits from the last decode call.
@@ -361,14 +381,17 @@ func (ctx *Context) GetPoolingType() PoolingType {
 func (ctx *Context) Logits() []float32 {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return nil
 	}
-	ptr := C.lfg_get_logits(ctx.c)
-	if ptr == nil {
+	registerContextFuncs()
+	registerModelFuncs()
+	registerVocabFuncs()
+	ptr := _lfg_get_logits(ctx.c)
+	if ptr == 0 {
 		return nil
 	}
-	nVocab := int(C.lfg_vocab_n_tokens(C.lfg_model_get_vocab(C.lfg_get_model(ctx.c))))
+	nVocab := int(_lfg_vocab_n_tokens(_lfg_model_get_vocab(_lfg_get_model(ctx.c))))
 	return unsafe.Slice((*float32)(unsafe.Pointer(ptr)), nVocab)
 }
 
@@ -377,14 +400,17 @@ func (ctx *Context) Logits() []float32 {
 func (ctx *Context) LogitsAt(i int) []float32 {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return nil
 	}
-	ptr := C.lfg_get_logits_ith(ctx.c, C.int32_t(i))
-	if ptr == nil {
+	registerContextFuncs()
+	registerModelFuncs()
+	registerVocabFuncs()
+	ptr := _lfg_get_logits_ith(ctx.c, int32(i))
+	if ptr == 0 {
 		return nil
 	}
-	nVocab := int(C.lfg_vocab_n_tokens(C.lfg_model_get_vocab(C.lfg_get_model(ctx.c))))
+	nVocab := int(_lfg_vocab_n_tokens(_lfg_model_get_vocab(_lfg_get_model(ctx.c))))
 	return unsafe.Slice((*float32)(unsafe.Pointer(ptr)), nVocab)
 }
 
@@ -393,14 +419,16 @@ func (ctx *Context) LogitsAt(i int) []float32 {
 func (ctx *Context) Embeddings() []float32 {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return nil
 	}
-	ptr := C.lfg_get_embeddings(ctx.c)
-	if ptr == nil {
+	registerContextFuncs()
+	registerModelFuncs()
+	ptr := _lfg_get_embeddings(ctx.c)
+	if ptr == 0 {
 		return nil
 	}
-	nEmbd := int(C.lfg_model_n_embd(C.lfg_get_model(ctx.c)))
+	nEmbd := int(_lfg_model_n_embd(_lfg_get_model(ctx.c)))
 	return unsafe.Slice((*float32)(unsafe.Pointer(ptr)), nEmbd)
 }
 
@@ -409,14 +437,16 @@ func (ctx *Context) Embeddings() []float32 {
 func (ctx *Context) EmbeddingsAt(i int) []float32 {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return nil
 	}
-	ptr := C.lfg_get_embeddings_ith(ctx.c, C.int32_t(i))
-	if ptr == nil {
+	registerContextFuncs()
+	registerModelFuncs()
+	ptr := _lfg_get_embeddings_ith(ctx.c, int32(i))
+	if ptr == 0 {
 		return nil
 	}
-	nEmbd := int(C.lfg_model_n_embd(C.lfg_get_model(ctx.c)))
+	nEmbd := int(_lfg_model_n_embd(_lfg_get_model(ctx.c)))
 	return unsafe.Slice((*float32)(unsafe.Pointer(ptr)), nEmbd)
 }
 
@@ -425,13 +455,15 @@ func (ctx *Context) EmbeddingsAt(i int) []float32 {
 func (ctx *Context) SequenceEmbeddings(seqID SequenceID) []float32 {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return nil
 	}
-	ptr := C.lfg_get_embeddings_seq(ctx.c, C.lfg_seq_id(seqID))
-	if ptr == nil {
+	registerContextFuncs()
+	registerModelFuncs()
+	ptr := _lfg_get_embeddings_seq(ctx.c, int32(seqID))
+	if ptr == 0 {
 		return nil
 	}
-	nEmbd := int(C.lfg_model_n_embd(C.lfg_get_model(ctx.c)))
+	nEmbd := int(_lfg_model_n_embd(_lfg_get_model(ctx.c)))
 	return unsafe.Slice((*float32)(unsafe.Pointer(ptr)), nEmbd)
 }

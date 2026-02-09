@@ -1,53 +1,13 @@
+//go:build (darwin && arm64) || (linux && amd64) || (linux && arm64)
+
 package lfg
 
-/*
-#include "lfg_api.h"
-#include <stdlib.h>
-
-// Forward-declare Go-exported callback trampolines.
-// Types must match exactly what cgo generates (no const qualifiers).
-extern int goGenerateTokenCB(int32_t token, char *piece, int32_t piece_len, void *user_data);
-extern char * goGenerateEntropyCB(lfg_entropy_event *event, float *embedding, void *user_data);
-extern void goGenerateConfidenceCB(lfg_confidence_event *event, float *embedding, void *user_data);
-extern void goGenerateSurpriseCB(lfg_surprise_event *event, float *embedding, void *user_data);
-
-// C trampolines matching the callback typedefs.
-static lfg_generate_action c_token_trampoline(lfg_token token, const char *piece, int32_t piece_len, void *user_data) {
-    return (lfg_generate_action)goGenerateTokenCB((int32_t)token, (char *)piece, piece_len, user_data);
-}
-
-static const char * c_entropy_trampoline(const lfg_entropy_event *event, const float *embedding, void *user_data) {
-    return (const char *)goGenerateEntropyCB((lfg_entropy_event *)event, (float *)embedding, user_data);
-}
-
-static void c_confidence_trampoline(const lfg_confidence_event *event, const float *embedding, void *user_data) {
-    goGenerateConfidenceCB((lfg_confidence_event *)event, (float *)embedding, user_data);
-}
-
-static void c_surprise_trampoline(const lfg_surprise_event *event, const float *embedding, void *user_data) {
-    goGenerateSurpriseCB((lfg_surprise_event *)event, (float *)embedding, user_data);
-}
-
-static lfg_generate_token_cb get_token_trampoline(void) {
-    return c_token_trampoline;
-}
-
-static lfg_generate_entropy_cb get_entropy_trampoline(void) {
-    return c_entropy_trampoline;
-}
-
-static lfg_generate_confidence_cb get_confidence_trampoline(void) {
-    return c_confidence_trampoline;
-}
-
-static lfg_generate_surprise_cb get_surprise_trampoline(void) {
-    return c_surprise_trampoline;
-}
-*/
-import "C"
 import (
+	"runtime"
 	"sync"
 	"unsafe"
+
+	"github.com/ebitengine/purego"
 )
 
 // ---------------------------------------------------------------------------
@@ -58,17 +18,17 @@ import (
 type StopReason int
 
 const (
-	StopReasonEOS       StopReason = C.LFG_STOP_EOS        // End-of-generation token.
-	StopReasonMaxTokens StopReason = C.LFG_STOP_MAX_TOKENS // Hit max_tokens limit.
-	StopReasonCallback  StopReason = C.LFG_STOP_CALLBACK   // Token callback returned GenerateStop.
+	StopReasonEOS       StopReason = 0 // End-of-generation token.
+	StopReasonMaxTokens StopReason = 1 // Hit max_tokens limit.
+	StopReasonCallback  StopReason = 2 // Token callback returned GenerateStop.
 )
 
 // GenerateAction controls whether the C-side generate loop continues or stops.
 type GenerateAction int
 
 const (
-	GenerateContinue GenerateAction = C.LFG_GENERATE_CONTINUE
-	GenerateStop     GenerateAction = C.LFG_GENERATE_STOP
+	GenerateContinue GenerateAction = 0
+	GenerateStop     GenerateAction = 1
 )
 
 // TokenCallback is called for each generated token during a C-side generate loop.
@@ -124,7 +84,7 @@ type generateHandle struct {
 	entropyCB    EntropyCallback
 	confidenceCB ConfidenceCallback
 	surpriseCB   SurpriseCallback
-	cStrings     []unsafe.Pointer // CStrings allocated by entropy callback, freed after generate.
+	pinnedStrings [][]byte // Pinned Go strings returned by entropy callback; GC'd after generate.
 }
 
 var (
@@ -149,129 +109,141 @@ func unregisterGenerateHandle(id uintptr) {
 }
 
 // ---------------------------------------------------------------------------
-// Exported callbacks (called from C trampolines)
+// purego callback trampolines (created once)
 // ---------------------------------------------------------------------------
 
-//export goGenerateTokenCB
-func goGenerateTokenCB(token C.int32_t, piece *C.char, pieceLen C.int32_t, userData unsafe.Pointer) C.int {
-	if userData == nil {
-		return C.int(GenerateContinue)
-	}
-	id := *(*uintptr)(userData)
-	genCBMu.Lock()
-	h, ok := genCBMap[id]
-	genCBMu.Unlock()
-	if !ok || h.tokenCB == nil {
-		return C.int(GenerateContinue)
-	}
+var (
+	genTrampolineOnce     sync.Once
+	tokenTrampoline       uintptr
+	entropyTrampoline     uintptr
+	confidenceTrampoline  uintptr
+	surpriseTrampoline    uintptr
+)
 
-	var goPiece string
-	if piece != nil && pieceLen > 0 {
-		goPiece = C.GoStringN(piece, C.int(pieceLen))
-	}
+func initGenerateTrampolines() {
+	genTrampolineOnce.Do(func() {
+		// Token callback: int (*)(lfg_token token, const char *piece, int32_t piece_len, void *user_data)
+		// Returns lfg_generate_action (int).
+		tokenTrampoline = purego.NewCallback(func(token int32, piece uintptr, pieceLen int32, userData uintptr) int32 {
+			if userData == 0 {
+				return int32(GenerateContinue)
+			}
+			id := *(*uintptr)(unsafe.Pointer(userData))
+			genCBMu.Lock()
+			h, ok := genCBMap[id]
+			genCBMu.Unlock()
+			if !ok || h.tokenCB == nil {
+				return int32(GenerateContinue)
+			}
+			goPiece := goStringN(piece, int(pieceLen))
+			action := h.tokenCB(Token(token), goPiece)
+			return int32(action)
+		})
 
-	action := h.tokenCB(Token(token), goPiece)
-	return C.int(action)
-}
+		// Entropy callback: const char * (*)(const lfg_entropy_event *event, const float *embedding, void *user_data)
+		// Returns a pointer to a null-terminated C string (or 0/nil to skip).
+		entropyTrampoline = purego.NewCallback(func(eventPtr uintptr, embeddingPtr uintptr, userData uintptr) uintptr {
+			if userData == 0 {
+				return 0
+			}
+			id := *(*uintptr)(unsafe.Pointer(userData))
+			genCBMu.Lock()
+			h, ok := genCBMap[id]
+			genCBMu.Unlock()
+			if !ok || h.entropyCB == nil {
+				return 0
+			}
 
-//export goGenerateEntropyCB
-func goGenerateEntropyCB(event *C.lfg_entropy_event, embedding *C.float, userData unsafe.Pointer) *C.char {
-	if userData == nil {
-		return nil
-	}
-	id := *(*uintptr)(userData)
-	genCBMu.Lock()
-	h, ok := genCBMap[id]
-	genCBMu.Unlock()
-	if !ok || h.entropyCB == nil {
-		return nil
-	}
+			event := (*cEntropyEvent)(unsafe.Pointer(eventPtr))
+			goEvent := EntropyEvent{
+				Entropy:      event.Entropy,
+				Normalized:   event.Normalized,
+				TopLogprob:   event.TopLogprob,
+				Token:        Token(event.Token),
+				NPast:        event.NPast,
+				CheckpointID: event.CheckpointID,
+				NEmbedding:   event.NEmbd,
+			}
 
-	goEvent := EntropyEvent{
-		Entropy:      float32(event.entropy),
-		Normalized:   float32(event.normalized),
-		TopLogprob:   float32(event.top_logprob),
-		Token:        Token(event.token),
-		NPast:        int32(event.n_past),
-		CheckpointID: int32(event.checkpoint_id),
-		NEmbedding:   int32(event.n_embd),
-	}
+			var goEmbed []float32
+			if embeddingPtr != 0 && goEvent.NEmbedding > 0 {
+				goEmbed = unsafe.Slice((*float32)(unsafe.Pointer(embeddingPtr)), goEvent.NEmbedding)
+			}
 
-	var goEmbed []float32
-	if embedding != nil && goEvent.NEmbedding > 0 {
-		goEmbed = unsafe.Slice((*float32)(unsafe.Pointer(embedding)), goEvent.NEmbedding)
-	}
+			result := h.entropyCB(goEvent, goEmbed)
+			if result == "" {
+				return 0
+			}
 
-	result := h.entropyCB(goEvent, goEmbed)
-	if result == "" {
-		return nil
-	}
+			// Pin the string in Go memory. GC will clean it up after generate returns.
+			pinned := cString(result)
+			genCBMu.Lock()
+			h.pinnedStrings = append(h.pinnedStrings, pinned)
+			genCBMu.Unlock()
+			return cStringPtr(pinned)
+		})
 
-	cs := C.CString(result)
-	// Track for cleanup after generate returns.
-	genCBMu.Lock()
-	h.cStrings = append(h.cStrings, unsafe.Pointer(cs))
-	genCBMu.Unlock()
-	return cs
-}
+		// Confidence callback: void (*)(const lfg_confidence_event *event, const float *embedding, void *user_data)
+		confidenceTrampoline = purego.NewCallback(func(eventPtr uintptr, embeddingPtr uintptr, userData uintptr) {
+			if userData == 0 {
+				return
+			}
+			id := *(*uintptr)(unsafe.Pointer(userData))
+			genCBMu.Lock()
+			h, ok := genCBMap[id]
+			genCBMu.Unlock()
+			if !ok || h.confidenceCB == nil {
+				return
+			}
 
-//export goGenerateConfidenceCB
-func goGenerateConfidenceCB(event *C.lfg_confidence_event, embedding *C.float, userData unsafe.Pointer) {
-	if userData == nil {
-		return
-	}
-	id := *(*uintptr)(userData)
-	genCBMu.Lock()
-	h, ok := genCBMap[id]
-	genCBMu.Unlock()
-	if !ok || h.confidenceCB == nil {
-		return
-	}
+			event := (*cConfidenceEvent)(unsafe.Pointer(eventPtr))
+			goEvent := ConfidenceEvent{
+				MeanEntropy: event.MeanEntropy,
+				MinEntropy:  event.MinEntropy,
+				SpanLength:  event.SpanLength,
+				StartPos:    event.StartPos,
+				EndPos:      event.EndPos,
+				NEmbedding:  event.NEmbd,
+			}
 
-	goEvent := ConfidenceEvent{
-		MeanEntropy: float32(event.mean_entropy),
-		MinEntropy:  float32(event.min_entropy),
-		SpanLength:  int32(event.span_length),
-		StartPos:    int32(event.start_pos),
-		EndPos:      int32(event.end_pos),
-		NEmbedding:  int32(event.n_embd),
-	}
+			var goEmbed []float32
+			if embeddingPtr != 0 && goEvent.NEmbedding > 0 {
+				goEmbed = unsafe.Slice((*float32)(unsafe.Pointer(embeddingPtr)), goEvent.NEmbedding)
+			}
 
-	var goEmbed []float32
-	if embedding != nil && goEvent.NEmbedding > 0 {
-		goEmbed = unsafe.Slice((*float32)(unsafe.Pointer(embedding)), goEvent.NEmbedding)
-	}
+			h.confidenceCB(goEvent, goEmbed)
+		})
 
-	h.confidenceCB(goEvent, goEmbed)
-}
+		// Surprise callback: void (*)(const lfg_surprise_event *event, const float *embedding, void *user_data)
+		surpriseTrampoline = purego.NewCallback(func(eventPtr uintptr, embeddingPtr uintptr, userData uintptr) {
+			if userData == 0 {
+				return
+			}
+			id := *(*uintptr)(unsafe.Pointer(userData))
+			genCBMu.Lock()
+			h, ok := genCBMap[id]
+			genCBMu.Unlock()
+			if !ok || h.surpriseCB == nil {
+				return
+			}
 
-//export goGenerateSurpriseCB
-func goGenerateSurpriseCB(event *C.lfg_surprise_event, embedding *C.float, userData unsafe.Pointer) {
-	if userData == nil {
-		return
-	}
-	id := *(*uintptr)(userData)
-	genCBMu.Lock()
-	h, ok := genCBMap[id]
-	genCBMu.Unlock()
-	if !ok || h.surpriseCB == nil {
-		return
-	}
+			event := (*cSurpriseEvent)(unsafe.Pointer(eventPtr))
+			goEvent := SurpriseEvent{
+				MeanSurprise:     event.MeanSurprise,
+				MaxSurprise:      event.MaxSurprise,
+				NAboveThreshold:  event.NAboveThreshold,
+				NTokensEvaluated: event.NTokensEvaluated,
+				NEmbedding:       event.NEmbd,
+			}
 
-	goEvent := SurpriseEvent{
-		MeanSurprise:     float32(event.mean_surprise),
-		MaxSurprise:      float32(event.max_surprise),
-		NAboveThreshold:  int32(event.n_above_threshold),
-		NTokensEvaluated: int32(event.n_tokens_evaluated),
-		NEmbedding:       int32(event.n_embd),
-	}
+			var goEmbed []float32
+			if embeddingPtr != 0 && goEvent.NEmbedding > 0 {
+				goEmbed = unsafe.Slice((*float32)(unsafe.Pointer(embeddingPtr)), goEvent.NEmbedding)
+			}
 
-	var goEmbed []float32
-	if embedding != nil && goEvent.NEmbedding > 0 {
-		goEmbed = unsafe.Slice((*float32)(unsafe.Pointer(embedding)), goEvent.NEmbedding)
-	}
-
-	h.surpriseCB(goEvent, goEmbed)
+			h.surpriseCB(goEvent, goEmbed)
+		})
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -279,20 +251,21 @@ func goGenerateSurpriseCB(event *C.lfg_surprise_event, embedding *C.float, userD
 // ---------------------------------------------------------------------------
 
 // prepareGenerate sets up the callback handle and C config.
-// The config is passed by value to C, so embedded Go pointers in user_data
-// fields are safe (CGo only checks pointer arguments, not value arguments).
-func prepareGenerate(config *GenerateConfig) (func(), C.lfg_generate_config) {
-	cCfg := C.lfg_generate_default_config()
+func prepareGenerate(config *GenerateConfig) (func(), cGenerateConfig) {
+	registerGenerateFuncs()
+	cCfg := _lfg_generate_default_config()
 
 	if config == nil {
 		return func() {}, cCfg
 	}
 
-	cCfg.max_tokens = C.int32_t(config.MaxTokens)
+	cCfg.MaxTokens = config.MaxTokens
 
 	if config.TokenCallback == nil && config.EntropyCallback == nil && config.ConfidenceCallback == nil && config.SurpriseCallback == nil {
 		return func() {}, cCfg
 	}
+
+	initGenerateTrampolines()
 
 	h := &generateHandle{
 		tokenCB:      config.TokenCallback,
@@ -306,39 +279,39 @@ func prepareGenerate(config *GenerateConfig) (func(), C.lfg_generate_config) {
 	*idPtr = id
 
 	if config.TokenCallback != nil {
-		cCfg.token_cb = C.get_token_trampoline()
-		cCfg.token_cb_data = unsafe.Pointer(idPtr)
+		cCfg.TokenCB = tokenTrampoline
+		cCfg.TokenCBData = uintptr(unsafe.Pointer(idPtr))
 	}
 	if config.EntropyCallback != nil {
-		cCfg.entropy_cb = C.get_entropy_trampoline()
-		cCfg.entropy_cb_data = unsafe.Pointer(idPtr)
+		cCfg.EntropyCB = entropyTrampoline
+		cCfg.EntropyCBData = uintptr(unsafe.Pointer(idPtr))
 	}
 	if config.ConfidenceCallback != nil {
-		cCfg.confidence_cb = C.get_confidence_trampoline()
-		cCfg.confidence_cb_data = unsafe.Pointer(idPtr)
+		cCfg.ConfidenceCB = confidenceTrampoline
+		cCfg.ConfidenceCBData = uintptr(unsafe.Pointer(idPtr))
 	}
 	if config.SurpriseCallback != nil {
-		cCfg.surprise_cb = C.get_surprise_trampoline()
-		cCfg.surprise_cb_data = unsafe.Pointer(idPtr)
+		cCfg.SurpriseCB = surpriseTrampoline
+		cCfg.SurpriseCBData = uintptr(unsafe.Pointer(idPtr))
 	}
 
 	cleanup := func() {
-		for _, p := range h.cStrings {
-			C.free(p)
-		}
+		// pinnedStrings are GC'd automatically — no C.free needed with purego.
 		unregisterGenerateHandle(id)
+		runtime.KeepAlive(idPtr)
+		runtime.KeepAlive(h)
 	}
 
 	return cleanup, cCfg
 }
 
-func resultFromC(r C.lfg_generate_result) GenerateLoopResult {
+func resultFromC(r cGenerateResult) GenerateLoopResult {
 	return GenerateLoopResult{
-		TokenCount:      int(r.n_tokens),
-		Retrievals:      int(r.n_retrievals),
-		ConfidenceSpans: int(r.n_confidence_spans),
-		SurpriseEvents:  int(r.n_surprise_events),
-		StopReason:      StopReason(r.stop_reason),
+		TokenCount:      int(r.NTokens),
+		Retrievals:      int(r.NRetrievals),
+		ConfidenceSpans: int(r.NConfidenceSpans),
+		SurpriseEvents:  int(r.NSurpriseEvents),
+		StopReason:      StopReason(r.StopReason),
 	}
 }
 
@@ -353,14 +326,14 @@ func resultFromC(r C.lfg_generate_result) GenerateLoopResult {
 func (s *Session) GenerateFromState(config GenerateConfig) (GenerateLoopResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return GenerateLoopResult{}, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
 	cleanup, cCfg := prepareGenerate(&config)
 	defer cleanup()
 
-	r := C.lfg_session_generate(s.c, cCfg)
+	r := _lfg_session_generate(s.c, cCfg)
 	return resultFromC(r), nil
 }
 
@@ -371,18 +344,19 @@ func (s *Session) GenerateFromState(config GenerateConfig) (GenerateLoopResult, 
 func (s *Session) PromptGenerate(prompt string, addBOS bool, config GenerateConfig) (GenerateLoopResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return GenerateLoopResult{}, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
-	cPrompt := C.CString(prompt)
-	defer C.free(unsafe.Pointer(cPrompt))
-	cLen := C.int32_t(len(prompt))
+	promptBytes := cString(prompt)
+	promptPtr := cStringPtr(promptBytes)
+	cLen := int32(len(prompt))
 
 	cleanup, cCfg := prepareGenerate(&config)
 	defer cleanup()
 
-	r := C.lfg_session_prompt_generate(s.c, cPrompt, cLen, C.bool(addBOS), cCfg)
+	r := _lfg_session_prompt_generate(s.c, promptPtr, cLen, addBOS, cCfg)
+	runtime.KeepAlive(promptBytes)
 	return resultFromC(r), nil
 }
 
@@ -392,7 +366,7 @@ func (s *Session) PromptGenerate(prompt string, addBOS bool, config GenerateConf
 func (s *Session) ChatGenerate(messages []ChatMessage, config GenerateConfig) (GenerateLoopResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return GenerateLoopResult{}, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 	if len(messages) == 0 {
@@ -400,25 +374,22 @@ func (s *Session) ChatGenerate(messages []ChatMessage, config GenerateConfig) (G
 	}
 
 	// Convert Go ChatMessages to C lfg_chat_message array.
-	cMessages := make([]C.struct_lfg_chat_message, len(messages))
-	cStrs := make([]*C.char, 0, len(messages)*2)
-	defer func() {
-		for _, p := range cStrs {
-			C.free(unsafe.Pointer(p))
-		}
-	}()
+	cMessages := make([]cChatMessage, len(messages))
+	keepAlive := make([][]byte, 0, len(messages)*2)
 
 	for i, msg := range messages {
-		cRole := C.CString(msg.Role)
-		cContent := C.CString(msg.Content)
-		cStrs = append(cStrs, cRole, cContent)
-		cMessages[i].role = cRole
-		cMessages[i].content = cContent
+		roleBytes := cString(msg.Role)
+		contentBytes := cString(msg.Content)
+		keepAlive = append(keepAlive, roleBytes, contentBytes)
+		cMessages[i].Role = cStringPtr(roleBytes)
+		cMessages[i].Content = cStringPtr(contentBytes)
 	}
 
 	cleanup, cCfg := prepareGenerate(&config)
 	defer cleanup()
 
-	r := C.lfg_session_chat_generate(s.c, &cMessages[0], C.size_t(len(messages)), cCfg)
+	r := _lfg_session_chat_generate(s.c, uintptr(unsafe.Pointer(&cMessages[0])), uintptr(len(messages)), cCfg)
+	runtime.KeepAlive(keepAlive)
+	runtime.KeepAlive(cMessages)
 	return resultFromC(r), nil
 }

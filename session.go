@@ -1,10 +1,7 @@
+//go:build (darwin && arm64) || (linux && amd64) || (linux && arm64)
+
 package lfg
 
-/*
-#include "lfg_api.h"
-#include <stdlib.h>
-*/
-import "C"
 import (
 	"runtime"
 	"sync"
@@ -43,88 +40,75 @@ type SessionConfig struct {
 
 // DefaultSamplingConfig returns the default sampling configuration.
 func DefaultSamplingConfig() SamplingConfig {
-	c := C.lfg_sampling_default_config()
-	return SamplingConfig{
-		Seed:           uint32(c.seed),
-		NPrev:          int32(c.n_prev),
-		TopK:           int32(c.top_k),
-		TopP:           float32(c.top_p),
-		MinP:           float32(c.min_p),
-		TypP:           float32(c.typ_p),
-		Temp:           float32(c.temp),
-		PenaltyLastN:   int32(c.penalty_last_n),
-		PenaltyRepeat:  float32(c.penalty_repeat),
-		PenaltyFreq:    float32(c.penalty_freq),
-		PenaltyPresent: float32(c.penalty_present),
-		Mirostat:       int32(c.mirostat),
-		MirostatTau:    float32(c.mirostat_tau),
-		MirostatEta:    float32(c.mirostat_eta),
-	}
+	registerSessionFuncs()
+	c := _lfg_sampling_default_config()
+	return samplingConfigFromC(c)
 }
 
 // DefaultSessionConfig returns the default session configuration.
 func DefaultSessionConfig() SessionConfig {
-	c := C.lfg_session_default_config()
+	registerSessionFuncs()
+	c := _lfg_session_default_config()
 	return SessionConfig{
-		NThreads:                int(c.n_threads),
-		NCtx:                    int(c.n_ctx),
-		NBatch:                  int(c.n_batch),
-		EnableHealing:           bool(c.enable_healing),
-		StructuredCheckpointing: bool(c.structured_checkpointing),
-		ReasoningBudget:         int(c.reasoning_budget),
-		MaxTokens:               int32(c.max_tokens),
-		Sampling:                samplingConfigFromC(c.sampling),
+		NThreads:                int(c.NThreads),
+		NCtx:                    int(c.NCtx),
+		NBatch:                  int(c.NBatch),
+		EnableHealing:           c.EnableHealing != 0,
+		StructuredCheckpointing: c.StructuredCheckpointing != 0,
+		ReasoningBudget:         int(c.ReasoningBudget),
+		MaxTokens:               c.MaxTokens,
+		Sampling:                samplingConfigFromC(c.Sampling),
 	}
 }
 
-func samplingConfigFromC(c C.lfg_sampling_config) SamplingConfig {
+func samplingConfigFromC(c cSamplingConfig) SamplingConfig {
 	return SamplingConfig{
-		Seed:           uint32(c.seed),
-		NPrev:          int32(c.n_prev),
-		TopK:           int32(c.top_k),
-		TopP:           float32(c.top_p),
-		MinP:           float32(c.min_p),
-		TypP:           float32(c.typ_p),
-		Temp:           float32(c.temp),
-		PenaltyLastN:   int32(c.penalty_last_n),
-		PenaltyRepeat:  float32(c.penalty_repeat),
-		PenaltyFreq:    float32(c.penalty_freq),
-		PenaltyPresent: float32(c.penalty_present),
-		Mirostat:       int32(c.mirostat),
-		MirostatTau:    float32(c.mirostat_tau),
-		MirostatEta:    float32(c.mirostat_eta),
+		Seed:           c.Seed,
+		NPrev:          c.NPrev,
+		TopK:           c.TopK,
+		TopP:           c.TopP,
+		MinP:           c.MinP,
+		TypP:           c.TypP,
+		Temp:           c.Temp,
+		PenaltyLastN:   c.PenaltyLastN,
+		PenaltyRepeat:  c.PenaltyRepeat,
+		PenaltyFreq:    c.PenaltyFreq,
+		PenaltyPresent: c.PenaltyPresent,
+		Mirostat:       c.Mirostat,
+		MirostatTau:    c.MirostatTau,
+		MirostatEta:    c.MirostatEta,
 	}
 }
 
-func (sc *SamplingConfig) toC() C.lfg_sampling_config {
-	return C.lfg_sampling_config{
-		seed:            C.uint32_t(sc.Seed),
-		n_prev:          C.int32_t(sc.NPrev),
-		top_k:           C.int32_t(sc.TopK),
-		top_p:           C.float(sc.TopP),
-		min_p:           C.float(sc.MinP),
-		typ_p:           C.float(sc.TypP),
-		temp:            C.float(sc.Temp),
-		penalty_last_n:  C.int32_t(sc.PenaltyLastN),
-		penalty_repeat:  C.float(sc.PenaltyRepeat),
-		penalty_freq:    C.float(sc.PenaltyFreq),
-		penalty_present: C.float(sc.PenaltyPresent),
-		mirostat:        C.int32_t(sc.Mirostat),
-		mirostat_tau:    C.float(sc.MirostatTau),
-		mirostat_eta:    C.float(sc.MirostatEta),
+func (sc *SamplingConfig) toC() cSamplingConfig {
+	return cSamplingConfig{
+		Seed:           sc.Seed,
+		NPrev:          sc.NPrev,
+		TopK:           sc.TopK,
+		TopP:           sc.TopP,
+		MinP:           sc.MinP,
+		TypP:           sc.TypP,
+		Temp:           sc.Temp,
+		PenaltyLastN:   sc.PenaltyLastN,
+		PenaltyRepeat:  sc.PenaltyRepeat,
+		PenaltyFreq:    sc.PenaltyFreq,
+		PenaltyPresent: sc.PenaltyPresent,
+		Mirostat:       sc.Mirostat,
+		MirostatTau:    sc.MirostatTau,
+		MirostatEta:    sc.MirostatEta,
 	}
 }
 
-func (cfg *SessionConfig) toC() C.lfg_session_config {
-	return C.lfg_session_config{
-		n_threads:                C.int(cfg.NThreads),
-		n_ctx:                    C.int(cfg.NCtx),
-		n_batch:                  C.int(cfg.NBatch),
-		enable_healing:           C.bool(cfg.EnableHealing),
-		structured_checkpointing: C.bool(cfg.StructuredCheckpointing),
-		reasoning_budget:         C.int(cfg.ReasoningBudget),
-		max_tokens:               C.int32_t(cfg.MaxTokens),
-		sampling:                 cfg.Sampling.toC(),
+func (cfg *SessionConfig) toC() cSessionConfig {
+	return cSessionConfig{
+		NThreads:                int32(cfg.NThreads),
+		NCtx:                    int32(cfg.NCtx),
+		NBatch:                  int32(cfg.NBatch),
+		EnableHealing:           boolToByte(cfg.EnableHealing),
+		StructuredCheckpointing: boolToByte(cfg.StructuredCheckpointing),
+		ReasoningBudget:         int32(cfg.ReasoningBudget),
+		MaxTokens:               cfg.MaxTokens,
+		Sampling:                cfg.Sampling.toC(),
 	}
 }
 
@@ -193,16 +177,17 @@ func WithSessionSampling(sc SamplingConfig) SessionOption {
 // Session wraps the high-level lfg_session API.
 type Session struct {
 	mu    sync.Mutex
-	c     *C.lfg_session
+	c     uintptr
 	model *Model // prevent GC
 }
 
 // NewSession creates a new high-level session. Automatically initializes the backend.
 func NewSession(model *Model, opts ...SessionOption) (*Session, error) {
 	ensureBackend()
+	registerSessionFuncs()
 
 	model.mu.RLock()
-	if model.c == nil {
+	if model.c == 0 {
 		model.mu.RUnlock()
 		return nil, &Error{Code: ErrorInvalidArgument, Message: "model is closed"}
 	}
@@ -213,10 +198,10 @@ func NewSession(model *Model, opts ...SessionOption) (*Session, error) {
 	}
 	cCfg := cfg.toC()
 
-	cs := C.lfg_session_create(model.c, &cCfg)
+	cs := _lfg_session_create(model.c, uintptr(unsafe.Pointer(&cCfg)))
 	model.mu.RUnlock()
 
-	if cs == nil {
+	if cs == 0 {
 		if err := getLastError(); err != nil {
 			return nil, err
 		}
@@ -232,9 +217,9 @@ func NewSession(model *Model, opts ...SessionOption) (*Session, error) {
 func (s *Session) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c != nil {
-		C.lfg_session_free(s.c)
-		s.c = nil
+	if s.c != 0 {
+		_lfg_session_free(s.c)
+		s.c = 0
 		runtime.SetFinalizer(s, nil)
 	}
 	return nil
@@ -244,10 +229,10 @@ func (s *Session) Close() error {
 func (s *Session) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return
 	}
-	C.lfg_session_reset(s.c)
+	_lfg_session_reset(s.c)
 }
 
 // ConfigureStructured sets up structured decoding with a grammar or JSON schema.
@@ -255,21 +240,22 @@ func (s *Session) Reset() {
 func (s *Session) ConfigureStructured(grammarOrSchema, rootRule string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
-	cGrammar := C.CString(grammarOrSchema)
-	defer C.free(unsafe.Pointer(cGrammar))
-
-	var cRoot *C.char
+	grammarBytes := cString(grammarOrSchema)
+	var rootPtr uintptr
+	var rootBytes []byte
 	if rootRule != "" {
-		cRoot = C.CString(rootRule)
-		defer C.free(unsafe.Pointer(cRoot))
+		rootBytes = cString(rootRule)
+		rootPtr = cStringPtr(rootBytes)
 	}
 
-	ok := C.lfg_session_configure_structured(s.c, cGrammar, cRoot)
-	if !bool(ok) {
+	ok := _lfg_session_configure_structured(s.c, cStringPtr(grammarBytes), rootPtr)
+	runtime.KeepAlive(grammarBytes)
+	runtime.KeepAlive(rootBytes)
+	if !ok {
 		if err := getLastError(); err != nil {
 			return err
 		}
@@ -283,21 +269,13 @@ func (s *Session) ConfigureStructured(grammarOrSchema, rootRule string) error {
 func (s *Session) ConfigureReasoning(startTokens, endTokens []Token) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return
 	}
 
-	var startPtr, endPtr *C.lfg_token
-	if len(startTokens) > 0 {
-		startPtr = (*C.lfg_token)(unsafe.Pointer(&startTokens[0]))
-	}
-	if len(endTokens) > 0 {
-		endPtr = (*C.lfg_token)(unsafe.Pointer(&endTokens[0]))
-	}
-
-	C.lfg_session_configure_reasoning(s.c,
-		startPtr, C.size_t(len(startTokens)),
-		endPtr, C.size_t(len(endTokens)))
+	_lfg_session_configure_reasoning(s.c,
+		tokenPtr(startTokens), uintptr(len(startTokens)),
+		tokenPtr(endTokens), uintptr(len(endTokens)))
 }
 
 // ConfigureStopSequences sets stop sequences for generation.
@@ -306,13 +284,13 @@ func (s *Session) ConfigureReasoning(startTokens, endTokens []Token) {
 func (s *Session) ConfigureStopSequences(sequences [][]Token) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
 	if len(sequences) == 0 {
-		ok := C.lfg_session_configure_stop_sequences(s.c, nil, nil, 0)
-		if !bool(ok) {
+		ok := _lfg_session_configure_stop_sequences(s.c, 0, 0, 0)
+		if !ok {
 			return &Error{Code: ErrorInvalidArgument, Message: "failed to clear stop sequences"}
 		}
 		return nil
@@ -320,25 +298,25 @@ func (s *Session) ConfigureStopSequences(sequences [][]Token) error {
 
 	n := len(sequences)
 
-	// Allocate the pointer array in C memory so we don't violate CGO's
-	// "no Go pointer to Go pointer" rule.
-	cPtrs := (*[1 << 30]*C.lfg_token)(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof((*C.lfg_token)(nil)))))[:n:n]
-	defer C.free(unsafe.Pointer(&cPtrs[0]))
-
-	cLens := make([]C.size_t, n)
+	// With purego, no "Go ptr to Go ptr" rule — use Go slices directly.
+	ptrs := make([]uintptr, n)
+	lens := make([]uintptr, n)
 	for i, seq := range sequences {
 		if len(seq) > 0 {
-			cPtrs[i] = (*C.lfg_token)(unsafe.Pointer(&seq[0]))
+			ptrs[i] = uintptr(unsafe.Pointer(&seq[0]))
 		}
-		cLens[i] = C.size_t(len(seq))
+		lens[i] = uintptr(len(seq))
 	}
 
-	ok := C.lfg_session_configure_stop_sequences(
+	ok := _lfg_session_configure_stop_sequences(
 		s.c,
-		&cPtrs[0],
-		&cLens[0],
-		C.size_t(n))
-	if !bool(ok) {
+		uintptr(unsafe.Pointer(&ptrs[0])),
+		uintptr(unsafe.Pointer(&lens[0])),
+		uintptr(n))
+	runtime.KeepAlive(sequences)
+	runtime.KeepAlive(ptrs)
+	runtime.KeepAlive(lens)
+	if !ok {
 		return &Error{Code: ErrorInvalidArgument, Message: "failed to configure stop sequences"}
 	}
 	return nil
@@ -349,15 +327,16 @@ func (s *Session) ConfigureStopSequences(sequences [][]Token) error {
 func (s *Session) IngestTokens(tokens []Token, updateSampler bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 	if len(tokens) == 0 {
 		return nil
 	}
 
-	ok := C.lfg_session_ingest_tokens(s.c, (*C.lfg_token)(unsafe.Pointer(&tokens[0])), C.size_t(len(tokens)), C.bool(updateSampler))
-	if !bool(ok) {
+	ok := _lfg_session_ingest_tokens(s.c, tokenPtr(tokens), uintptr(len(tokens)), updateSampler)
+	runtime.KeepAlive(tokens)
+	if !ok {
 		if err := getLastError(); err != nil {
 			return err
 		}
@@ -370,12 +349,12 @@ func (s *Session) IngestTokens(tokens []Token, updateSampler bool) error {
 func (s *Session) Decode() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
-	ok := C.lfg_session_decode(s.c)
-	if !bool(ok) {
+	ok := _lfg_session_decode(s.c)
+	if !ok {
 		if err := getLastError(); err != nil {
 			return err
 		}
@@ -388,22 +367,22 @@ func (s *Session) Decode() error {
 func (s *Session) Sample() Token {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return InvalidToken
 	}
-	return Token(C.lfg_session_sample(s.c))
+	return Token(_lfg_session_sample(s.c))
 }
 
 // HealToken performs token healing on the last token.
 func (s *Session) HealToken() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
-	ok := C.lfg_session_heal_last_token(s.c)
-	if !bool(ok) {
+	ok := _lfg_session_heal_last_token(s.c)
+	if !ok {
 		if err := getLastError(); err != nil {
 			return err
 		}
@@ -417,23 +396,23 @@ func (s *Session) HealToken() error {
 func (s *Session) Logits(out []float32) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return 0
 	}
 	if len(out) == 0 {
-		return int(C.lfg_session_get_logits(s.c, nil, 0))
+		return int(_lfg_session_get_logits(s.c, 0, 0))
 	}
-	return int(C.lfg_session_get_logits(s.c, (*C.float)(unsafe.Pointer(&out[0])), C.int32_t(len(out))))
+	return int(_lfg_session_get_logits(s.c, uintptr(unsafe.Pointer(&out[0])), int32(len(out))))
 }
 
 // VocabSize returns the vocabulary size for this session.
 func (s *Session) VocabSize() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return 0
 	}
-	return int(C.lfg_session_get_vocab_size(s.c))
+	return int(_lfg_session_get_vocab_size(s.c))
 }
 
 // ModelStats holds statistics about a loaded model.
@@ -448,21 +427,22 @@ type ModelStats struct {
 func (m *Model) Stats() ModelStats {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.c == nil {
+	if m.c == 0 {
 		return ModelStats{}
 	}
-	cs := C.lfg_model_get_stats(m.c)
+	registerSessionFuncs()
+	cs := _lfg_model_get_stats(m.c)
 	return ModelStats{
-		ParameterCount: uint64(cs.n_params),
-		SizeBytes:      uint64(cs.size_bytes),
-		VocabSize:      int32(cs.n_vocab),
-		ContextSize:    int32(cs.n_ctx_train),
+		ParameterCount: cs.NParams,
+		SizeBytes:      cs.SizeBytes,
+		VocabSize:      cs.NVocab,
+		ContextSize:    cs.NCtxTrain,
 	}
 }
 
 // Checkpoint wraps an lfg_checkpoint.
 type Checkpoint struct {
-	c       *C.lfg_checkpoint
+	c       uintptr
 	session *Session // prevent GC
 }
 
@@ -470,11 +450,11 @@ type Checkpoint struct {
 func (s *Session) CreateCheckpoint() *Checkpoint {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return nil
 	}
-	cp := C.lfg_session_create_checkpoint(s.c)
-	if cp == nil {
+	cp := _lfg_session_create_checkpoint(s.c)
+	if cp == 0 {
 		return nil
 	}
 	c := &Checkpoint{c: cp, session: s}
@@ -484,9 +464,9 @@ func (s *Session) CreateCheckpoint() *Checkpoint {
 
 // Close frees the checkpoint. Safe to call multiple times.
 func (cp *Checkpoint) Close() {
-	if cp.c != nil {
-		C.lfg_checkpoint_free(cp.c)
-		cp.c = nil
+	if cp.c != 0 {
+		_lfg_checkpoint_free(cp.c)
+		cp.c = 0
 		runtime.SetFinalizer(cp, nil)
 	}
 }
@@ -499,10 +479,11 @@ type CheckpointRestoreOptions struct {
 
 // DefaultCheckpointRestoreOptions returns the default restore options.
 func DefaultCheckpointRestoreOptions() CheckpointRestoreOptions {
-	c := C.lfg_checkpoint_restore_default_options()
+	registerSessionFuncs()
+	c := _lfg_checkpoint_restore_default_options()
 	return CheckpointRestoreOptions{
-		RestoreSamplerState: bool(c.restore_sampler_state),
-		RestoreGrammar:      bool(c.restore_grammar),
+		RestoreSamplerState: c.RestoreSamplerState != 0,
+		RestoreGrammar:      c.RestoreGrammar != 0,
 	}
 }
 
@@ -510,15 +491,15 @@ func DefaultCheckpointRestoreOptions() CheckpointRestoreOptions {
 func (s *Session) RestoreCheckpoint(cp *Checkpoint) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
-	if cp == nil || cp.c == nil {
+	if cp == nil || cp.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "checkpoint is nil"}
 	}
 
-	ok := C.lfg_session_restore_checkpoint(s.c, cp.c)
-	if !bool(ok) {
+	ok := _lfg_session_restore_checkpoint(s.c, cp.c)
+	if !ok {
 		if err := getLastError(); err != nil {
 			return err
 		}
@@ -531,20 +512,20 @@ func (s *Session) RestoreCheckpoint(cp *Checkpoint) error {
 func (s *Session) RestoreCheckpointEx(cp *Checkpoint, opts CheckpointRestoreOptions) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
-	if cp == nil || cp.c == nil {
+	if cp == nil || cp.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "checkpoint is nil"}
 	}
 
-	cOpts := C.lfg_checkpoint_restore_options{
-		restore_sampler_state: C.bool(opts.RestoreSamplerState),
-		restore_grammar:       C.bool(opts.RestoreGrammar),
+	cOpts := cCheckpointRestoreOptions{
+		RestoreSamplerState: boolToByte(opts.RestoreSamplerState),
+		RestoreGrammar:      boolToByte(opts.RestoreGrammar),
 	}
 
-	ok := C.lfg_session_restore_checkpoint_ex(s.c, cp.c, &cOpts)
-	if !bool(ok) {
+	ok := _lfg_session_restore_checkpoint_ex(s.c, cp.c, uintptr(unsafe.Pointer(&cOpts)))
+	if !ok {
 		if err := getLastError(); err != nil {
 			return err
 		}
@@ -556,11 +537,13 @@ func (s *Session) RestoreCheckpointEx(cp *Checkpoint, opts CheckpointRestoreOpti
 // JSONSchemaToGrammar converts a JSON schema string to a GBNF grammar.
 // If forceGBNF is true, always outputs GBNF format.
 func JSONSchemaToGrammar(jsonSchema string, forceGBNF bool) (string, error) {
-	cSchema := C.CString(jsonSchema)
-	defer C.free(unsafe.Pointer(cSchema))
+	registerSessionFuncs()
+	schemaBytes := cString(jsonSchema)
+	schemaPtr := cStringPtr(schemaBytes)
 
 	// First pass: get required size.
-	n := C.lfg_json_schema_to_grammar(cSchema, C.bool(forceGBNF), nil, 0)
+	n := _lfg_json_schema_to_grammar(schemaPtr, forceGBNF, 0, 0)
+	runtime.KeepAlive(schemaBytes)
 	if n < 0 {
 		if err := getLastError(); err != nil {
 			return "", err
@@ -572,7 +555,8 @@ func JSONSchemaToGrammar(jsonSchema string, forceGBNF bool) (string, error) {
 	}
 
 	buf := make([]byte, int(n)+1)
-	n = C.lfg_json_schema_to_grammar(cSchema, C.bool(forceGBNF), (*C.char)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
+	n = _lfg_json_schema_to_grammar(schemaPtr, forceGBNF, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	runtime.KeepAlive(schemaBytes)
 	if n < 0 {
 		if err := getLastError(); err != nil {
 			return "", err
@@ -597,54 +581,50 @@ type ToolDesc struct {
 func (s *Session) RegisterTools(tools []ToolDesc, topK int32) (int32, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return 0, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 	if len(tools) == 0 {
 		return 0, &Error{Code: ErrorInvalidArgument, Message: "no tools provided"}
 	}
 
-	// Build C tool descriptors. Keep CStrings alive until the call returns.
-	cDescs := make([]C.lfg_tool_desc, len(tools))
-	cStrs := make([]*C.char, 0, len(tools)*3) // for deferred free
-	defer func() {
-		for _, p := range cStrs {
-			C.free(unsafe.Pointer(p))
-		}
-	}()
+	// Build C tool descriptors with Go byte slices.
+	cDescs := make([]cToolDesc, len(tools))
+	keepAlive := make([][]byte, 0, len(tools)*3)
 
 	for i, t := range tools {
-		cName := C.CString(t.Name)
-		cStrs = append(cStrs, cName)
-		cDesc := C.CString(t.Description)
-		cStrs = append(cStrs, cDesc)
-		cDescs[i].name = cName
-		cDescs[i].description = cDesc
+		nameBytes := cString(t.Name)
+		descBytes := cString(t.Description)
+		keepAlive = append(keepAlive, nameBytes, descBytes)
+		cDescs[i].Name = cStringPtr(nameBytes)
+		cDescs[i].Description = cStringPtr(descBytes)
 		if t.JSONSchema != "" {
-			cSchema := C.CString(t.JSONSchema)
-			cStrs = append(cStrs, cSchema)
-			cDescs[i].json_schema = cSchema
+			schemaBytes := cString(t.JSONSchema)
+			keepAlive = append(keepAlive, schemaBytes)
+			cDescs[i].JSONSchema = cStringPtr(schemaBytes)
 		}
 	}
 
-	n := C.lfg_session_register_tools(s.c, &cDescs[0], C.int32_t(len(tools)), C.int32_t(topK))
+	n := _lfg_session_register_tools(s.c, uintptr(unsafe.Pointer(&cDescs[0])), int32(len(tools)), topK)
+	runtime.KeepAlive(keepAlive)
+	runtime.KeepAlive(cDescs)
 	if n < 0 {
 		if err := getLastError(); err != nil {
 			return 0, err
 		}
 		return 0, &Error{Code: ErrorInternal, Message: "failed to register tools"}
 	}
-	return int32(n), nil
+	return n, nil
 }
 
 // ClearTools removes all registered tools and frees the tool ranking context.
 func (s *Session) ClearTools() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return
 	}
-	C.lfg_session_clear_tools(s.c)
+	_lfg_session_clear_tools(s.c)
 }
 
 // ---------------------------------------------------------------------------
@@ -671,11 +651,12 @@ type EntropyMonitorConfig struct {
 
 // DefaultEntropyMonitorConfig returns the default entropy monitor configuration.
 func DefaultEntropyMonitorConfig() EntropyMonitorConfig {
-	c := C.lfg_entropy_monitor_default_config()
+	registerSessionFuncs()
+	c := _lfg_entropy_monitor_default_config()
 	return EntropyMonitorConfig{
-		Threshold:      float32(c.threshold),
-		CooldownTokens: int32(c.cooldown_tokens),
-		RingSize:       int32(c.ring_size),
+		Threshold:      c.Threshold,
+		CooldownTokens: c.CooldownTokens,
+		RingSize:       c.RingSize,
 	}
 }
 
@@ -686,28 +667,28 @@ func DefaultEntropyMonitorConfig() EntropyMonitorConfig {
 func (s *Session) ConfigureEntropyMonitor(config *EntropyMonitorConfig) (int32, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return 0, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
 	if config == nil {
-		C.lfg_session_configure_entropy_monitor(s.c, nil)
+		_lfg_session_configure_entropy_monitor(s.c, 0)
 		return 0, nil
 	}
 
-	cConfig := C.lfg_entropy_monitor_config{
-		threshold:       C.float(config.Threshold),
-		cooldown_tokens: C.int32_t(config.CooldownTokens),
-		ring_size:       C.int32_t(config.RingSize),
+	cConfig := cEntropyMonitorConfig{
+		Threshold:      config.Threshold,
+		CooldownTokens: config.CooldownTokens,
+		RingSize:       config.RingSize,
 	}
-	nEmbd := C.lfg_session_configure_entropy_monitor(s.c, &cConfig)
+	nEmbd := _lfg_session_configure_entropy_monitor(s.c, uintptr(unsafe.Pointer(&cConfig)))
 	if nEmbd <= 0 {
 		if err := getLastError(); err != nil {
 			return 0, err
 		}
 		return 0, &Error{Code: ErrorInternal, Message: "failed to configure entropy monitor"}
 	}
-	return int32(nEmbd), nil
+	return nEmbd, nil
 }
 
 // EntropyPop pops the next pending entropy event from the ring buffer.
@@ -717,31 +698,31 @@ func (s *Session) ConfigureEntropyMonitor(config *EntropyMonitorConfig) (int32, 
 func (s *Session) EntropyPop(embeddingOut []float32) (EntropyEvent, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return EntropyEvent{}, false
 	}
 
-	var cEvent C.lfg_entropy_event
-	var embdPtr *C.float
-	var embdCap C.int32_t
+	var cEvent cEntropyEvent
+	var embdPtr uintptr
+	var embdCap int32
 	if len(embeddingOut) > 0 {
-		embdPtr = (*C.float)(unsafe.Pointer(&embeddingOut[0]))
-		embdCap = C.int32_t(len(embeddingOut))
+		embdPtr = uintptr(unsafe.Pointer(&embeddingOut[0]))
+		embdCap = int32(len(embeddingOut))
 	}
 
-	ok := C.lfg_session_entropy_pop(s.c, &cEvent, embdPtr, embdCap)
-	if !bool(ok) {
+	ok := _lfg_session_entropy_pop(s.c, uintptr(unsafe.Pointer(&cEvent)), embdPtr, embdCap)
+	if !ok {
 		return EntropyEvent{}, false
 	}
 
 	return EntropyEvent{
-		Entropy:      float32(cEvent.entropy),
-		Normalized:   float32(cEvent.normalized),
-		TopLogprob:   float32(cEvent.top_logprob),
-		Token:        Token(cEvent.token),
-		NPast:        int32(cEvent.n_past),
-		CheckpointID: int32(cEvent.checkpoint_id),
-		NEmbedding:   int32(cEvent.n_embd),
+		Entropy:      cEvent.Entropy,
+		Normalized:   cEvent.Normalized,
+		TopLogprob:   cEvent.TopLogprob,
+		Token:        Token(cEvent.Token),
+		NPast:        cEvent.NPast,
+		CheckpointID: cEvent.CheckpointID,
+		NEmbedding:   cEvent.NEmbd,
 	}, true
 }
 
@@ -749,20 +730,20 @@ func (s *Session) EntropyPop(embeddingOut []float32) (EntropyEvent, bool) {
 func (s *Session) EntropyPending() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return 0
 	}
-	return int(C.lfg_session_entropy_pending(s.c))
+	return int(_lfg_session_entropy_pending(s.c))
 }
 
 // EntropyFlush discards all pending entropy events without reading them.
 func (s *Session) EntropyFlush() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return
 	}
-	C.lfg_session_entropy_flush(s.c)
+	_lfg_session_entropy_flush(s.c)
 }
 
 // EntropyCounter returns a pointer to an atomic write counter that is incremented
@@ -772,11 +753,11 @@ func (s *Session) EntropyFlush() {
 func (s *Session) EntropyCounter() *int32 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return nil
 	}
-	p := C.lfg_session_entropy_counter(s.c)
-	if p == nil {
+	p := _lfg_session_entropy_counter(s.c)
+	if p == 0 {
 		return nil
 	}
 	return (*int32)(unsafe.Pointer(p))
@@ -787,12 +768,12 @@ func (s *Session) EntropyCounter() *int32 {
 func (s *Session) Rewind(checkpointID int32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
-	ok := C.lfg_session_rewind(s.c, C.int32_t(checkpointID))
-	if !bool(ok) {
+	ok := _lfg_session_rewind(s.c, checkpointID)
+	if !ok {
 		if err := getLastError(); err != nil {
 			return err
 		}
@@ -806,10 +787,10 @@ func (s *Session) Rewind(checkpointID int32) error {
 func (s *Session) LastEntropy() float32 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return -1
 	}
-	return float32(C.lfg_session_get_last_entropy(s.c))
+	return _lfg_session_get_last_entropy(s.c)
 }
 
 // ---------------------------------------------------------------------------
@@ -831,17 +812,18 @@ type ConfidenceMonitorConfig struct {
 	Threshold        float32 // Normalized entropy ceiling (0,1]. Tokens below this are "confident".
 	MinSpan          int32   // Min consecutive tokens to emit event. 0 = default (5).
 	RingSize         int32   // Ring buffer slots. 0 = default (4).
-	IgnoreReasoning  bool    // Skip reasoning tokens (treat as run-breaker).
+	IncludeReasoning bool    // false (default) = skip reasoning tokens; true = include them.
 }
 
 // DefaultConfidenceMonitorConfig returns the default confidence monitor configuration.
 func DefaultConfidenceMonitorConfig() ConfidenceMonitorConfig {
-	c := C.lfg_confidence_monitor_default_config()
+	registerSessionFuncs()
+	c := _lfg_confidence_monitor_default_config()
 	return ConfidenceMonitorConfig{
-		Threshold:       float32(c.threshold),
-		MinSpan:         int32(c.min_span),
-		RingSize:        int32(c.ring_size),
-		IgnoreReasoning: bool(c.ignore_reasoning),
+		Threshold:        c.Threshold,
+		MinSpan:          c.MinSpan,
+		RingSize:         c.RingSize,
+		IncludeReasoning: c.IncludeReasoning != 0,
 	}
 }
 
@@ -852,29 +834,29 @@ func DefaultConfidenceMonitorConfig() ConfidenceMonitorConfig {
 func (s *Session) ConfigureConfidenceMonitor(config *ConfidenceMonitorConfig) (int32, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return 0, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
 	if config == nil {
-		C.lfg_session_configure_confidence_monitor(s.c, nil)
+		_lfg_session_configure_confidence_monitor(s.c, 0)
 		return 0, nil
 	}
 
-	cConfig := C.lfg_confidence_monitor_config{
-		threshold:        C.float(config.Threshold),
-		min_span:         C.int32_t(config.MinSpan),
-		ring_size:        C.int32_t(config.RingSize),
-		ignore_reasoning: C.bool(config.IgnoreReasoning),
+	cConfig := cConfidenceMonitorConfig{
+		Threshold:        config.Threshold,
+		MinSpan:          config.MinSpan,
+		RingSize:         config.RingSize,
+		IncludeReasoning: boolToByte(config.IncludeReasoning),
 	}
-	nEmbd := C.lfg_session_configure_confidence_monitor(s.c, &cConfig)
+	nEmbd := _lfg_session_configure_confidence_monitor(s.c, uintptr(unsafe.Pointer(&cConfig)))
 	if nEmbd <= 0 {
 		if err := getLastError(); err != nil {
 			return 0, err
 		}
 		return 0, &Error{Code: ErrorInternal, Message: "failed to configure confidence monitor"}
 	}
-	return int32(nEmbd), nil
+	return nEmbd, nil
 }
 
 // ConfidencePop pops the next pending confidence event from the ring buffer.
@@ -884,30 +866,30 @@ func (s *Session) ConfigureConfidenceMonitor(config *ConfidenceMonitorConfig) (i
 func (s *Session) ConfidencePop(embeddingOut []float32) (ConfidenceEvent, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return ConfidenceEvent{}, false
 	}
 
-	var cEvent C.lfg_confidence_event
-	var embdPtr *C.float
-	var embdCap C.int32_t
+	var cEvent cConfidenceEvent
+	var embdPtr uintptr
+	var embdCap int32
 	if len(embeddingOut) > 0 {
-		embdPtr = (*C.float)(unsafe.Pointer(&embeddingOut[0]))
-		embdCap = C.int32_t(len(embeddingOut))
+		embdPtr = uintptr(unsafe.Pointer(&embeddingOut[0]))
+		embdCap = int32(len(embeddingOut))
 	}
 
-	ok := C.lfg_session_confidence_pop(s.c, &cEvent, embdPtr, embdCap)
-	if !bool(ok) {
+	ok := _lfg_session_confidence_pop(s.c, uintptr(unsafe.Pointer(&cEvent)), embdPtr, embdCap)
+	if !ok {
 		return ConfidenceEvent{}, false
 	}
 
 	return ConfidenceEvent{
-		MeanEntropy: float32(cEvent.mean_entropy),
-		MinEntropy:  float32(cEvent.min_entropy),
-		SpanLength:  int32(cEvent.span_length),
-		StartPos:    int32(cEvent.start_pos),
-		EndPos:      int32(cEvent.end_pos),
-		NEmbedding:  int32(cEvent.n_embd),
+		MeanEntropy: cEvent.MeanEntropy,
+		MinEntropy:  cEvent.MinEntropy,
+		SpanLength:  cEvent.SpanLength,
+		StartPos:    cEvent.StartPos,
+		EndPos:      cEvent.EndPos,
+		NEmbedding:  cEvent.NEmbd,
 	}, true
 }
 
@@ -915,20 +897,20 @@ func (s *Session) ConfidencePop(embeddingOut []float32) (ConfidenceEvent, bool) 
 func (s *Session) ConfidencePending() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return 0
 	}
-	return int(C.lfg_session_confidence_pending(s.c))
+	return int(_lfg_session_confidence_pending(s.c))
 }
 
 // ConfidenceFlush discards all pending confidence events without reading them.
 func (s *Session) ConfidenceFlush() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return
 	}
-	C.lfg_session_confidence_flush(s.c)
+	_lfg_session_confidence_flush(s.c)
 }
 
 // ConfidenceCounter returns a pointer to an atomic write counter that is incremented
@@ -937,11 +919,11 @@ func (s *Session) ConfidenceFlush() {
 func (s *Session) ConfidenceCounter() *int32 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return nil
 	}
-	p := C.lfg_session_confidence_counter(s.c)
-	if p == nil {
+	p := _lfg_session_confidence_counter(s.c)
+	if p == 0 {
 		return nil
 	}
 	return (*int32)(unsafe.Pointer(p))
@@ -963,16 +945,17 @@ type SurpriseEvent struct {
 
 // SurpriseMonitorConfig configures the surprise monitor.
 type SurpriseMonitorConfig struct {
-	Threshold       float32 // Normalized surprise floor (0,1]. Above = surprising.
-	IgnoreReasoning bool    // Skip reasoning tokens during surprise evaluation.
+	Threshold        float32 // Normalized surprise floor (0,1]. Above = surprising.
+	IncludeReasoning bool    // false (default) = skip reasoning tokens; true = include them.
 }
 
 // DefaultSurpriseMonitorConfig returns the default surprise monitor configuration.
 func DefaultSurpriseMonitorConfig() SurpriseMonitorConfig {
-	c := C.lfg_surprise_monitor_default_config()
+	registerSessionFuncs()
+	c := _lfg_surprise_monitor_default_config()
 	return SurpriseMonitorConfig{
-		Threshold:       float32(c.threshold),
-		IgnoreReasoning: bool(c.ignore_reasoning),
+		Threshold:        c.Threshold,
+		IncludeReasoning: c.IncludeReasoning != 0,
 	}
 }
 
@@ -983,27 +966,27 @@ func DefaultSurpriseMonitorConfig() SurpriseMonitorConfig {
 func (s *Session) ConfigureSurpriseMonitor(config *SurpriseMonitorConfig) (int32, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return 0, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
 	if config == nil {
-		C.lfg_session_configure_surprise_monitor(s.c, nil)
+		_lfg_session_configure_surprise_monitor(s.c, 0)
 		return 0, nil
 	}
 
-	cConfig := C.lfg_surprise_monitor_config{
-		threshold:        C.float(config.Threshold),
-		ignore_reasoning: C.bool(config.IgnoreReasoning),
+	cConfig := cSurpriseMonitorConfig{
+		Threshold:        config.Threshold,
+		IncludeReasoning: boolToByte(config.IncludeReasoning),
 	}
-	nEmbd := C.lfg_session_configure_surprise_monitor(s.c, &cConfig)
+	nEmbd := _lfg_session_configure_surprise_monitor(s.c, uintptr(unsafe.Pointer(&cConfig)))
 	if nEmbd <= 0 {
 		if err := getLastError(); err != nil {
 			return 0, err
 		}
 		return 0, &Error{Code: ErrorInternal, Message: "failed to configure surprise monitor"}
 	}
-	return int32(nEmbd), nil
+	return nEmbd, nil
 }
 
 // SurprisePop pops the next pending surprise event from the ring buffer.
@@ -1013,29 +996,29 @@ func (s *Session) ConfigureSurpriseMonitor(config *SurpriseMonitorConfig) (int32
 func (s *Session) SurprisePop(embeddingOut []float32) (SurpriseEvent, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return SurpriseEvent{}, false
 	}
 
-	var cEvent C.lfg_surprise_event
-	var embdPtr *C.float
-	var embdCap C.int32_t
+	var cEvent cSurpriseEvent
+	var embdPtr uintptr
+	var embdCap int32
 	if len(embeddingOut) > 0 {
-		embdPtr = (*C.float)(unsafe.Pointer(&embeddingOut[0]))
-		embdCap = C.int32_t(len(embeddingOut))
+		embdPtr = uintptr(unsafe.Pointer(&embeddingOut[0]))
+		embdCap = int32(len(embeddingOut))
 	}
 
-	ok := C.lfg_session_surprise_pop(s.c, &cEvent, embdPtr, embdCap)
-	if !bool(ok) {
+	ok := _lfg_session_surprise_pop(s.c, uintptr(unsafe.Pointer(&cEvent)), embdPtr, embdCap)
+	if !ok {
 		return SurpriseEvent{}, false
 	}
 
 	return SurpriseEvent{
-		MeanSurprise:     float32(cEvent.mean_surprise),
-		MaxSurprise:      float32(cEvent.max_surprise),
-		NAboveThreshold:  int32(cEvent.n_above_threshold),
-		NTokensEvaluated: int32(cEvent.n_tokens_evaluated),
-		NEmbedding:       int32(cEvent.n_embd),
+		MeanSurprise:     cEvent.MeanSurprise,
+		MaxSurprise:      cEvent.MaxSurprise,
+		NAboveThreshold:  cEvent.NAboveThreshold,
+		NTokensEvaluated: cEvent.NTokensEvaluated,
+		NEmbedding:       cEvent.NEmbd,
 	}, true
 }
 
@@ -1046,13 +1029,13 @@ func (s *Session) SurprisePop(embeddingOut []float32) (SurpriseEvent, bool) {
 func (s *Session) ConfigureStopStrings(strings []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
 	if len(strings) == 0 {
-		ok := C.lfg_session_configure_stop_strings(s.c, nil, 0)
-		if !bool(ok) {
+		ok := _lfg_session_configure_stop_strings(s.c, 0, 0)
+		if !ok {
 			return &Error{Code: ErrorInvalidArgument, Message: "failed to clear stop strings"}
 		}
 		return nil
@@ -1060,24 +1043,18 @@ func (s *Session) ConfigureStopStrings(strings []string) error {
 
 	n := len(strings)
 
-	// Allocate the pointer array in C memory to avoid "Go ptr to Go ptr".
-	cPtrs := (*[1 << 30]*C.char)(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof((*C.char)(nil)))))[:n:n]
-	defer C.free(unsafe.Pointer(&cPtrs[0]))
-
-	cStrs := make([]*C.char, n)
+	// With purego, no "Go ptr to Go ptr" rule — use Go slices directly.
+	strBytes := make([][]byte, n)
+	strPtrs := make([]uintptr, n)
 	for i, s := range strings {
-		cs := C.CString(s)
-		cPtrs[i] = cs
-		cStrs[i] = cs
+		strBytes[i] = cString(s)
+		strPtrs[i] = cStringPtr(strBytes[i])
 	}
-	defer func() {
-		for _, p := range cStrs {
-			C.free(unsafe.Pointer(p))
-		}
-	}()
 
-	ok := C.lfg_session_configure_stop_strings(s.c, &cPtrs[0], C.int32_t(n))
-	if !bool(ok) {
+	ok := _lfg_session_configure_stop_strings(s.c, uintptr(unsafe.Pointer(&strPtrs[0])), int32(n))
+	runtime.KeepAlive(strBytes)
+	runtime.KeepAlive(strPtrs)
+	if !ok {
 		return &Error{Code: ErrorInvalidArgument, Message: "failed to configure stop strings"}
 	}
 	return nil
@@ -1089,19 +1066,20 @@ func (s *Session) ConfigureStopStrings(strings []string) error {
 
 // ModelLoadConfig configures the convenience model loader.
 type ModelLoadConfig struct {
-	ModelPath  string
-	UseMmap    bool
-	UseMlock   bool
-	GPULayers  int
+	ModelPath string
+	UseMmap   bool
+	UseMlock  bool
+	GPULayers int
 }
 
 // DefaultModelLoadConfig returns the default model loading configuration.
 func DefaultModelLoadConfig() ModelLoadConfig {
-	c := C.lfg_model_load_default_config()
+	registerSessionFuncs()
+	c := _lfg_model_load_default_config()
 	return ModelLoadConfig{
-		UseMmap:   bool(c.use_mmap),
-		UseMlock:  bool(c.use_mlock),
-		GPULayers: int(c.n_gpu_layers),
+		UseMmap:   c.UseMmap != 0,
+		UseMlock:  c.UseMlock != 0,
+		GPULayers: int(c.NGPULayers),
 	}
 }
 
@@ -1110,6 +1088,7 @@ func DefaultModelLoadConfig() ModelLoadConfig {
 // and reduces the setup to a single C call.
 func LoadModelSimple(path string, opts ...ModelOption) (*Model, error) {
 	ensureBackend()
+	registerSessionFuncs()
 
 	defaults := DefaultModelLoadConfig()
 	cfg := ModelConfig{
@@ -1121,18 +1100,18 @@ func LoadModelSimple(path string, opts ...ModelOption) (*Model, error) {
 		opt(&cfg)
 	}
 
-	cPath := C.CString(path)
-	defer C.free(unsafe.Pointer(cPath))
+	pathBytes := cString(path)
 
-	cCfg := C.lfg_model_load_config{
-		model_path:   cPath,
-		use_mmap:     C.bool(cfg.Mmap),
-		use_mlock:    C.bool(cfg.Mlock),
-		n_gpu_layers: C.int(cfg.GPULayers),
+	cCfg := cModelLoadConfig{
+		ModelPath:  cStringPtr(pathBytes),
+		UseMmap:    boolToByte(cfg.Mmap),
+		UseMlock:   boolToByte(cfg.Mlock),
+		NGPULayers: int32(cfg.GPULayers),
 	}
 
-	cModel := C.lfg_load_model(&cCfg)
-	if cModel == nil {
+	cModel := _lfg_load_model(uintptr(unsafe.Pointer(&cCfg)))
+	runtime.KeepAlive(pathBytes)
+	if cModel == 0 {
 		if err := getLastError(); err != nil {
 			return nil, err
 		}
@@ -1154,23 +1133,25 @@ func LoadModelSimple(path string, opts ...ModelOption) (*Model, error) {
 func (s *Session) Embed(text string) ([]float32, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c == nil {
+	if s.c == 0 {
 		return nil, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
 	// Get embedding dimension from the model. The C API requires a valid
 	// output buffer on every call (it does not support a nil/0 query pattern).
-	nEmbd := int(C.lfg_model_n_embd(s.model.c))
+	registerModelFuncs()
+	nEmbd := int(_lfg_model_n_embd(s.model.c))
 	if nEmbd <= 0 {
 		return nil, &Error{Code: ErrorInternal, Message: "model has no embedding dimension"}
 	}
 
-	cText := C.CString(text)
-	defer C.free(unsafe.Pointer(cText))
-	cLen := C.int32_t(len(text))
+	textBytes := cString(text)
+	textPtr := cStringPtr(textBytes)
+	cLen := int32(len(text))
 
 	out := make([]float32, nEmbd)
-	n := C.lfg_session_embed(s.c, cText, cLen, (*C.float)(unsafe.Pointer(&out[0])), C.int32_t(nEmbd))
+	n := _lfg_session_embed(s.c, textPtr, cLen, uintptr(unsafe.Pointer(&out[0])), int32(nEmbd))
+	runtime.KeepAlive(textBytes)
 	if n <= 0 {
 		if err := getLastError(); err != nil {
 			return nil, err

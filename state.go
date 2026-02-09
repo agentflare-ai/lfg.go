@@ -1,20 +1,21 @@
+//go:build (darwin && arm64) || (linux && amd64) || (linux && arm64)
+
 package lfg
 
-/*
-#include "lfg_inference.h"
-#include <stdlib.h>
-*/
-import "C"
-import "unsafe"
+import (
+	"runtime"
+	"unsafe"
+)
 
 // StateGetSize returns the actual size in bytes needed to save the full state.
 func (ctx *Context) StateGetSize() int {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return 0
 	}
-	return int(C.lfg_state_get_size(ctx.c))
+	registerStateFuncs()
+	return int(_lfg_state_get_size(ctx.c))
 }
 
 // StateGetData copies the full context state into dst.
@@ -23,10 +24,11 @@ func (ctx *Context) StateGetSize() int {
 func (ctx *Context) StateGetData(dst []byte) int {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil || len(dst) == 0 {
+	if ctx.c == 0 || len(dst) == 0 {
 		return 0
 	}
-	return int(C.lfg_state_get_data(ctx.c, (*C.uint8_t)(unsafe.Pointer(&dst[0])), C.size_t(len(dst))))
+	registerStateFuncs()
+	return int(_lfg_state_get_data(ctx.c, uintptr(unsafe.Pointer(&dst[0])), uintptr(len(dst))))
 }
 
 // StateSetData restores context state from src.
@@ -34,27 +36,27 @@ func (ctx *Context) StateGetData(dst []byte) int {
 func (ctx *Context) StateSetData(src []byte) int {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil || len(src) == 0 {
+	if ctx.c == 0 || len(src) == 0 {
 		return 0
 	}
-	return int(C.lfg_state_set_data(ctx.c, (*C.uint8_t)(unsafe.Pointer(&src[0])), C.size_t(len(src))))
+	registerStateFuncs()
+	return int(_lfg_state_set_data(ctx.c, uintptr(unsafe.Pointer(&src[0])), uintptr(len(src))))
 }
 
 // StateSaveFile saves the session state to a file.
 func (ctx *Context) StateSaveFile(path string, tokens []Token) error {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "context is closed"}
 	}
 
-	cPath := C.CString(path)
-	defer C.free(unsafe.Pointer(cPath))
+	registerStateFuncs()
+	pathBytes := cString(path)
 
-	tokPtr := cTokenPtr(tokens)
-
-	ok := C.lfg_state_save_file(ctx.c, cPath, tokPtr, C.size_t(len(tokens)))
-	if !bool(ok) {
+	ok := _lfg_state_save_file(ctx.c, cStringPtr(pathBytes), tokenPtr(tokens), uintptr(len(tokens)))
+	runtime.KeepAlive(pathBytes)
+	if !ok {
 		if err := getLastError(); err != nil {
 			return err
 		}
@@ -68,18 +70,19 @@ func (ctx *Context) StateSaveFile(path string, tokens []Token) error {
 func (ctx *Context) StateLoadFile(path string, maxTokens int) ([]Token, error) {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return nil, &Error{Code: ErrorInvalidArgument, Message: "context is closed"}
 	}
 
-	cPath := C.CString(path)
-	defer C.free(unsafe.Pointer(cPath))
+	registerStateFuncs()
+	pathBytes := cString(path)
 
 	tokens := make([]Token, maxTokens)
-	var nTokens C.size_t
+	var nTokens uintptr
 
-	ok := C.lfg_state_load_file(ctx.c, cPath, cTokenPtr(tokens), C.size_t(maxTokens), &nTokens)
-	if !bool(ok) {
+	ok := _lfg_state_load_file(ctx.c, cStringPtr(pathBytes), tokenPtr(tokens), uintptr(maxTokens), uintptr(unsafe.Pointer(&nTokens)))
+	runtime.KeepAlive(pathBytes)
+	if !ok {
 		if err := getLastError(); err != nil {
 			return nil, err
 		}
@@ -92,10 +95,11 @@ func (ctx *Context) StateLoadFile(path string, maxTokens int) ([]Token, error) {
 func (ctx *Context) StateSeqGetSize(seqID SequenceID) int {
 	ctx.mu.RLock()
 	defer ctx.mu.RUnlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return 0
 	}
-	return int(C.lfg_state_seq_get_size(ctx.c, C.lfg_seq_id(seqID)))
+	registerStateFuncs()
+	return int(_lfg_state_seq_get_size(ctx.c, int32(seqID)))
 }
 
 // StateSeqGetData copies a single sequence's state into dst.
@@ -103,10 +107,11 @@ func (ctx *Context) StateSeqGetSize(seqID SequenceID) int {
 func (ctx *Context) StateSeqGetData(dst []byte, seqID SequenceID) int {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil || len(dst) == 0 {
+	if ctx.c == 0 || len(dst) == 0 {
 		return 0
 	}
-	return int(C.lfg_state_seq_get_data(ctx.c, (*C.uint8_t)(unsafe.Pointer(&dst[0])), C.size_t(len(dst)), C.lfg_seq_id(seqID)))
+	registerStateFuncs()
+	return int(_lfg_state_seq_get_data(ctx.c, uintptr(unsafe.Pointer(&dst[0])), uintptr(len(dst)), int32(seqID)))
 }
 
 // StateSeqSetData restores a single sequence's state from src.
@@ -114,26 +119,26 @@ func (ctx *Context) StateSeqGetData(dst []byte, seqID SequenceID) int {
 func (ctx *Context) StateSeqSetData(src []byte, destSeqID SequenceID) int {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil || len(src) == 0 {
+	if ctx.c == 0 || len(src) == 0 {
 		return 0
 	}
-	return int(C.lfg_state_seq_set_data(ctx.c, (*C.uint8_t)(unsafe.Pointer(&src[0])), C.size_t(len(src)), C.lfg_seq_id(destSeqID)))
+	registerStateFuncs()
+	return int(_lfg_state_seq_set_data(ctx.c, uintptr(unsafe.Pointer(&src[0])), uintptr(len(src)), int32(destSeqID)))
 }
 
 // StateSeqSaveFile saves a single sequence's state to a file.
 func (ctx *Context) StateSeqSaveFile(path string, seqID SequenceID, tokens []Token) error {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "context is closed"}
 	}
 
-	cPath := C.CString(path)
-	defer C.free(unsafe.Pointer(cPath))
+	registerStateFuncs()
+	pathBytes := cString(path)
 
-	tokPtr := cTokenPtr(tokens)
-
-	n := C.lfg_state_seq_save_file(ctx.c, cPath, C.lfg_seq_id(seqID), tokPtr, C.size_t(len(tokens)))
+	n := _lfg_state_seq_save_file(ctx.c, cStringPtr(pathBytes), int32(seqID), tokenPtr(tokens), uintptr(len(tokens)))
+	runtime.KeepAlive(pathBytes)
 	if n == 0 {
 		return &Error{Code: ErrorIO, Message: "failed to save sequence state file"}
 	}
@@ -144,17 +149,18 @@ func (ctx *Context) StateSeqSaveFile(path string, seqID SequenceID, tokens []Tok
 func (ctx *Context) StateSeqLoadFile(path string, destSeqID SequenceID, maxTokens int) ([]Token, error) {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return nil, &Error{Code: ErrorInvalidArgument, Message: "context is closed"}
 	}
 
-	cPath := C.CString(path)
-	defer C.free(unsafe.Pointer(cPath))
+	registerStateFuncs()
+	pathBytes := cString(path)
 
 	tokens := make([]Token, maxTokens)
-	var nTokens C.size_t
+	var nTokens uintptr
 
-	n := C.lfg_state_seq_load_file(ctx.c, cPath, C.lfg_seq_id(destSeqID), cTokenPtr(tokens), C.size_t(maxTokens), &nTokens)
+	n := _lfg_state_seq_load_file(ctx.c, cStringPtr(pathBytes), int32(destSeqID), tokenPtr(tokens), uintptr(maxTokens), uintptr(unsafe.Pointer(&nTokens)))
+	runtime.KeepAlive(pathBytes)
 	if n == 0 {
 		if err := getLastError(); err != nil {
 			return nil, err

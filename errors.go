@@ -1,27 +1,29 @@
+//go:build (darwin && arm64) || (linux && amd64) || (linux && arm64)
+
 package lfg
 
-/*
-#include "lfg_inference.h"
-*/
-import "C"
-import "fmt"
+import (
+	"fmt"
+	"unsafe"
+)
 
 // ErrorCode represents an error code returned by the C API.
 type ErrorCode int
 
 const (
-	ErrorNone            ErrorCode = C.LFG_ERROR_NONE
-	ErrorInvalidArgument ErrorCode = C.LFG_ERROR_INVALID_ARGUMENT
-	ErrorIO              ErrorCode = C.LFG_ERROR_IO
-	ErrorOutOfMemory     ErrorCode = C.LFG_ERROR_OUT_OF_MEMORY
-	ErrorUnsupported     ErrorCode = C.LFG_ERROR_UNSUPPORTED
-	ErrorCancelled       ErrorCode = C.LFG_ERROR_CANCELLED
-	ErrorInternal        ErrorCode = C.LFG_ERROR_INTERNAL
+	ErrorNone            ErrorCode = 0
+	ErrorInvalidArgument ErrorCode = 1
+	ErrorIO              ErrorCode = 2
+	ErrorOutOfMemory     ErrorCode = 3
+	ErrorUnsupported     ErrorCode = 4
+	ErrorCancelled       ErrorCode = 5
+	ErrorInternal        ErrorCode = 6
 )
 
 // String returns the human-readable name of the error code.
 func (c ErrorCode) String() string {
-	return C.GoString(C.lfg_error_string(C.enum_lfg_error(c)))
+	registerBackendFuncs()
+	return goString(_lfg_error_string(int32(c)))
 }
 
 // Error represents an error from the lfg C library.
@@ -40,13 +42,19 @@ func (e *Error) Error() string {
 // getLastError reads the thread-local C error state. Must be called immediately
 // after a failed C call (CGO pins the goroutine to the OS thread during the call).
 func getLastError() error {
-	var buf [1024]C.char
-	code := C.lfg_get_last_error(&buf[0], 1024)
-	if code == C.LFG_ERROR_NONE {
+	registerBackendFuncs()
+	var buf [1024]byte
+	code := _lfg_get_last_error(uintptr(unsafe.Pointer(&buf[0])), uintptr(1024))
+	if code == int32(ErrorNone) {
 		return nil
+	}
+	// Find length of the null-terminated string in the buffer.
+	n := 0
+	for n < len(buf) && buf[n] != 0 {
+		n++
 	}
 	return &Error{
 		Code:    ErrorCode(code),
-		Message: C.GoString(&buf[0]),
+		Message: goStringN(uintptr(unsafe.Pointer(&buf[0])), n),
 	}
 }

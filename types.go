@@ -1,10 +1,5 @@
 package lfg
 
-/*
-#include "lfg_inference.h"
-*/
-import "C"
-
 // Token represents a token ID in the vocabulary.
 type Token int32
 
@@ -15,136 +10,136 @@ type Position int32
 type SequenceID int32
 
 // InvalidToken is the sentinel value for an invalid token.
-const InvalidToken Token = C.LFG_TOKEN_NULL
+const InvalidToken Token = -1
 
 // RandomSeed is the default seed value that signals random seed selection.
-const RandomSeed uint32 = C.LFG_DEFAULT_SEED
+const RandomSeed uint32 = 0xFFFFFFFF
 
 // VocabType represents the type of vocabulary used by the model.
 type VocabType int
 
 const (
-	VocabTypeNone   VocabType = C.LFG_VOCAB_TYPE_NONE
-	VocabTypeSPM    VocabType = C.LFG_VOCAB_TYPE_SPM
-	VocabTypeBPE    VocabType = C.LFG_VOCAB_TYPE_BPE
-	VocabTypeWPM    VocabType = C.LFG_VOCAB_TYPE_WPM
-	VocabTypeUGM    VocabType = C.LFG_VOCAB_TYPE_UGM
-	VocabTypeRWKV   VocabType = C.LFG_VOCAB_TYPE_RWKV
-	VocabTypePLaMo2 VocabType = C.LFG_VOCAB_TYPE_PLAMO2
+	VocabTypeNone   VocabType = 0
+	VocabTypeSPM    VocabType = 1
+	VocabTypeBPE    VocabType = 2
+	VocabTypeWPM    VocabType = 3
+	VocabTypeUGM    VocabType = 4
+	VocabTypeRWKV   VocabType = 5
+	VocabTypePLaMo2 VocabType = 6
 )
 
 // RopeType represents the type of RoPE (Rotary Position Embedding).
 type RopeType int
 
 const (
-	RopeTypeNone RopeType = C.LFG_ROPE_TYPE_NONE
-	RopeTypeNorm RopeType = C.LFG_ROPE_TYPE_NORM
+	RopeTypeNone RopeType = -1
+	RopeTypeNorm RopeType = 0
 )
 
 // TokenType represents the type of a token.
 type TokenType int
 
 const (
-	TokenTypeUndefined   TokenType = C.LFG_TOKEN_TYPE_UNDEFINED
-	TokenTypeNormal      TokenType = C.LFG_TOKEN_TYPE_NORMAL
-	TokenTypeUnknown     TokenType = C.LFG_TOKEN_TYPE_UNKNOWN
-	TokenTypeControl     TokenType = C.LFG_TOKEN_TYPE_CONTROL
-	TokenTypeUserDefined TokenType = C.LFG_TOKEN_TYPE_USER_DEFINED
-	TokenTypeUnused      TokenType = C.LFG_TOKEN_TYPE_UNUSED
-	TokenTypeByte        TokenType = C.LFG_TOKEN_TYPE_BYTE
+	TokenTypeUndefined   TokenType = 0
+	TokenTypeNormal      TokenType = 1
+	TokenTypeUnknown     TokenType = 2
+	TokenTypeControl     TokenType = 3
+	TokenTypeUserDefined TokenType = 4
+	TokenTypeUnused      TokenType = 5
+	TokenTypeByte        TokenType = 6
 )
 
 // TokenAttr represents token attributes (bitfield).
 type TokenAttr int
 
 const (
-	TokenAttrUndefined   TokenAttr = C.LFG_TOKEN_ATTR_UNDEFINED
-	TokenAttrUnknown     TokenAttr = C.LFG_TOKEN_ATTR_UNKNOWN
-	TokenAttrUnused      TokenAttr = C.LFG_TOKEN_ATTR_UNUSED
-	TokenAttrNormal      TokenAttr = C.LFG_TOKEN_ATTR_NORMAL
-	TokenAttrControl     TokenAttr = C.LFG_TOKEN_ATTR_CONTROL
-	TokenAttrUserDefined TokenAttr = C.LFG_TOKEN_ATTR_USER_DEFINED
-	TokenAttrByte        TokenAttr = C.LFG_TOKEN_ATTR_BYTE
-	TokenAttrNormalized  TokenAttr = C.LFG_TOKEN_ATTR_NORMALIZED
-	TokenAttrLstrip      TokenAttr = C.LFG_TOKEN_ATTR_LSTRIP
-	TokenAttrRstrip      TokenAttr = C.LFG_TOKEN_ATTR_RSTRIP
-	TokenAttrSingleWord  TokenAttr = C.LFG_TOKEN_ATTR_SINGLE_WORD
+	TokenAttrUndefined   TokenAttr = 0
+	TokenAttrUnknown     TokenAttr = 1 << 0
+	TokenAttrUnused      TokenAttr = 1 << 1
+	TokenAttrNormal      TokenAttr = 1 << 2
+	TokenAttrControl     TokenAttr = 1 << 3
+	TokenAttrUserDefined TokenAttr = 1 << 4
+	TokenAttrByte        TokenAttr = 1 << 5
+	TokenAttrNormalized  TokenAttr = 1 << 6
+	TokenAttrLstrip      TokenAttr = 1 << 7
+	TokenAttrRstrip      TokenAttr = 1 << 8
+	TokenAttrSingleWord  TokenAttr = 1 << 9
 )
 
 // FType represents model file quantization types.
 type FType int
 
 const (
-	FTypeAllF32         FType = C.LFG_FTYPE_ALL_F32
-	FTypeMostlyF16      FType = C.LFG_FTYPE_MOSTLY_F16
-	FTypeMostlyQ4_0     FType = C.LFG_FTYPE_MOSTLY_Q4_0
-	FTypeMostlyQ4_1     FType = C.LFG_FTYPE_MOSTLY_Q4_1
-	FTypeMostlyQ8_0     FType = C.LFG_FTYPE_MOSTLY_Q8_0
-	FTypeMostlyQ5_0     FType = C.LFG_FTYPE_MOSTLY_Q5_0
-	FTypeMostlyQ5_1     FType = C.LFG_FTYPE_MOSTLY_Q5_1
-	FTypeMostlyQ2_K     FType = C.LFG_FTYPE_MOSTLY_Q2_K
-	FTypeMostlyQ3_K_S   FType = C.LFG_FTYPE_MOSTLY_Q3_K_S
-	FTypeMostlyQ3_K_M   FType = C.LFG_FTYPE_MOSTLY_Q3_K_M
-	FTypeMostlyQ3_K_L   FType = C.LFG_FTYPE_MOSTLY_Q3_K_L
-	FTypeMostlyQ4_K_S   FType = C.LFG_FTYPE_MOSTLY_Q4_K_S
-	FTypeMostlyQ4_K_M   FType = C.LFG_FTYPE_MOSTLY_Q4_K_M
-	FTypeMostlyQ5_K_S   FType = C.LFG_FTYPE_MOSTLY_Q5_K_S
-	FTypeMostlyQ5_K_M   FType = C.LFG_FTYPE_MOSTLY_Q5_K_M
-	FTypeMostlyQ6_K     FType = C.LFG_FTYPE_MOSTLY_Q6_K
-	FTypeMostlyBF16     FType = C.LFG_FTYPE_MOSTLY_BF16
-	FTypeMostlyTQ1_0    FType = C.LFG_FTYPE_MOSTLY_TQ1_0
-	FTypeMostlyTQ2_0    FType = C.LFG_FTYPE_MOSTLY_TQ2_0
-	FTypeGuessed        FType = C.LFG_FTYPE_GUESSED
+	FTypeAllF32         FType = 0
+	FTypeMostlyF16      FType = 1
+	FTypeMostlyQ4_0     FType = 2
+	FTypeMostlyQ4_1     FType = 3
+	FTypeMostlyQ8_0     FType = 7
+	FTypeMostlyQ5_0     FType = 8
+	FTypeMostlyQ5_1     FType = 9
+	FTypeMostlyQ2_K     FType = 10
+	FTypeMostlyQ3_K_S   FType = 11
+	FTypeMostlyQ3_K_M   FType = 12
+	FTypeMostlyQ3_K_L   FType = 13
+	FTypeMostlyQ4_K_S   FType = 14
+	FTypeMostlyQ4_K_M   FType = 15
+	FTypeMostlyQ5_K_S   FType = 16
+	FTypeMostlyQ5_K_M   FType = 17
+	FTypeMostlyQ6_K     FType = 18
+	FTypeMostlyBF16     FType = 32
+	FTypeMostlyTQ1_0    FType = 36
+	FTypeMostlyTQ2_0    FType = 37
+	FTypeGuessed        FType = 1024
 )
 
 // RopeScalingType represents the RoPE scaling type.
 type RopeScalingType int
 
 const (
-	RopeScalingTypeUnspecified RopeScalingType = C.LFG_ROPE_SCALING_TYPE_UNSPECIFIED
-	RopeScalingTypeNone       RopeScalingType = C.LFG_ROPE_SCALING_TYPE_NONE
-	RopeScalingTypeLinear     RopeScalingType = C.LFG_ROPE_SCALING_TYPE_LINEAR
-	RopeScalingTypeYarn       RopeScalingType = C.LFG_ROPE_SCALING_TYPE_YARN
-	RopeScalingTypeLongRope   RopeScalingType = C.LFG_ROPE_SCALING_TYPE_LONGROPE
+	RopeScalingTypeUnspecified RopeScalingType = -1
+	RopeScalingTypeNone       RopeScalingType = 0
+	RopeScalingTypeLinear     RopeScalingType = 1
+	RopeScalingTypeYarn       RopeScalingType = 2
+	RopeScalingTypeLongRope   RopeScalingType = 3
 )
 
 // PoolingType represents the pooling type for embeddings.
 type PoolingType int
 
 const (
-	PoolingTypeUnspecified PoolingType = C.LFG_POOLING_TYPE_UNSPECIFIED
-	PoolingTypeNone       PoolingType = C.LFG_POOLING_TYPE_NONE
-	PoolingTypeMean       PoolingType = C.LFG_POOLING_TYPE_MEAN
-	PoolingTypeCLS        PoolingType = C.LFG_POOLING_TYPE_CLS
-	PoolingTypeLast       PoolingType = C.LFG_POOLING_TYPE_LAST
-	PoolingTypeRank       PoolingType = C.LFG_POOLING_TYPE_RANK
+	PoolingTypeUnspecified PoolingType = -1
+	PoolingTypeNone       PoolingType = 0
+	PoolingTypeMean       PoolingType = 1
+	PoolingTypeCLS        PoolingType = 2
+	PoolingTypeLast       PoolingType = 3
+	PoolingTypeRank       PoolingType = 4
 )
 
 // AttentionType represents the attention type.
 type AttentionType int
 
 const (
-	AttentionTypeUnspecified AttentionType = C.LFG_ATTENTION_TYPE_UNSPECIFIED
-	AttentionTypeCausal     AttentionType = C.LFG_ATTENTION_TYPE_CAUSAL
-	AttentionTypeNonCausal  AttentionType = C.LFG_ATTENTION_TYPE_NON_CAUSAL
+	AttentionTypeUnspecified AttentionType = -1
+	AttentionTypeCausal     AttentionType = 0
+	AttentionTypeNonCausal  AttentionType = 1
 )
 
 // FlashAttnType represents flash attention configuration.
 type FlashAttnType int
 
 const (
-	FlashAttnTypeAuto     FlashAttnType = C.LFG_FLASH_ATTN_TYPE_AUTO
-	FlashAttnTypeDisabled FlashAttnType = C.LFG_FLASH_ATTN_TYPE_DISABLED
-	FlashAttnTypeEnabled  FlashAttnType = C.LFG_FLASH_ATTN_TYPE_ENABLED
+	FlashAttnTypeAuto     FlashAttnType = -1
+	FlashAttnTypeDisabled FlashAttnType = 0
+	FlashAttnTypeEnabled  FlashAttnType = 1
 )
 
 // SplitMode represents how the model is split across GPUs.
 type SplitMode int
 
 const (
-	SplitModeNone  SplitMode = C.LFG_SPLIT_MODE_NONE
-	SplitModeLayer SplitMode = C.LFG_SPLIT_MODE_LAYER
-	SplitModeRow   SplitMode = C.LFG_SPLIT_MODE_ROW
+	SplitModeNone  SplitMode = 0
+	SplitModeLayer SplitMode = 1
+	SplitModeRow   SplitMode = 2
 )
 
 // TokenData holds token ID, logit, and probability.

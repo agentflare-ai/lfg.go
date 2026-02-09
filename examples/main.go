@@ -49,6 +49,7 @@ type (
 		spanLength int32
 	}
 	memSurpriseMsg struct {
+		inputText        string
 		meanSurprise     float32
 		nAboveThreshold  int32
 		nTokensEvaluated int32
@@ -287,6 +288,7 @@ func runAgentTurn(
 				memory.storeWithEmbedding(userText, embCopy, "surprise")
 			}
 			eventCh <- memSurpriseMsg{
+				inputText:        userText,
 				meanSurprise:     event.MeanSurprise,
 				nAboveThreshold:  event.NAboveThreshold,
 				nTokensEvaluated: event.NTokensEvaluated,
@@ -346,6 +348,7 @@ type model struct {
 	memoryEntries []chatEntry    // stored/retrieval events
 	memViewport   viewport.Model // scrollable viewport for memory tab
 	width, height int            // terminal dimensions
+	thinkingDone  bool           // true once </think> seen in current stream
 }
 
 func initialModel(cfg agentConfig) model {
@@ -473,6 +476,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.input.Reset()
 					m.generating = true
 					m.streaming = ""
+					m.thinkingDone = false
 					m.status = "Generating..."
 
 					historyCopy := make([]lfg.ChatMessage, len(m.history))
@@ -523,6 +527,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tokenMsg:
 		m.streaming += string(msg)
+		if !m.thinkingDone && strings.Contains(m.streaming, "</think>") {
+			m.thinkingDone = true
+		}
 		return m, waitForEvent(m.eventCh)
 
 	case streamClearMsg:
@@ -544,7 +551,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			role: "system",
 			text: fmt.Sprintf("[recall] Retrieved %d items:\n%s", msg.count, msg.text),
 		})
-		m.memViewport.SetContent(renderMemoryContent(m.memoryEntries))
+		m.memViewport.SetContent(renderMemoryContent(m.memoryEntries, m.memViewport.Width))
 		m.memViewport.GotoBottom()
 		return m, waitForEvent(m.eventCh)
 
@@ -553,17 +560,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			role: "stored",
 			text: fmt.Sprintf("[stored] %q (%dt)", truncate(msg.text, 40), msg.spanLength),
 		})
-		m.memViewport.SetContent(renderMemoryContent(m.memoryEntries))
+		m.memViewport.SetContent(renderMemoryContent(m.memoryEntries, m.memViewport.Width))
 		m.memViewport.GotoBottom()
 		return m, waitForEvent(m.eventCh)
 
 	case memSurpriseMsg:
 		m.memoryEntries = append(m.memoryEntries, chatEntry{
 			role: "system",
-			text: fmt.Sprintf("[surprise] Novel input detected (%.2f surprise, %d/%d tokens above threshold)",
-				msg.meanSurprise, msg.nAboveThreshold, msg.nTokensEvaluated),
+			text: fmt.Sprintf("[surprise] Novel input (%.2f, %d/%d tokens): %s",
+				msg.meanSurprise, msg.nAboveThreshold, msg.nTokensEvaluated, msg.inputText),
 		})
-		m.memViewport.SetContent(renderMemoryContent(m.memoryEntries))
+		m.memViewport.SetContent(renderMemoryContent(m.memoryEntries, m.memViewport.Width))
 		m.memViewport.GotoBottom()
 		return m, waitForEvent(m.eventCh)
 
@@ -616,17 +623,21 @@ var (
 	inactiveTabStyle = lipgloss.NewStyle().Faint(true)
 )
 
-func renderMemoryContent(entries []chatEntry) string {
+func renderMemoryContent(entries []chatEntry, width int) string {
 	if len(entries) == 0 {
 		return "No memory events yet."
 	}
+	if width <= 0 {
+		width = 80
+	}
+	wrap := lipgloss.NewStyle().Width(width)
 	var sb strings.Builder
 	for _, entry := range entries {
 		switch entry.role {
 		case "system":
-			sb.WriteString(systemStyle.Render(entry.text))
+			sb.WriteString(wrap.Render(systemStyle.Render(entry.text)))
 		case "stored":
-			sb.WriteString(storedStyle.Render(entry.text))
+			sb.WriteString(wrap.Render(storedStyle.Render(entry.text)))
 		}
 		sb.WriteString("\n")
 	}
@@ -694,7 +705,7 @@ func (m model) renderChatTab(sb *strings.Builder) {
 
 	if m.streaming != "" {
 		display := stripThinking(m.streaming)
-		if display != "" {
+		if display != "" && m.thinkingDone {
 			sb.WriteString(streamStyle.Render("Agent: " + display))
 		} else {
 			sb.WriteString(dimStyle.Render("Thinking..."))
@@ -707,23 +718,33 @@ func (m model) renderChatTab(sb *strings.Builder) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// stripThinking removes <think>...</think> blocks from generated text.
-// Handles partial tags (unclosed <think> at end of stream).
+// stripThinking removes thinking blocks from generated text.
+// Handles three cases:
+//  1. Normal:  <think>...</think>Response   — strips the block.
+//  2. Leading: reasoning...</think>Response  — chat template added <think> to prompt,
+//     so generated text starts mid-thinking. Strips everything before </think>.
+//  3. Unclosed: text<think>...               — partial stream, discard after <think>.
 func stripThinking(s string) string {
 	var sb strings.Builder
 	for {
-		start := strings.Index(s, "<think>")
-		if start < 0 {
-			sb.WriteString(s)
-			break
-		}
-		sb.WriteString(s[:start])
-		end := strings.Index(s[start:], "</think>")
+		end := strings.Index(s, "</think>")
 		if end < 0 {
-			// Unclosed <think> — discard everything after it.
+			// No </think>. Check for unclosed <think> at end.
+			if start := strings.Index(s, "<think>"); start >= 0 {
+				sb.WriteString(s[:start])
+			} else {
+				sb.WriteString(s)
+			}
 			break
 		}
-		s = s[start+end+len("</think>"):]
+		// Found </think>. Check for matching <think> before it.
+		start := strings.Index(s[:end], "<think>")
+		if start >= 0 {
+			// Normal case: keep text before <think>.
+			sb.WriteString(s[:start])
+		}
+		// Leading case (no <think>): skip everything before </think>.
+		s = s[end+len("</think>"):]
 	}
 	return strings.TrimSpace(sb.String())
 }

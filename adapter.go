@@ -1,17 +1,17 @@
+//go:build (darwin && arm64) || (linux && amd64) || (linux && arm64)
+
 package lfg
 
-/*
-#include "lfg_inference.h"
-#include <stdlib.h>
-*/
-import "C"
-import "unsafe"
+import (
+	"runtime"
+	"unsafe"
+)
 
 // AdapterLoRA wraps a LoRA adapter loaded from a file.
 // The adapter is valid as long as its parent model is not freed.
 // All adapters must be loaded before context creation.
 type AdapterLoRA struct {
-	c     *C.struct_lfg_adapter_lora
+	c     uintptr
 	model *Model // prevent GC of parent
 }
 
@@ -19,15 +19,16 @@ type AdapterLoRA struct {
 func LoadAdapterLoRA(model *Model, path string) (*AdapterLoRA, error) {
 	model.mu.RLock()
 	defer model.mu.RUnlock()
-	if model.c == nil {
+	if model.c == 0 {
 		return nil, &Error{Code: ErrorInvalidArgument, Message: "model is closed"}
 	}
 
-	cPath := C.CString(path)
-	defer C.free(unsafe.Pointer(cPath))
+	registerAdapterFuncs()
+	pathBytes := cString(path)
+	adapter := _lfg_adapter_lora_init(model.c, cStringPtr(pathBytes))
+	runtime.KeepAlive(pathBytes)
 
-	adapter := C.lfg_adapter_lora_init(model.c, cPath)
-	if adapter == nil {
+	if adapter == 0 {
 		if err := getLastError(); err != nil {
 			return nil, err
 		}
@@ -41,83 +42,88 @@ func LoadAdapterLoRA(model *Model, path string) (*AdapterLoRA, error) {
 func (a *AdapterLoRA) Metadata(key string) (string, bool) {
 	a.model.mu.RLock()
 	defer a.model.mu.RUnlock()
-	if a.c == nil {
+	if a.c == 0 {
 		return "", false
 	}
-	cKey := C.CString(key)
-	defer C.free(unsafe.Pointer(cKey))
-
-	var buf [512]C.char
-	n := C.lfg_adapter_meta_val_str(a.c, cKey, &buf[0], 512)
+	registerAdapterFuncs()
+	keyBytes := cString(key)
+	var buf [512]byte
+	n := _lfg_adapter_meta_val_str(a.c, cStringPtr(keyBytes), uintptr(unsafe.Pointer(&buf[0])), uintptr(512))
+	runtime.KeepAlive(keyBytes)
 	if n < 0 {
 		return "", false
 	}
-	return C.GoStringN(&buf[0], n), true
+	return goStringN(uintptr(unsafe.Pointer(&buf[0])), int(n)), true
 }
 
 // MetadataCount returns the number of metadata key/value pairs.
 func (a *AdapterLoRA) MetadataCount() int {
 	a.model.mu.RLock()
 	defer a.model.mu.RUnlock()
-	if a.c == nil {
+	if a.c == 0 {
 		return 0
 	}
-	return int(C.lfg_adapter_meta_count(a.c))
+	registerAdapterFuncs()
+	return int(_lfg_adapter_meta_count(a.c))
 }
 
 // MetadataKeyAt returns the metadata key at the given index.
 func (a *AdapterLoRA) MetadataKeyAt(i int) (string, bool) {
 	a.model.mu.RLock()
 	defer a.model.mu.RUnlock()
-	if a.c == nil {
+	if a.c == 0 {
 		return "", false
 	}
-	var buf [256]C.char
-	n := C.lfg_adapter_meta_key_by_index(a.c, C.int32_t(i), &buf[0], 256)
+	registerAdapterFuncs()
+	var buf [256]byte
+	n := _lfg_adapter_meta_key_by_index(a.c, int32(i), uintptr(unsafe.Pointer(&buf[0])), uintptr(256))
 	if n < 0 {
 		return "", false
 	}
-	return C.GoStringN(&buf[0], n), true
+	return goStringN(uintptr(unsafe.Pointer(&buf[0])), int(n)), true
 }
 
 // MetadataValueAt returns the metadata value at the given index.
 func (a *AdapterLoRA) MetadataValueAt(i int) (string, bool) {
 	a.model.mu.RLock()
 	defer a.model.mu.RUnlock()
-	if a.c == nil {
+	if a.c == 0 {
 		return "", false
 	}
-	var buf [512]C.char
-	n := C.lfg_adapter_meta_val_str_by_index(a.c, C.int32_t(i), &buf[0], 512)
+	registerAdapterFuncs()
+	var buf [512]byte
+	n := _lfg_adapter_meta_val_str_by_index(a.c, int32(i), uintptr(unsafe.Pointer(&buf[0])), uintptr(512))
 	if n < 0 {
 		return "", false
 	}
-	return C.GoStringN(&buf[0], n), true
+	return goStringN(uintptr(unsafe.Pointer(&buf[0])), int(n)), true
 }
 
 // InvocationTokenCount returns the number of invocation tokens if this is an aLoRA.
 func (a *AdapterLoRA) InvocationTokenCount() uint64 {
 	a.model.mu.RLock()
 	defer a.model.mu.RUnlock()
-	if a.c == nil {
+	if a.c == 0 {
 		return 0
 	}
-	return uint64(C.lfg_adapter_get_alora_n_invocation_tokens(a.c))
+	registerAdapterFuncs()
+	return _lfg_adapter_get_alora_n_invocation_tokens(a.c)
 }
 
 // InvocationTokens returns the invocation tokens if this is an aLoRA.
 func (a *AdapterLoRA) InvocationTokens() []Token {
 	a.model.mu.RLock()
 	defer a.model.mu.RUnlock()
-	if a.c == nil {
+	if a.c == 0 {
 		return nil
 	}
-	n := int(C.lfg_adapter_get_alora_n_invocation_tokens(a.c))
+	registerAdapterFuncs()
+	n := int(_lfg_adapter_get_alora_n_invocation_tokens(a.c))
 	if n == 0 {
 		return nil
 	}
-	ptr := C.lfg_adapter_get_alora_invocation_tokens(a.c)
-	if ptr == nil {
+	ptr := _lfg_adapter_get_alora_invocation_tokens(a.c)
+	if ptr == 0 {
 		return nil
 	}
 	cTokens := unsafe.Slice((*int32)(unsafe.Pointer(ptr)), n)
@@ -132,13 +138,14 @@ func (a *AdapterLoRA) InvocationTokens() []Token {
 func (ctx *Context) SetLoRA(adapter *AdapterLoRA, scale float32) error {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "context is closed"}
 	}
-	if adapter == nil || adapter.c == nil {
+	if adapter == nil || adapter.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "adapter is nil"}
 	}
-	rc := C.lfg_set_adapter_lora(ctx.c, adapter.c, C.float(scale))
+	registerAdapterFuncs()
+	rc := _lfg_set_adapter_lora(ctx.c, adapter.c, scale)
 	if rc != 0 {
 		return &Error{Code: ErrorInternal, Message: "failed to set LoRA adapter"}
 	}
@@ -149,13 +156,14 @@ func (ctx *Context) SetLoRA(adapter *AdapterLoRA, scale float32) error {
 func (ctx *Context) RemoveLoRA(adapter *AdapterLoRA) error {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "context is closed"}
 	}
-	if adapter == nil || adapter.c == nil {
+	if adapter == nil || adapter.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "adapter is nil"}
 	}
-	rc := C.lfg_rm_adapter_lora(ctx.c, adapter.c)
+	registerAdapterFuncs()
+	rc := _lfg_rm_adapter_lora(ctx.c, adapter.c)
 	if rc != 0 {
 		return &Error{Code: ErrorInternal, Message: "adapter not present in context"}
 	}
@@ -166,10 +174,11 @@ func (ctx *Context) RemoveLoRA(adapter *AdapterLoRA) error {
 func (ctx *Context) ClearLoRA() {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return
 	}
-	C.lfg_clear_adapter_lora(ctx.c)
+	registerAdapterFuncs()
+	_lfg_clear_adapter_lora(ctx.c)
 }
 
 // ApplyControlVector applies a control vector to the context.
@@ -178,18 +187,19 @@ func (ctx *Context) ClearLoRA() {
 func (ctx *Context) ApplyControlVector(data []float32, nEmbd, ilStart, ilEnd int) error {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	if ctx.c == nil {
+	if ctx.c == 0 {
 		return &Error{Code: ErrorInvalidArgument, Message: "context is closed"}
 	}
 
-	var dataPtr *C.float
-	var dataLen C.size_t
+	registerAdapterFuncs()
+	var dataPtr uintptr
+	var dataLen uintptr
 	if len(data) > 0 {
-		dataPtr = (*C.float)(unsafe.Pointer(&data[0]))
-		dataLen = C.size_t(len(data))
+		dataPtr = uintptr(unsafe.Pointer(&data[0]))
+		dataLen = uintptr(len(data))
 	}
 
-	rc := C.lfg_apply_adapter_cvec(ctx.c, dataPtr, dataLen, C.int32_t(nEmbd), C.int32_t(ilStart), C.int32_t(ilEnd))
+	rc := _lfg_apply_adapter_cvec(ctx.c, dataPtr, dataLen, int32(nEmbd), int32(ilStart), int32(ilEnd))
 	if rc != 0 {
 		return &Error{Code: ErrorInternal, Message: "failed to apply control vector"}
 	}
