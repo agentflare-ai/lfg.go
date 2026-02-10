@@ -1883,7 +1883,7 @@ func TestSessionRegisterToolsBasic(t *testing.T) {
 	tools := []ToolDesc{
 		{Name: "get_weather", Description: "Get the current weather for a location"},
 		{Name: "search_web", Description: "Search the web for information"},
-		{Name: "calculator", Description: "Perform arithmetic calculations", JSONSchema: `{"type":"object","properties":{"expression":{"type":"string"}}}`},
+		{Name: "calculator", Description: "Perform arithmetic calculations", Parameters: `{"type":"object","properties":{"expression":{"type":"string"}}}`},
 	}
 
 	n, err := s.RegisterTools(tools, 2)
@@ -2078,8 +2078,8 @@ func TestSessionToolsWithOptionalSchema(t *testing.T) {
 	// Mix of tools with and without schema.
 	tools := []ToolDesc{
 		{Name: "no_schema", Description: "A tool without a schema"},
-		{Name: "with_schema", Description: "A tool with a schema", JSONSchema: `{"type":"object","properties":{"q":{"type":"string"}}}`},
-		{Name: "empty_schema", Description: "A tool with empty schema", JSONSchema: ""},
+		{Name: "with_schema", Description: "A tool with a schema", Parameters: `{"type":"object","properties":{"q":{"type":"string"}}}`},
+		{Name: "empty_schema", Description: "A tool with empty schema", Parameters: ""},
 	}
 
 	n, err := s.RegisterTools(tools, 3)

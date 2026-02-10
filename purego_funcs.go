@@ -598,10 +598,18 @@ var (
 	_lfg_session_configure_surprise_monitor   func(session uintptr, config uintptr) int32
 	_lfg_session_surprise_pop                 func(session uintptr, eventOut uintptr, embdOut uintptr, embdCap int32) bool
 	_lfg_session_embed                        func(session uintptr, text uintptr, textLen int32, out uintptr, outCap int32) int32
+	_lfg_session_rank_tools                  func(session uintptr, query uintptr, queryLen int32, buf uintptr, bufSize int32) int32
+	_lfg_session_get_last_prompt             func(session uintptr, lenOut uintptr) uintptr
+	_lfg_session_get_tool_calls              func(session uintptr, nOut uintptr) uintptr
+	_lfg_session_get_last_output             func(session uintptr, lenOut uintptr) uintptr
+	_lfg_session_set_tool_call_format        func(session uintptr, format int32)
+	_lfg_parse_pythonic_tool_calls           func(text uintptr, textLen int32, out uintptr, outCap int32) int32
 	_lfg_json_schema_to_grammar              func(jsonSchema uintptr, forceGBNF bool, buf uintptr, bufSize uintptr) int32
 	_lfg_model_load_default_config           func() cModelLoadConfig
 	_lfg_load_model                          func(config uintptr) uintptr
 	_lfg_model_get_stats                     func(model uintptr) cModelStats
+	_free                                    func(ptr uintptr)
+	_malloc                                  func(size uintptr) uintptr
 )
 
 func registerSessionFuncs() {
@@ -632,6 +640,12 @@ func registerSessionFuncs() {
 		purego.RegisterLibFunc(&_lfg_checkpoint_free, lib, "lfg_checkpoint_free")
 		purego.RegisterLibFunc(&_lfg_session_register_tools, lib, "lfg_session_register_tools")
 		purego.RegisterLibFunc(&_lfg_session_clear_tools, lib, "lfg_session_clear_tools")
+		purego.RegisterLibFunc(&_lfg_session_rank_tools, lib, "lfg_session_rank_tools")
+		purego.RegisterLibFunc(&_lfg_session_get_last_prompt, lib, "lfg_session_get_last_prompt")
+		purego.RegisterLibFunc(&_lfg_session_get_tool_calls, lib, "lfg_session_get_tool_calls")
+		purego.RegisterLibFunc(&_lfg_session_get_last_output, lib, "lfg_session_get_last_output")
+		purego.RegisterLibFunc(&_lfg_session_set_tool_call_format, lib, "lfg_session_set_tool_call_format")
+		purego.RegisterLibFunc(&_lfg_parse_pythonic_tool_calls, lib, "lfg_parse_pythonic_tool_calls")
 		purego.RegisterLibFunc(&_lfg_entropy_monitor_default_config, lib, "lfg_entropy_monitor_default_config")
 		purego.RegisterLibFunc(&_lfg_session_configure_entropy_monitor, lib, "lfg_session_configure_entropy_monitor")
 		purego.RegisterLibFunc(&_lfg_session_entropy_pop, lib, "lfg_session_entropy_pop")
@@ -654,6 +668,8 @@ func registerSessionFuncs() {
 		purego.RegisterLibFunc(&_lfg_model_load_default_config, lib, "lfg_model_load_default_config")
 		purego.RegisterLibFunc(&_lfg_load_model, lib, "lfg_load_model")
 		purego.RegisterLibFunc(&_lfg_model_get_stats, lib, "lfg_model_get_stats")
+		purego.RegisterLibFunc(&_free, lib, "free")
+		purego.RegisterLibFunc(&_malloc, lib, "malloc")
 	})
 }
 

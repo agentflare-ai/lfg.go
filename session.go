@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"sync"
 	"unsafe"
+
+	"github.com/ebitengine/purego"
 )
 
 // SamplingConfig mirrors lfg_sampling_config.
@@ -566,11 +568,79 @@ func JSONSchemaToGrammar(jsonSchema string, forceGBNF bool) (string, error) {
 	return string(buf[:n]), nil
 }
 
-// ToolDesc describes a tool for embedding-based ranking.
+// ToolDesc describes a tool for embedding-based ranking and optional auto-execution.
 type ToolDesc struct {
 	Name        string // Tool name.
 	Description string // Human-readable description.
-	JSONSchema  string // Optional JSON schema for parameters.
+	Parameters  string // Optional JSON schema for parameters.
+	Fn          ToolFn // Optional auto-execution function. nil = consumer handles tool calls.
+}
+
+// ---------------------------------------------------------------------------
+// Tool function trampoline (auto-execution)
+// ---------------------------------------------------------------------------
+
+var (
+	toolFnMu        sync.Mutex
+	toolFnMap       = make(map[uintptr]ToolFn)
+	toolFnNextID    uintptr
+	toolFnTrampOnce sync.Once
+	toolFnTramp     uintptr
+)
+
+func initToolFnTrampoline() {
+	toolFnTrampOnce.Do(func() {
+		registerSessionFuncs() // ensure _malloc is registered
+
+		// C signature: const char * (*)(const char *arguments, void *user_data)
+		// Returns a malloc'd C string — the C engine calls free() on it.
+		toolFnTramp = purego.NewCallback(func(argsPtr uintptr, userData uintptr) uintptr {
+			if userData == 0 {
+				return 0
+			}
+			id := *(*uintptr)(unsafe.Pointer(userData))
+			toolFnMu.Lock()
+			fn, ok := toolFnMap[id]
+			toolFnMu.Unlock()
+			if !ok || fn == nil {
+				return 0
+			}
+
+			goArgs := goString(argsPtr)
+			result, err := fn(goArgs)
+			if err != nil {
+				result = "error: " + err.Error()
+			}
+
+			// Allocate C string via malloc — caller (C engine) will free.
+			n := len(result)
+			cPtr := _malloc(uintptr(n + 1))
+			if cPtr == 0 {
+				return 0
+			}
+			dst := unsafe.Slice((*byte)(unsafe.Pointer(cPtr)), n+1)
+			copy(dst, result)
+			dst[n] = 0
+			return cPtr
+		})
+	})
+}
+
+func registerToolFn(fn ToolFn) uintptr {
+	toolFnMu.Lock()
+	defer toolFnMu.Unlock()
+	toolFnNextID++
+	id := toolFnNextID
+	toolFnMap[id] = fn
+	return id
+}
+
+func unregisterToolFns(ids []uintptr) {
+	toolFnMu.Lock()
+	defer toolFnMu.Unlock()
+	for _, id := range ids {
+		delete(toolFnMap, id)
+	}
 }
 
 // RegisterTools registers tools with the session for embedding-based ranking.
@@ -591,6 +661,8 @@ func (s *Session) RegisterTools(tools []ToolDesc, topK int32) (int32, error) {
 	// Build C tool descriptors with Go byte slices.
 	cDescs := make([]cToolDesc, len(tools))
 	keepAlive := make([][]byte, 0, len(tools)*3)
+	var fnIDs []uintptr
+	var fnIDPtrs []*uintptr // prevent GC
 
 	for i, t := range tools {
 		nameBytes := cString(t.Name)
@@ -598,17 +670,29 @@ func (s *Session) RegisterTools(tools []ToolDesc, topK int32) (int32, error) {
 		keepAlive = append(keepAlive, nameBytes, descBytes)
 		cDescs[i].Name = cStringPtr(nameBytes)
 		cDescs[i].Description = cStringPtr(descBytes)
-		if t.JSONSchema != "" {
-			schemaBytes := cString(t.JSONSchema)
-			keepAlive = append(keepAlive, schemaBytes)
-			cDescs[i].JSONSchema = cStringPtr(schemaBytes)
+		if t.Parameters != "" {
+			paramBytes := cString(t.Parameters)
+			keepAlive = append(keepAlive, paramBytes)
+			cDescs[i].Parameters = cStringPtr(paramBytes)
+		}
+		if t.Fn != nil {
+			initToolFnTrampoline()
+			id := registerToolFn(t.Fn)
+			fnIDs = append(fnIDs, id)
+			idPtr := new(uintptr)
+			*idPtr = id
+			fnIDPtrs = append(fnIDPtrs, idPtr)
+			cDescs[i].Fn = toolFnTramp
+			cDescs[i].FnUserData = uintptr(unsafe.Pointer(idPtr))
 		}
 	}
 
 	n := _lfg_session_register_tools(s.c, uintptr(unsafe.Pointer(&cDescs[0])), int32(len(tools)), topK)
 	runtime.KeepAlive(keepAlive)
 	runtime.KeepAlive(cDescs)
+	runtime.KeepAlive(fnIDPtrs)
 	if n < 0 {
+		unregisterToolFns(fnIDs)
 		if err := getLastError(); err != nil {
 			return 0, err
 		}
@@ -1159,4 +1243,158 @@ func (s *Session) Embed(text string) ([]float32, error) {
 		return nil, &Error{Code: ErrorInternal, Message: "failed to compute embedding"}
 	}
 	return out[:int(n)], nil
+}
+
+// ---------------------------------------------------------------------------
+// Tool Call Introspection & Parsing
+// ---------------------------------------------------------------------------
+
+// RankTools ranks registered tools against a query string.
+// Returns a JSON string with the ranking results.
+func (s *Session) RankTools(query string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == 0 {
+		return "", &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
+	}
+
+	queryBytes := cString(query)
+	queryPtr := cStringPtr(queryBytes)
+	cLen := int32(len(query))
+
+	// First pass: get required size.
+	n := _lfg_session_rank_tools(s.c, queryPtr, cLen, 0, 0)
+	runtime.KeepAlive(queryBytes)
+	if n < 0 {
+		if err := getLastError(); err != nil {
+			return "", err
+		}
+		return "", &Error{Code: ErrorInternal, Message: "failed to rank tools"}
+	}
+	if n == 0 {
+		return "", nil
+	}
+
+	buf := make([]byte, int(n)+1)
+	n = _lfg_session_rank_tools(s.c, queryPtr, cLen, uintptr(unsafe.Pointer(&buf[0])), int32(len(buf)))
+	runtime.KeepAlive(queryBytes)
+	if n < 0 {
+		if err := getLastError(); err != nil {
+			return "", err
+		}
+		return "", &Error{Code: ErrorInternal, Message: "failed to rank tools"}
+	}
+	return string(buf[:n]), nil
+}
+
+// LastPrompt returns the fully-formatted prompt from the last chat_generate call.
+// The returned string is owned by the session and valid until the next generate/reset/free.
+func (s *Session) LastPrompt() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == 0 {
+		return ""
+	}
+
+	var lenOut int32
+	ptr := _lfg_session_get_last_prompt(s.c, uintptr(unsafe.Pointer(&lenOut)))
+	return goStringN(ptr, int(lenOut))
+}
+
+// ToolCalls returns parsed tool calls from the last generation.
+// Valid after a generate call that stopped with StopReasonToolCall.
+// The returned data is owned by the session and valid until the next generate/reset/free.
+func (s *Session) ToolCalls() []ToolCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == 0 {
+		return nil
+	}
+
+	var nOut int32
+	ptr := _lfg_session_get_tool_calls(s.c, uintptr(unsafe.Pointer(&nOut)))
+	if ptr == 0 || nOut <= 0 {
+		return nil
+	}
+
+	cCalls := unsafe.Slice((*cToolCall)(unsafe.Pointer(ptr)), int(nOut))
+	calls := make([]ToolCall, int(nOut))
+	for i := range calls {
+		calls[i] = ToolCall{
+			ID:        goString(cCalls[i].ID),
+			Name:      goString(cCalls[i].Name),
+			Arguments: goString(cCalls[i].Arguments),
+		}
+	}
+	return calls
+}
+
+// LastOutput returns the raw text output from the last generation.
+// The returned string is owned by the session and valid until the next generate/reset/free.
+func (s *Session) LastOutput() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == 0 {
+		return ""
+	}
+
+	var lenOut int32
+	ptr := _lfg_session_get_last_output(s.c, uintptr(unsafe.Pointer(&lenOut)))
+	return goStringN(ptr, int(lenOut))
+}
+
+// SetToolCallFormat sets the format used for tool call parsing.
+func (s *Session) SetToolCallFormat(format ToolCallFormat) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == 0 {
+		return
+	}
+	_lfg_session_set_tool_call_format(s.c, int32(format))
+}
+
+// ParsePythonicToolCalls parses pythonic-format tool calls from text.
+// Returns a slice of parsed tool calls. The id/name/arguments strings
+// in each returned ToolCall are allocated and owned by Go.
+func ParsePythonicToolCalls(text string) []ToolCall {
+	registerSessionFuncs()
+
+	textBytes := cString(text)
+	textPtr := cStringPtr(textBytes)
+	cLen := int32(len(text))
+
+	// First pass: get count.
+	n := _lfg_parse_pythonic_tool_calls(textPtr, cLen, 0, 0)
+	runtime.KeepAlive(textBytes)
+	if n <= 0 {
+		return nil
+	}
+
+	// Allocate output array and parse.
+	cCalls := make([]cToolCall, int(n))
+	n = _lfg_parse_pythonic_tool_calls(textPtr, cLen, uintptr(unsafe.Pointer(&cCalls[0])), n)
+	runtime.KeepAlive(textBytes)
+	if n <= 0 {
+		return nil
+	}
+
+	calls := make([]ToolCall, int(n))
+	for i := range calls {
+		calls[i] = ToolCall{
+			ID:        goString(cCalls[i].ID),
+			Name:      goString(cCalls[i].Name),
+			Arguments: goString(cCalls[i].Arguments),
+		}
+		// Free C-allocated strings (parse allocates via malloc).
+		if cCalls[i].ID != 0 {
+			_free(cCalls[i].ID)
+		}
+		if cCalls[i].Name != 0 {
+			_free(cCalls[i].Name)
+		}
+		if cCalls[i].Arguments != 0 {
+			_free(cCalls[i].Arguments)
+		}
+	}
+	return calls
 }

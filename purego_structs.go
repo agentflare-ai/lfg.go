@@ -208,34 +208,50 @@ type cSurpriseMonitorConfig struct {
 	_                [3]byte
 }
 
+// cToolCall mirrors lfg_tool_call.
+type cToolCall struct {
+	ID        uintptr // const char *
+	Name      uintptr // const char *
+	Arguments uintptr // const char *
+}
+
 // cToolDesc mirrors lfg_tool_desc.
 type cToolDesc struct {
 	Name        uintptr // const char *
 	Description uintptr // const char *
-	JSONSchema  uintptr // const char *
+	Parameters  uintptr // const char *
+	Fn          uintptr // lfg_tool_fn
+	FnUserData  uintptr // void *
 }
 
 // cGenerateConfig mirrors lfg_generate_config.
 type cGenerateConfig struct {
-	MaxTokens          int32
-	_                  [4]byte // padding
-	TokenCB            uintptr // lfg_generate_token_cb
-	TokenCBData        uintptr // void *
-	EntropyCB          uintptr // lfg_generate_entropy_cb
-	EntropyCBData      uintptr // void *
-	ConfidenceCB       uintptr // lfg_generate_confidence_cb
-	ConfidenceCBData   uintptr // void *
-	SurpriseCB         uintptr // lfg_generate_surprise_cb
-	SurpriseCBData     uintptr // void *
+	MaxTokens               int32
+	IncludeHistoryReasoning byte    // bool
+	_                       [3]byte // padding to 8
+	TokenCB                 uintptr // lfg_generate_token_cb
+	TokenCBData             uintptr // void *
+	EntropyCB               uintptr // lfg_generate_entropy_cb
+	EntropyCBData           uintptr // void *
+	ConfidenceCB            uintptr // lfg_generate_confidence_cb
+	ConfidenceCBData        uintptr // void *
+	SurpriseCB              uintptr // lfg_generate_surprise_cb
+	SurpriseCBData          uintptr // void *
+	ToolCallCB              uintptr // lfg_tool_call_cb
+	ToolCallCBData          uintptr // void *
+	MaxToolRounds           int32   // 0 = default (5)
+	_pad                    [4]byte // padding to 8-byte alignment
 }
 
 // cGenerateResult mirrors lfg_generate_result.
 type cGenerateResult struct {
-	NTokens         int32
-	NRetrievals     int32
+	NTokens          int32
+	NRetrievals      int32
 	NConfidenceSpans int32
-	NSurpriseEvents int32
-	StopReason      int32 // lfg_stop_reason
+	NSurpriseEvents  int32
+	NToolCalls       int32
+	NToolRounds      int32
+	StopReason       int32 // lfg_stop_reason
 }
 
 // cCheckpointRestoreOptions mirrors lfg_checkpoint_restore_options.

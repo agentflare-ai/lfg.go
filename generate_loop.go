@@ -21,6 +21,7 @@ const (
 	StopReasonEOS       StopReason = 0 // End-of-generation token.
 	StopReasonMaxTokens StopReason = 1 // Hit max_tokens limit.
 	StopReasonCallback  StopReason = 2 // Token callback returned GenerateStop.
+	StopReasonToolCall  StopReason = 3 // Model emitted tool call end token.
 )
 
 // GenerateAction controls whether the C-side generate loop continues or stops.
@@ -54,11 +55,14 @@ type SurpriseCallback func(event SurpriseEvent, embedding []float32)
 
 // GenerateConfig configures a C-side generate loop.
 type GenerateConfig struct {
-	MaxTokens          int32              // Hard token limit. 0 = use session config.
-	TokenCallback      TokenCallback      // Per-token callback (optional).
-	EntropyCallback    EntropyCallback    // Entropy threshold callback (optional).
-	ConfidenceCallback ConfidenceCallback // Confidence span callback (optional).
-	SurpriseCallback   SurpriseCallback   // Surprise span callback (optional).
+	MaxTokens                int32              // Hard token limit. 0 = use session config.
+	IncludeHistoryReasoning  bool               // Include <think> blocks in chat history (default false).
+	TokenCallback            TokenCallback      // Per-token callback (optional).
+	EntropyCallback          EntropyCallback    // Entropy threshold callback (optional).
+	ConfidenceCallback       ConfidenceCallback // Confidence span callback (optional).
+	SurpriseCallback         SurpriseCallback   // Surprise span callback (optional).
+	ToolCallCallback         ToolCallCallback   // Observation callback for auto-executed tool calls (optional).
+	MaxToolRounds            int32              // Max auto-execution rounds. 0 = default (5).
 }
 
 // GenerateLoopResult holds the result from a C-side generate loop.
@@ -67,6 +71,8 @@ type GenerateLoopResult struct {
 	Retrievals      int        // Number of entropy-triggered rewind+inject cycles.
 	ConfidenceSpans int        // Number of confidence events fired.
 	SurpriseEvents  int        // Number of surprise events from prompt ingestion (0 or 1).
+	ToolCallCount   int        // Number of parsed tool calls.
+	ToolRounds      int        // Auto-execution rounds completed.
 	StopReason      StopReason // Why generation stopped.
 }
 
@@ -84,6 +90,7 @@ type generateHandle struct {
 	entropyCB    EntropyCallback
 	confidenceCB ConfidenceCallback
 	surpriseCB   SurpriseCallback
+	toolCallCB   ToolCallCallback
 	pinnedStrings [][]byte // Pinned Go strings returned by entropy callback; GC'd after generate.
 }
 
@@ -118,6 +125,7 @@ var (
 	entropyTrampoline     uintptr
 	confidenceTrampoline  uintptr
 	surpriseTrampoline    uintptr
+	toolCallTrampoline    uintptr
 )
 
 func initGenerateTrampolines() {
@@ -243,6 +251,29 @@ func initGenerateTrampolines() {
 
 			h.surpriseCB(goEvent, goEmbed)
 		})
+
+		// Tool call callback: void (*)(const lfg_tool_call *call, const char *result, int32_t result_len, int32_t round, void *user_data)
+		toolCallTrampoline = purego.NewCallback(func(callPtr uintptr, resultPtr uintptr, resultLen int32, round int32, userData uintptr) {
+			if userData == 0 {
+				return
+			}
+			id := *(*uintptr)(unsafe.Pointer(userData))
+			genCBMu.Lock()
+			h, ok := genCBMap[id]
+			genCBMu.Unlock()
+			if !ok || h.toolCallCB == nil {
+				return
+			}
+
+			cCall := (*cToolCall)(unsafe.Pointer(callPtr))
+			goCall := ToolCall{
+				ID:        goString(cCall.ID),
+				Name:      goString(cCall.Name),
+				Arguments: goString(cCall.Arguments),
+			}
+			goResult := goStringN(resultPtr, int(resultLen))
+			h.toolCallCB(goCall, goResult, int(round))
+		})
 	})
 }
 
@@ -260,8 +291,10 @@ func prepareGenerate(config *GenerateConfig) (func(), cGenerateConfig) {
 	}
 
 	cCfg.MaxTokens = config.MaxTokens
+	cCfg.IncludeHistoryReasoning = boolToByte(config.IncludeHistoryReasoning)
+	cCfg.MaxToolRounds = config.MaxToolRounds
 
-	if config.TokenCallback == nil && config.EntropyCallback == nil && config.ConfidenceCallback == nil && config.SurpriseCallback == nil {
+	if config.TokenCallback == nil && config.EntropyCallback == nil && config.ConfidenceCallback == nil && config.SurpriseCallback == nil && config.ToolCallCallback == nil {
 		return func() {}, cCfg
 	}
 
@@ -272,6 +305,7 @@ func prepareGenerate(config *GenerateConfig) (func(), cGenerateConfig) {
 		entropyCB:    config.EntropyCallback,
 		confidenceCB: config.ConfidenceCallback,
 		surpriseCB:   config.SurpriseCallback,
+		toolCallCB:   config.ToolCallCallback,
 	}
 	id := registerGenerateHandle(h)
 
@@ -294,6 +328,10 @@ func prepareGenerate(config *GenerateConfig) (func(), cGenerateConfig) {
 		cCfg.SurpriseCB = surpriseTrampoline
 		cCfg.SurpriseCBData = uintptr(unsafe.Pointer(idPtr))
 	}
+	if config.ToolCallCallback != nil {
+		cCfg.ToolCallCB = toolCallTrampoline
+		cCfg.ToolCallCBData = uintptr(unsafe.Pointer(idPtr))
+	}
 
 	cleanup := func() {
 		// pinnedStrings are GC'd automatically — no C.free needed with purego.
@@ -311,6 +349,8 @@ func resultFromC(r cGenerateResult) GenerateLoopResult {
 		Retrievals:      int(r.NRetrievals),
 		ConfidenceSpans: int(r.NConfidenceSpans),
 		SurpriseEvents:  int(r.NSurpriseEvents),
+		ToolCallCount:   int(r.NToolCalls),
+		ToolRounds:      int(r.NToolRounds),
 		StopReason:      StopReason(r.StopReason),
 	}
 }

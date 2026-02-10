@@ -154,3 +154,28 @@ type LogitBias struct {
 	Token Token
 	Bias  float32
 }
+
+// ToolCallFormat controls how tool calls are formatted in the output.
+type ToolCallFormat int
+
+const (
+	ToolCallFormatPythonic ToolCallFormat = 0 // [func(key='val', key2=123)]
+	ToolCallFormatJSON     ToolCallFormat = 1 // {"name":"func","arguments":{...}}
+)
+
+// ToolCall represents a parsed tool call from model output.
+type ToolCall struct {
+	ID        string // e.g. "call_0"
+	Name      string // Function name
+	Arguments string // JSON string of arguments
+}
+
+// ToolFn is a function that auto-executes a tool call.
+// The engine calls this during generation when the model emits a tool call.
+// Returns the result string and an error. The engine calls free() on the C string.
+type ToolFn func(arguments string) (string, error)
+
+// ToolCallCallback is called after each auto-executed tool call for observation.
+// call is the parsed tool call, result is the function return value,
+// round is the current auto-execution round (0-indexed).
+type ToolCallCallback func(call ToolCall, result string, round int)
