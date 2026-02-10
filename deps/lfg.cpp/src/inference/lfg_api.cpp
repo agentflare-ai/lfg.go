@@ -198,7 +198,9 @@ struct lfg_session {
     lfg_token       *tool_token_buf;      // malloc'd, for tokenized tool block
     int32_t          tool_token_buf_cap;
 
-    int32_t          tool_top_k;            // 0 = disabled
+    int32_t              tool_top_k;            // 0 = disabled
+    lfg_tool_score_mode  tool_score_mode;
+    float                tool_min_score;
     bool             tools_injected;       // Reset on session_reset()
 
     // Entropy monitor config
@@ -208,6 +210,9 @@ struct lfg_session {
     float                entropy_last;
     float                entropy_last_norm;
     bool                 entropy_active;
+    lfg_entropy_gate_mode entropy_gate_mode;
+    float                entropy_running_sum;
+    int32_t              entropy_running_count;
 
     // SPSC ring buffer (pre-allocated at configure time)
     lfg_entropy_ring_slot *entropy_slots;
@@ -223,6 +228,9 @@ struct lfg_session {
     float                confidence_threshold;
     int32_t              confidence_min_span;
     bool                 confidence_active;
+    lfg_confidence_gate_mode confidence_gate_mode;
+    float                confidence_running_sum;
+    int32_t              confidence_running_count;
 
     // Run tracker (zero-alloc hot path state)
     int32_t              confidence_run_count;
@@ -241,11 +249,18 @@ struct lfg_session {
     // Confidence reasoning gating
     bool                 confidence_include_reasoning;
 
+    // Confidence span text buffer (realloc'd, valid until next pop)
+    char                *confidence_text_buf;
+    int32_t              confidence_text_cap;
+
     // Surprise monitor (input novelty — single aggregate event per ingestion)
     float                surprise_threshold;
     bool                 surprise_active;
     bool                 surprise_include_reasoning;
     int32_t              surprise_skip_tokens;  // tokens to skip at start of next ingestion (chat context)
+    lfg_surprise_gate_mode surprise_gate_mode;
+    float               *surprise_per_token;     // malloc'd scratch for AUTO two-pass
+    int32_t              surprise_per_token_cap;  // capacity of above
 
     // Accumulator (filled during ingestion, read via pop)
     int32_t              surprise_count;        // tokens above threshold
@@ -749,16 +764,50 @@ static bool session_ingest_internal(lfg_session *s, const lfg_token *tokens, siz
 
                 // Accumulate aggregate stats
                 s->surprise_n_evaluated++;
-                if (surprise >= s->surprise_threshold) {
-                    s->surprise_count++;
-                    s->surprise_sum += surprise;
-                    if (surprise > s->surprise_max)
-                        s->surprise_max = surprise;
+                if (s->surprise_gate_mode == LFG_SURPRISE_GATE_AUTO) {
+                    // Store for two-pass (realloc if needed)
+                    int32_t idx = s->surprise_n_evaluated - 1;
+                    if (idx >= s->surprise_per_token_cap) {
+                        s->surprise_per_token_cap = (idx + 1) * 2;
+                        s->surprise_per_token = (float *)realloc(s->surprise_per_token,
+                            s->surprise_per_token_cap * sizeof(float));
+                    }
+                    s->surprise_per_token[idx] = surprise;
+                } else {
+                    // FIXED: accumulate on the fly
+                    if (surprise >= s->surprise_threshold) {
+                        s->surprise_count++;
+                        s->surprise_sum += surprise;
+                        if (surprise > s->surprise_max)
+                            s->surprise_max = surprise;
+                    }
                 }
             }
         }
 
         s->n_past += n;
+    }
+
+    // AUTO two-pass: compute mean, then flag outliers
+    if (s->surprise_active && s->surprise_gate_mode == LFG_SURPRISE_GATE_AUTO &&
+        s->surprise_n_evaluated > 0) {
+        float sum = 0.0f;
+        for (int32_t i = 0; i < s->surprise_n_evaluated; ++i) {
+            sum += s->surprise_per_token[i];
+        }
+        float mean = sum / s->surprise_n_evaluated;
+        float gap = s->surprise_threshold > 0.0f ? s->surprise_threshold : 0.20f;
+        float effective_threshold = mean + gap;
+
+        for (int32_t i = 0; i < s->surprise_n_evaluated; ++i) {
+            if (s->surprise_per_token[i] >= effective_threshold) {
+                s->surprise_count++;
+                s->surprise_sum += s->surprise_per_token[i];
+                if (s->surprise_per_token[i] > s->surprise_max) {
+                    s->surprise_max = s->surprise_per_token[i];
+                }
+            }
+        }
     }
 
     // Post-ingest: mark event ready if any tokens exceeded threshold
@@ -837,6 +886,8 @@ LFG_API lfg_session_config lfg_session_default_config(void) {
     cfg.structured_checkpointing = true;
     cfg.reasoning_budget = 0;
     cfg.max_tokens = 0;
+    cfg.tool_score_mode = LFG_TOOL_SCORE_OFF;
+    cfg.tool_min_score = 0.0f;
     cfg.sampling = lfg_sampling_default_config();
     return cfg;
 }
@@ -917,6 +968,8 @@ LFG_API lfg_session * lfg_session_create(lfg_model * model, const lfg_session_co
     s->tool_token_buf = nullptr;
     s->tool_token_buf_cap = 0;
     s->tool_top_k = 0;
+    s->tool_score_mode = cfg.tool_score_mode;
+    s->tool_min_score = cfg.tool_min_score;
     s->tools_injected = false;
 
     // Entropy monitor (all nullptr/zero — allocated in configure_entropy_monitor)
@@ -926,6 +979,9 @@ LFG_API lfg_session * lfg_session_create(lfg_model * model, const lfg_session_co
     s->entropy_last = -1.0f;
     s->entropy_last_norm = -1.0f;
     s->entropy_active = false;
+    s->entropy_gate_mode = LFG_ENTROPY_GATE_OFF;
+    s->entropy_running_sum = 0.0f;
+    s->entropy_running_count = 0;
     s->entropy_slots = nullptr;
     s->entropy_snaps = nullptr;
     s->entropy_embd_pool = nullptr;
@@ -939,6 +995,9 @@ LFG_API lfg_session * lfg_session_create(lfg_model * model, const lfg_session_co
     s->confidence_threshold = 0.0f;
     s->confidence_min_span = 5;
     s->confidence_active = false;
+    s->confidence_gate_mode = LFG_CONFIDENCE_GATE_OFF;
+    s->confidence_running_sum = 0.0f;
+    s->confidence_running_count = 0;
     s->confidence_include_reasoning = false;
     s->confidence_run_count = 0;
     s->confidence_run_entropy_sum = 0.0f;
@@ -956,6 +1015,9 @@ LFG_API lfg_session * lfg_session_create(lfg_model * model, const lfg_session_co
     s->surprise_active = false;
     s->surprise_include_reasoning = false;
     s->surprise_skip_tokens = 0;
+    s->surprise_gate_mode = LFG_SURPRISE_GATE_OFF;
+    s->surprise_per_token = nullptr;
+    s->surprise_per_token_cap = 0;
     s->surprise_count = 0;
     s->surprise_sum = 0.0f;
     s->surprise_max = 0.0f;
@@ -1041,9 +1103,11 @@ LFG_API void lfg_session_free(lfg_session * session) {
 
     free(session->confidence_slots);
     free(session->confidence_embd_pool);
+    free(session->confidence_text_buf);
 
     // Surprise monitor
     free(session->surprise_embd);
+    free(session->surprise_per_token);
 
     // Last formatted prompt
     free(session->last_formatted_prompt);
@@ -1090,6 +1154,8 @@ LFG_API void lfg_session_reset(lfg_session * session) {
         session->entropy_tokens_since = session->entropy_cooldown; // allow first event immediately
         session->entropy_last = -1.0f;
         session->entropy_last_norm = -1.0f;
+        session->entropy_running_sum = 0.0f;
+        session->entropy_running_count = 0;
         // Invalidate all snaps
         for (int32_t i = 0; i < session->entropy_ring_cap; ++i) {
             session->entropy_snaps[i].valid = false;
@@ -1103,6 +1169,8 @@ LFG_API void lfg_session_reset(lfg_session * session) {
         session->confidence_run_count = 0;
         session->confidence_run_entropy_sum = 0.0f;
         session->confidence_run_min_entropy = 1.0f;
+        session->confidence_running_sum = 0.0f;
+        session->confidence_running_count = 0;
     }
 
     // Surprise monitor reset
@@ -1406,6 +1474,30 @@ static int32_t session_rank_and_format_tools(lfg_session *session, const float *
                       session->tool_scores[idx]);
     }
 
+    // Gate injection based on score mode
+    if (session->tool_score_mode != LFG_TOOL_SCORE_OFF) {
+        float top_score = session->tool_scores[session->tool_score_indices[0]];
+        bool skip = false;
+
+        if (session->tool_score_mode == LFG_TOOL_SCORE_FIXED) {
+            skip = top_score < session->tool_min_score;
+        } else { // AUTO
+            float threshold = session->tool_min_score > 0.0f ? session->tool_min_score : 0.1f;
+            float sum = 0.0f;
+            for (int32_t i = 0; i < session->tool_count; ++i) {
+                sum += session->tool_scores[i];
+            }
+            float mean = sum / session->tool_count;
+            skip = (top_score - mean) < threshold;
+        }
+
+        if (skip) {
+            LFG_LOG_DEBUG("tool_inject: skipped (mode=%d top=%.4f min=%.4f)",
+                          session->tool_score_mode, top_score, session->tool_min_score);
+            return 0;
+        }
+    }
+
     // Build "List of tools: [tool1, tool2, ...]" into pre-allocated buffer
     int32_t k = session->tool_top_k;
     if (k > session->tool_count) k = session->tool_count;
@@ -1495,8 +1587,24 @@ LFG_API lfg_token lfg_session_sample(lfg_session * session) {
         if (session->entropy_active) {
             session->entropy_tokens_since++;
 
-            // Threshold + cooldown gate
-            if (norm >= session->entropy_threshold &&
+            // Update running stats for AUTO mode
+            if (session->entropy_gate_mode == LFG_ENTROPY_GATE_AUTO) {
+                session->entropy_running_sum += norm;
+                session->entropy_running_count++;
+            }
+
+            // Compute effective threshold
+            bool entropy_fires = false;
+            if (session->entropy_gate_mode == LFG_ENTROPY_GATE_FIXED) {
+                entropy_fires = norm >= session->entropy_threshold;
+            } else if (session->entropy_gate_mode == LFG_ENTROPY_GATE_AUTO &&
+                       session->entropy_running_count >= 2) {
+                float running_mean = session->entropy_running_sum / session->entropy_running_count;
+                float gap = session->entropy_threshold > 0.0f ? session->entropy_threshold : 0.15f;
+                entropy_fires = norm >= (running_mean + gap);
+            }
+
+            if (entropy_fires &&
                 session->entropy_tokens_since >= session->entropy_cooldown) {
                 session->entropy_tokens_since = 0;
 
@@ -1538,7 +1646,27 @@ LFG_API lfg_token lfg_session_sample(lfg_session * session) {
         // Embedding is computed lazily in pop(), not here.
         if (session->confidence_active) {
             bool conf_skip = !session->confidence_include_reasoning && session->in_reasoning;
-            if (!conf_skip && norm <= session->confidence_threshold) {
+
+            // Update running stats for AUTO mode (skip reasoning if configured)
+            if (session->confidence_gate_mode == LFG_CONFIDENCE_GATE_AUTO && !conf_skip) {
+                session->confidence_running_sum += norm;
+                session->confidence_running_count++;
+            }
+
+            // Compute effective threshold
+            bool is_confident = false;
+            if (!conf_skip) {
+                if (session->confidence_gate_mode == LFG_CONFIDENCE_GATE_FIXED) {
+                    is_confident = norm <= session->confidence_threshold;
+                } else if (session->confidence_gate_mode == LFG_CONFIDENCE_GATE_AUTO &&
+                           session->confidence_running_count >= 5) {
+                    float running_mean = session->confidence_running_sum / session->confidence_running_count;
+                    float gap = session->confidence_threshold > 0.0f ? session->confidence_threshold : 0.10f;
+                    is_confident = norm <= (running_mean - gap);
+                }
+            }
+
+            if (is_confident) {
                 // Extend run
                 if (session->confidence_run_count == 0) {
                     session->confidence_run_start_pos = session->n_past;
@@ -2122,6 +2250,7 @@ LFG_API lfg_entropy_monitor_config lfg_entropy_monitor_default_config(void) {
     cfg.threshold = 0.7f;
     cfg.cooldown_tokens = 16;
     cfg.ring_size = 4;
+    cfg.gate_mode = LFG_ENTROPY_GATE_FIXED;
     return cfg;
 }
 
@@ -2169,6 +2298,9 @@ LFG_API int32_t lfg_session_configure_entropy_monitor(
     session->entropy_tokens_since = config->cooldown_tokens > 0 ? config->cooldown_tokens : 1; // allow first event immediately
     session->entropy_last         = -1.0f;
     session->entropy_last_norm    = -1.0f;
+    session->entropy_gate_mode    = config->gate_mode;
+    session->entropy_running_sum  = 0.0f;
+    session->entropy_running_count = 0;
     session->entropy_active       = true;
 
     return n_embd;
@@ -2307,6 +2439,7 @@ LFG_API lfg_confidence_monitor_config lfg_confidence_monitor_default_config(void
     cfg.threshold = 0.3f;
     cfg.min_span = 5;
     cfg.ring_size = 4;
+    cfg.gate_mode = LFG_CONFIDENCE_GATE_FIXED;
     return cfg;
 }
 
@@ -2333,6 +2466,7 @@ LFG_API int32_t lfg_session_configure_confidence_monitor(
     // Free previous allocations
     free(session->confidence_slots);
     free(session->confidence_embd_pool);
+    free(session->confidence_text_buf);
 
     // One-time allocation of ring buffer + embedding pool
     session->confidence_slots     = (lfg_confidence_ring_slot *)calloc(cap, sizeof(lfg_confidence_ring_slot));
@@ -2354,7 +2488,16 @@ LFG_API int32_t lfg_session_configure_confidence_monitor(
     session->confidence_run_min_entropy = 1.0f;
     session->confidence_run_start_pos   = 0;
     session->confidence_include_reasoning = config->include_reasoning;
+    session->confidence_gate_mode    = config->gate_mode;
+    session->confidence_running_sum  = 0.0f;
+    session->confidence_running_count = 0;
     session->confidence_active       = true;
+
+    // Span text buffer (realloc'd on demand at pop time)
+    if (!session->confidence_text_buf) {
+        session->confidence_text_cap = 4096;
+        session->confidence_text_buf = (char *)malloc(session->confidence_text_cap);
+    }
 
     return n_embd;
 }
@@ -2378,6 +2521,35 @@ LFG_API bool lfg_session_confidence_pop(lfg_session * session,
             rs->embedding = slot_embd;
         } else {
             rs->event.n_embd = 0;
+        }
+    }
+
+    // Detokenize span text from token_history
+    int32_t span_n = rs->event.end_pos - rs->event.start_pos;
+    if (span_n > 0 && session->confidence_text_buf &&
+        rs->event.start_pos >= 0 &&
+        rs->event.end_pos <= (int32_t)session->token_history.size) {
+        const lfg_vocab *vocab = lfg_model_get_vocab(session->model);
+        lfg_token *span_tokens = session->token_history.data + rs->event.start_pos;
+
+        int32_t text_len = lfg_detokenize(vocab, span_tokens, span_n,
+                                           session->confidence_text_buf,
+                                           session->confidence_text_cap,
+                                           false, false);
+        if (text_len < 0) {
+            // Buffer too small — grow and retry
+            session->confidence_text_cap = -text_len + 1;
+            session->confidence_text_buf = (char *)realloc(
+                session->confidence_text_buf, session->confidence_text_cap);
+            text_len = lfg_detokenize(vocab, span_tokens, span_n,
+                                       session->confidence_text_buf,
+                                       session->confidence_text_cap,
+                                       false, false);
+        }
+        if (text_len >= 0) {
+            session->confidence_text_buf[text_len] = '\0';
+            rs->event.span_text = session->confidence_text_buf;
+            rs->event.span_text_len = text_len;
         }
     }
 
@@ -2416,6 +2588,7 @@ LFG_API volatile int32_t * lfg_session_confidence_counter(lfg_session * session)
 LFG_API lfg_surprise_monitor_config lfg_surprise_monitor_default_config(void) {
     lfg_surprise_monitor_config cfg{};
     cfg.threshold = 0.5f;
+    cfg.gate_mode = LFG_SURPRISE_GATE_FIXED;
     return cfg;
 }
 
@@ -2453,6 +2626,14 @@ LFG_API int32_t lfg_session_configure_surprise_monitor(
     session->surprise_popped       = false;
     session->surprise_include_reasoning = config->include_reasoning;
     session->surprise_skip_tokens  = 0;
+    session->surprise_gate_mode    = config->gate_mode;
+
+    // Pre-allocate scratch for AUTO two-pass
+    if (config->gate_mode == LFG_SURPRISE_GATE_AUTO && !session->surprise_per_token) {
+        session->surprise_per_token_cap = 512;
+        session->surprise_per_token = (float *)malloc(512 * sizeof(float));
+    }
+
     session->surprise_active       = true;
 
     return n_embd;
