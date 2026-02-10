@@ -144,14 +144,16 @@ type cSamplingConfig struct {
 
 // cSessionConfig mirrors lfg_session_config.
 type cSessionConfig struct {
-	NThreads                int32 // int
-	NCtx                    int32 // int
-	NBatch                  int32 // int
-	EnableHealing           byte  // bool
-	StructuredCheckpointing byte  // bool
+	NThreads                int32   // int
+	NCtx                    int32   // int
+	NBatch                  int32   // int
+	EnableHealing           byte    // bool
+	StructuredCheckpointing byte    // bool
 	_                       [2]byte // padding
 	ReasoningBudget         int32   // int
 	MaxTokens               int32   // int32_t
+	ToolScoreMode           int32   // lfg_tool_score_mode (enum)
+	ToolMinScore            float32 // float
 	Sampling                cSamplingConfig
 }
 
@@ -171,6 +173,7 @@ type cEntropyMonitorConfig struct {
 	Threshold      float32
 	CooldownTokens int32
 	RingSize       int32
+	GateMode       int32 // lfg_entropy_gate_mode
 }
 
 // cConfidenceEvent mirrors lfg_confidence_event.
@@ -181,6 +184,9 @@ type cConfidenceEvent struct {
 	StartPos    int32
 	EndPos      int32
 	NEmbd       int32
+	SpanText    uintptr // const char *
+	SpanTextLen int32
+	_           [4]byte // padding to 8-byte alignment
 }
 
 // cConfidenceMonitorConfig mirrors lfg_confidence_monitor_config.
@@ -190,6 +196,7 @@ type cConfidenceMonitorConfig struct {
 	RingSize         int32
 	IncludeReasoning byte // bool
 	_                [3]byte
+	GateMode         int32 // lfg_confidence_gate_mode
 }
 
 // cSurpriseEvent mirrors lfg_surprise_event.
@@ -206,6 +213,7 @@ type cSurpriseMonitorConfig struct {
 	Threshold        float32
 	IncludeReasoning byte // bool
 	_                [3]byte
+	GateMode         int32 // lfg_surprise_gate_mode
 }
 
 // cToolCall mirrors lfg_tool_call.

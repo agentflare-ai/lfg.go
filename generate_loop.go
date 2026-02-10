@@ -212,6 +212,7 @@ func initGenerateTrampolines() {
 				StartPos:    event.StartPos,
 				EndPos:      event.EndPos,
 				NEmbedding:  event.NEmbd,
+				SpanText:    goStringN(event.SpanText, int(event.SpanTextLen)),
 			}
 
 			var goEmbed []float32

@@ -179,3 +179,39 @@ type ToolFn func(arguments string) (string, error)
 // call is the parsed tool call, result is the function return value,
 // round is the current auto-execution round (0-indexed).
 type ToolCallCallback func(call ToolCall, result string, round int)
+
+// ToolScoreMode controls whether tool injection is gated by similarity score.
+type ToolScoreMode int
+
+const (
+	ToolScoreOff   ToolScoreMode = 0 // Always inject tools (default, backward compatible).
+	ToolScoreAuto  ToolScoreMode = 1 // Skip if top score doesn't exceed mean by threshold.
+	ToolScoreFixed ToolScoreMode = 2 // Skip if top score < threshold.
+)
+
+// EntropyGateMode controls the entropy monitor's gating behavior.
+type EntropyGateMode int
+
+const (
+	EntropyGateOff   EntropyGateMode = 0 // Disabled (no entropy events).
+	EntropyGateFixed EntropyGateMode = 1 // Fire when norm >= threshold (default).
+	EntropyGateAuto  EntropyGateMode = 2 // Fire when norm >= running_mean + threshold.
+)
+
+// ConfidenceGateMode controls the confidence monitor's gating behavior.
+type ConfidenceGateMode int
+
+const (
+	ConfidenceGateOff   ConfidenceGateMode = 0 // Disabled (no confidence events).
+	ConfidenceGateFixed ConfidenceGateMode = 1 // Confident when norm <= threshold (default).
+	ConfidenceGateAuto  ConfidenceGateMode = 2 // Confident when norm <= running_mean - threshold.
+)
+
+// SurpriseGateMode controls the surprise monitor's gating behavior.
+type SurpriseGateMode int
+
+const (
+	SurpriseGateOff   SurpriseGateMode = 0 // Disabled (no surprise events).
+	SurpriseGateFixed SurpriseGateMode = 1 // Token surprising when surprise >= threshold (default).
+	SurpriseGateAuto  SurpriseGateMode = 2 // Token surprising when surprise >= prompt_mean + threshold.
+)

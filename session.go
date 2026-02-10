@@ -35,8 +35,10 @@ type SessionConfig struct {
 	NBatch                  int
 	EnableHealing           bool
 	StructuredCheckpointing bool
-	ReasoningBudget         int   // 0 = disabled. Max tokens allowed for reasoning.
-	MaxTokens               int32 // 0 = unlimited. Max tokens to generate per reset cycle.
+	ReasoningBudget         int           // 0 = disabled. Max tokens allowed for reasoning.
+	MaxTokens               int32         // 0 = unlimited. Max tokens to generate per reset cycle.
+	ToolScoreMode           ToolScoreMode // Tool injection gating. 0 = OFF (always inject).
+	ToolMinScore            float32       // Threshold value. AUTO: gap above mean. FIXED: absolute minimum.
 	Sampling                SamplingConfig
 }
 
@@ -59,6 +61,8 @@ func DefaultSessionConfig() SessionConfig {
 		StructuredCheckpointing: c.StructuredCheckpointing != 0,
 		ReasoningBudget:         int(c.ReasoningBudget),
 		MaxTokens:               c.MaxTokens,
+		ToolScoreMode:           ToolScoreMode(c.ToolScoreMode),
+		ToolMinScore:            c.ToolMinScore,
 		Sampling:                samplingConfigFromC(c.Sampling),
 	}
 }
@@ -110,6 +114,8 @@ func (cfg *SessionConfig) toC() cSessionConfig {
 		StructuredCheckpointing: boolToByte(cfg.StructuredCheckpointing),
 		ReasoningBudget:         int32(cfg.ReasoningBudget),
 		MaxTokens:               cfg.MaxTokens,
+		ToolScoreMode:           int32(cfg.ToolScoreMode),
+		ToolMinScore:            cfg.ToolMinScore,
 		Sampling:                cfg.Sampling.toC(),
 	}
 }
@@ -166,6 +172,21 @@ func WithSessionReasoningBudget(n int) SessionOption {
 func WithSessionMaxTokens(n int32) SessionOption {
 	return func(cfg *SessionConfig) {
 		cfg.MaxTokens = n
+	}
+}
+
+// WithSessionToolScoreMode sets the tool injection gating mode.
+func WithSessionToolScoreMode(mode ToolScoreMode) SessionOption {
+	return func(cfg *SessionConfig) {
+		cfg.ToolScoreMode = mode
+	}
+}
+
+// WithSessionToolMinScore sets the tool score threshold.
+// For ToolScoreAuto: gap above mean. For ToolScoreFixed: absolute minimum.
+func WithSessionToolMinScore(score float32) SessionOption {
+	return func(cfg *SessionConfig) {
+		cfg.ToolMinScore = score
 	}
 }
 
@@ -728,9 +749,10 @@ type EntropyEvent struct {
 
 // EntropyMonitorConfig configures the entropy monitor.
 type EntropyMonitorConfig struct {
-	Threshold      float32 // Normalized entropy threshold (0,1]. 0 = disabled.
-	CooldownTokens int32   // Min tokens between events.
-	RingSize       int32   // Ring buffer slots. 0 = default (4).
+	Threshold      float32         // Normalized entropy threshold (0,1]. 0 = disabled.
+	CooldownTokens int32           // Min tokens between events.
+	RingSize       int32           // Ring buffer slots. 0 = default (4).
+	GateMode       EntropyGateMode // Gating mode. Off, Fixed (default), or Auto.
 }
 
 // DefaultEntropyMonitorConfig returns the default entropy monitor configuration.
@@ -741,6 +763,7 @@ func DefaultEntropyMonitorConfig() EntropyMonitorConfig {
 		Threshold:      c.Threshold,
 		CooldownTokens: c.CooldownTokens,
 		RingSize:       c.RingSize,
+		GateMode:       EntropyGateMode(c.GateMode),
 	}
 }
 
@@ -764,6 +787,7 @@ func (s *Session) ConfigureEntropyMonitor(config *EntropyMonitorConfig) (int32, 
 		Threshold:      config.Threshold,
 		CooldownTokens: config.CooldownTokens,
 		RingSize:       config.RingSize,
+		GateMode:       int32(config.GateMode),
 	}
 	nEmbd := _lfg_session_configure_entropy_monitor(s.c, uintptr(unsafe.Pointer(&cConfig)))
 	if nEmbd <= 0 {
@@ -889,14 +913,16 @@ type ConfidenceEvent struct {
 	StartPos    int32   // Token position at span start.
 	EndPos      int32   // Token position at span end.
 	NEmbedding  int32   // Embedding dimension (for embedding output sizing).
+	SpanText    string  // Detokenized span text. Empty if unavailable.
 }
 
 // ConfidenceMonitorConfig configures the confidence monitor.
 type ConfidenceMonitorConfig struct {
-	Threshold        float32 // Normalized entropy ceiling (0,1]. Tokens below this are "confident".
-	MinSpan          int32   // Min consecutive tokens to emit event. 0 = default (5).
-	RingSize         int32   // Ring buffer slots. 0 = default (4).
-	IncludeReasoning bool    // false (default) = skip reasoning tokens; true = include them.
+	Threshold        float32            // Normalized entropy ceiling (0,1]. Tokens below this are "confident".
+	MinSpan          int32              // Min consecutive tokens to emit event. 0 = default (5).
+	RingSize         int32              // Ring buffer slots. 0 = default (4).
+	IncludeReasoning bool               // false (default) = skip reasoning tokens; true = include them.
+	GateMode         ConfidenceGateMode // Gating mode. Off, Fixed (default), or Auto.
 }
 
 // DefaultConfidenceMonitorConfig returns the default confidence monitor configuration.
@@ -908,6 +934,7 @@ func DefaultConfidenceMonitorConfig() ConfidenceMonitorConfig {
 		MinSpan:          c.MinSpan,
 		RingSize:         c.RingSize,
 		IncludeReasoning: c.IncludeReasoning != 0,
+		GateMode:         ConfidenceGateMode(c.GateMode),
 	}
 }
 
@@ -932,6 +959,7 @@ func (s *Session) ConfigureConfidenceMonitor(config *ConfidenceMonitorConfig) (i
 		MinSpan:          config.MinSpan,
 		RingSize:         config.RingSize,
 		IncludeReasoning: boolToByte(config.IncludeReasoning),
+		GateMode:         int32(config.GateMode),
 	}
 	nEmbd := _lfg_session_configure_confidence_monitor(s.c, uintptr(unsafe.Pointer(&cConfig)))
 	if nEmbd <= 0 {
@@ -974,6 +1002,7 @@ func (s *Session) ConfidencePop(embeddingOut []float32) (ConfidenceEvent, bool) 
 		StartPos:    cEvent.StartPos,
 		EndPos:      cEvent.EndPos,
 		NEmbedding:  cEvent.NEmbd,
+		SpanText:    goStringN(cEvent.SpanText, int(cEvent.SpanTextLen)),
 	}, true
 }
 
@@ -1029,8 +1058,9 @@ type SurpriseEvent struct {
 
 // SurpriseMonitorConfig configures the surprise monitor.
 type SurpriseMonitorConfig struct {
-	Threshold        float32 // Normalized surprise floor (0,1]. Above = surprising.
-	IncludeReasoning bool    // false (default) = skip reasoning tokens; true = include them.
+	Threshold        float32          // Normalized surprise floor (0,1]. Above = surprising.
+	IncludeReasoning bool             // false (default) = skip reasoning tokens; true = include them.
+	GateMode         SurpriseGateMode // Gating mode. Off, Fixed (default), or Auto.
 }
 
 // DefaultSurpriseMonitorConfig returns the default surprise monitor configuration.
@@ -1040,6 +1070,7 @@ func DefaultSurpriseMonitorConfig() SurpriseMonitorConfig {
 	return SurpriseMonitorConfig{
 		Threshold:        c.Threshold,
 		IncludeReasoning: c.IncludeReasoning != 0,
+		GateMode:         SurpriseGateMode(c.GateMode),
 	}
 }
 
@@ -1062,6 +1093,7 @@ func (s *Session) ConfigureSurpriseMonitor(config *SurpriseMonitorConfig) (int32
 	cConfig := cSurpriseMonitorConfig{
 		Threshold:        config.Threshold,
 		IncludeReasoning: boolToByte(config.IncludeReasoning),
+		GateMode:         int32(config.GateMode),
 	}
 	nEmbd := _lfg_session_configure_surprise_monitor(s.c, uintptr(unsafe.Pointer(&cConfig)))
 	if nEmbd <= 0 {
