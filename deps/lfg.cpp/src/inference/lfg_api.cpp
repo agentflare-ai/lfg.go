@@ -2,12 +2,14 @@
 
 #include "json_schema_to_grammar.h"
 #include "lfg_impl.h"
+#include "peg-parser.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <spdlog/spdlog.h>
 
 // ---------------------------------------------------------------------------
@@ -168,9 +170,9 @@ struct lfg_session {
     // Tool ranking state (all buffers pre-allocated at register time)
     struct lfg_tool_entry {
         char    *name;                 // strdup'd
-        char    *xml_text;             // strdup'd pre-formatted XML
-        int32_t  xml_text_len;         // strlen of xml_text
-        int32_t  token_cost;           // token count of xml_text
+        char    *json_text;            // malloc'd pre-formatted JSON
+        int32_t  json_text_len;        // strlen of json_text
+        int32_t  token_cost;           // token count of json_text
         float   *embedding;           // malloc'd, L2-normalized, size = n_embd
     };
 
@@ -189,9 +191,9 @@ struct lfg_session {
     float           *tool_query_embd;     // malloc'd, size = n_embd
     int32_t         *tool_score_indices;  // malloc'd, size = tool_count (sorted by score)
     float           *tool_scores;         // malloc'd, size = tool_count
-    char            *tool_xml_buf;        // malloc'd, pre-computed full XML block
-    int32_t          tool_xml_buf_cap;
-    lfg_token       *tool_token_buf;      // malloc'd, for tokenized XML block
+    char            *tool_json_buf;        // malloc'd, pre-computed full JSON block
+    int32_t          tool_json_buf_cap;
+    lfg_token       *tool_token_buf;      // malloc'd, for tokenized tool block
     int32_t          tool_token_buf_cap;
 
     int32_t          tool_top_k;            // 0 = disabled
@@ -254,6 +256,27 @@ struct lfg_session {
     // Single embedding buffer (allocated at configure time)
     float               *surprise_embd;         // malloc'd, size = n_embd
     int32_t              surprise_n_embd;
+
+    // Last formatted prompt (captured by chat_generate / prompt_generate)
+    char                *last_formatted_prompt;      // malloc'd via strdup
+    int32_t              last_formatted_prompt_len;
+
+    // Structured tool call parsing (OpenAI-compatible)
+    lfg_tool_call       *parsed_tool_calls;          // malloc'd array
+    int32_t              parsed_tool_call_count;
+    int32_t              parsed_tool_call_cap;
+    char                *last_raw_output;             // detokenized with special=true
+    int32_t              last_raw_output_len;
+    int32_t              last_raw_output_cap;
+    char                *tool_call_text_buf;           // accumulator during generation
+    int32_t              tool_call_text_len;
+    int32_t              tool_call_text_cap;
+    bool                 in_tool_call;                 // flag for generate loop
+    lfg_token            tool_call_start_token;        // cached special token ID
+    lfg_token            tool_call_end_token;          // cached special token ID
+    bool                 tool_call_tokens_cached;
+    lfg_tool_call_format tool_call_format;             // default PYTHONIC (0)
+    int32_t              tool_call_id_counter;          // for generating unique call_N IDs
 };
 
 // ---------------------------------------------------------------------------
@@ -286,28 +309,57 @@ static uint64_t fnv1a_hash(const char *data, size_t len) {
     return hash;
 }
 
+// Append a JSON-escaped version of src to dst. Returns bytes written.
+static int32_t json_escape_append(char *dst, const char *src) {
+    int32_t w = 0;
+    for (const char *p = src; *p; ++p) {
+        switch (*p) {
+            case '"':  dst[w++] = '\\'; dst[w++] = '"';  break;
+            case '\\': dst[w++] = '\\'; dst[w++] = '\\'; break;
+            case '\n': dst[w++] = '\\'; dst[w++] = 'n';  break;
+            case '\r': dst[w++] = '\\'; dst[w++] = 'r';  break;
+            case '\t': dst[w++] = '\\'; dst[w++] = 't';  break;
+            default:   dst[w++] = *p; break;
+        }
+    }
+    return w;
+}
+
 // Returns malloc'd string. Caller must free.
-static char * tool_format_xml(const lfg_tool_desc *tool, int32_t *out_len) {
+static char * tool_format_json(const lfg_tool_desc *tool, int32_t *out_len) {
     const char *name = tool->name ? tool->name : "";
     const char *desc = tool->description ? tool->description : "";
-    const char *schema = tool->json_schema;
-    bool has_schema = schema && schema[0] != '\0';
+    const char *params = tool->parameters;
+    bool has_params = params && params[0] != '\0';
 
-    // Calculate required size
-    // <tool name="..." description="..."[ schema='...']/>
-    size_t len = 13 + std::strlen(name) + 15 + std::strlen(desc) + 1; // <tool name="..." description="..."
-    if (has_schema) len += 9 + std::strlen(schema) + 1;               //  schema='...'
-    len += 3; // />\n
+    // Worst-case size: every char in name/desc could double from escaping
+    size_t name_len = std::strlen(name);
+    size_t desc_len = std::strlen(desc);
+    size_t params_len = has_params ? std::strlen(params) : 0;
+    // {"name": "...", "description": "...", "parameters": ...}
+    size_t cap = 64 + name_len * 2 + desc_len * 2 + params_len + 1;
 
-    char *buf = (char *)malloc(len + 1);
-    int n;
-    if (has_schema) {
-        n = std::snprintf(buf, len + 1, "<tool name=\"%s\" description=\"%s\" schema='%s'/>\n",
-                          name, desc, schema);
-    } else {
-        n = std::snprintf(buf, len + 1, "<tool name=\"%s\" description=\"%s\"/>\n", name, desc);
+    char *buf = (char *)malloc(cap);
+    int32_t w = 0;
+
+    // {"name": "
+    std::memcpy(buf + w, "{\"name\": \"", 10); w += 10;
+    w += json_escape_append(buf + w, name);
+    // ", "description": "
+    std::memcpy(buf + w, "\", \"description\": \"", 19); w += 19;
+    w += json_escape_append(buf + w, desc);
+    buf[w++] = '"';
+
+    if (has_params) {
+        // , "parameters": <raw JSON>
+        std::memcpy(buf + w, ", \"parameters\": ", 16); w += 16;
+        std::memcpy(buf + w, params, params_len); w += (int32_t)params_len;
     }
-    if (out_len) *out_len = n;
+
+    buf[w++] = '}';
+    buf[w] = '\0';
+
+    if (out_len) *out_len = w;
     return buf;
 }
 
@@ -759,13 +811,13 @@ LFG_API lfg_sampling_config lfg_sampling_default_config(void) {
     lfg_sampling_config cfg{};
     cfg.seed = 0xFFFFFFFF;
     cfg.n_prev = 64;
-    cfg.top_k = 40;
-    cfg.top_p = 0.95f;
+    cfg.top_k = 50;
+    cfg.top_p = 0.1f;
     cfg.min_p = 0.05f;
     cfg.typ_p = 1.0f;
-    cfg.temp = 0.80f;
+    cfg.temp = 0.1f;
     cfg.penalty_last_n = 64;
-    cfg.penalty_repeat = 1.0f;
+    cfg.penalty_repeat = 1.05f;
     cfg.penalty_freq = 0.0f;
     cfg.penalty_present = 0.0f;
     cfg.mirostat = 0;
@@ -858,8 +910,8 @@ LFG_API lfg_session * lfg_session_create(lfg_model * model, const lfg_session_co
     s->tool_query_embd = nullptr;
     s->tool_score_indices = nullptr;
     s->tool_scores = nullptr;
-    s->tool_xml_buf = nullptr;
-    s->tool_xml_buf_cap = 0;
+    s->tool_json_buf = nullptr;
+    s->tool_json_buf_cap = 0;
     s->tool_token_buf = nullptr;
     s->tool_token_buf_cap = 0;
     s->tool_top_k = 0;
@@ -911,9 +963,36 @@ LFG_API lfg_session * lfg_session_create(lfg_model * model, const lfg_session_co
     s->surprise_embd = nullptr;
     s->surprise_n_embd = 0;
 
+    // Tool call parsing (pre-allocate buffers)
+    s->parsed_tool_calls = nullptr;
+    s->parsed_tool_call_count = 0;
+    s->parsed_tool_call_cap = 0;
+    s->last_raw_output = (char *)malloc(2048);
+    s->last_raw_output_len = 0;
+    s->last_raw_output_cap = 2048;
+    s->tool_call_text_buf = (char *)malloc(1024);
+    s->tool_call_text_len = 0;
+    s->tool_call_text_cap = 1024;
+    s->in_tool_call = false;
+    s->tool_call_start_token = LFG_TOKEN_NULL;
+    s->tool_call_end_token = LFG_TOKEN_NULL;
+    s->tool_call_tokens_cached = false;
+    s->tool_call_format = LFG_TOOL_CALL_FORMAT_PYTHONIC;
+    s->tool_call_id_counter = 0;
+
     session_rebuild_sampler(s);
 
     return s;
+}
+
+// Free strdup'd strings inside parsed_tool_calls and reset count.
+static void session_free_tool_calls(lfg_session * s) {
+    for (int32_t i = 0; i < s->parsed_tool_call_count; ++i) {
+        free((void *)s->parsed_tool_calls[i].id);
+        free((void *)s->parsed_tool_calls[i].name);
+        free((void *)s->parsed_tool_calls[i].arguments);
+    }
+    s->parsed_tool_call_count = 0;
 }
 
 LFG_API void lfg_session_free(lfg_session * session) {
@@ -963,6 +1042,15 @@ LFG_API void lfg_session_free(lfg_session * session) {
 
     // Surprise monitor
     free(session->surprise_embd);
+
+    // Last formatted prompt
+    free(session->last_formatted_prompt);
+
+    // Tool call parsing
+    session_free_tool_calls(session);
+    free(session->parsed_tool_calls);
+    free(session->last_raw_output);
+    free(session->tool_call_text_buf);
 
     free(session);
 }
@@ -1025,6 +1113,18 @@ LFG_API void lfg_session_reset(lfg_session * session) {
         session->surprise_popped = false;
         session->surprise_skip_tokens = 0;
     }
+
+    // Last formatted prompt
+    free(session->last_formatted_prompt);
+    session->last_formatted_prompt = nullptr;
+    session->last_formatted_prompt_len = 0;
+
+    // Tool call parsing reset
+    session_free_tool_calls(session);
+    session->last_raw_output_len = 0;
+    session->tool_call_text_len = 0;
+    session->in_tool_call = false;
+    session->tool_call_id_counter = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,9 +1367,9 @@ LFG_API bool lfg_session_ingest_tokens(lfg_session * session,
 }
 
 // Rank registered tools against a pre-computed query embedding and build the
-// <tools>...</tools> XML block into session->tool_xml_buf.
+// "List of tools: [...]" JSON block into session->tool_json_buf.
 // query_embd must be L2-normalized, length = session->tool_n_embd.
-// Returns the XML text length written, or 0 if no tools / ranking failed.
+// Returns the text length written, or 0 if no tools / ranking failed.
 static int32_t session_rank_and_format_tools(lfg_session *session, const float *query_embd) {
     if (!session || session->tool_count <= 0 || session->tool_top_k <= 0) return 0;
 
@@ -1304,60 +1404,34 @@ static int32_t session_rank_and_format_tools(lfg_session *session, const float *
                       session->tool_scores[idx]);
     }
 
-    // Build XML block with top_k tools into pre-allocated buffer
+    // Build "List of tools: [tool1, tool2, ...]" into pre-allocated buffer
     int32_t k = session->tool_top_k;
     if (k > session->tool_count) k = session->tool_count;
-    int32_t xml_len = 0;
+    int32_t len = 0;
 
-    const char *header = "<tools>\n";
-    const char *footer = "</tools>\n";
-    int32_t header_len = 8;
-    int32_t footer_len = 9;
-
-    std::memcpy(session->tool_xml_buf + xml_len, header, header_len);
-    xml_len += header_len;
+    const char *header = "List of tools: [";
+    int32_t header_len = 16;
+    std::memcpy(session->tool_json_buf + len, header, header_len);
+    len += header_len;
 
     for (int32_t i = 0; i < k; ++i) {
+        if (i > 0) { session->tool_json_buf[len++] = ','; session->tool_json_buf[len++] = ' '; }
         auto &tool = session->tool_entries[session->tool_score_indices[i]];
-        std::memcpy(session->tool_xml_buf + xml_len, tool.xml_text, tool.xml_text_len);
-        xml_len += tool.xml_text_len;
+        std::memcpy(session->tool_json_buf + len, tool.json_text, tool.json_text_len);
+        len += tool.json_text_len;
     }
 
-    std::memcpy(session->tool_xml_buf + xml_len, footer, footer_len);
-    xml_len += footer_len;
-    session->tool_xml_buf[xml_len] = '\0';
+    session->tool_json_buf[len++] = ']';
+    session->tool_json_buf[len++] = '\n';
+    session->tool_json_buf[len] = '\0';
 
-    LFG_LOG_DEBUG("tool_inject: top_k=%d xml_len=%d", k, xml_len);
+    LFG_LOG_DEBUG("tool_inject: top_k=%d len=%d", k, len);
 
-    return xml_len;
+    return len;
 }
 
 LFG_API bool lfg_session_decode(lfg_session * session) {
     if (!session) return false;
-
-    // Tool ranking and injection for low-level API users (ingest + decode + sample).
-    // For chat_generate / prompt_generate, tools are already injected into the
-    // prompt text before tokenization, so tools_injected is already true.
-    if (session->tool_count > 0 && !session->tools_injected && session->tool_top_k > 0) {
-        bool got_query_embd = compute_query_embedding(session, session->tool_query_embd);
-
-        if (got_query_embd) {
-            int32_t xml_len = session_rank_and_format_tools(session, session->tool_query_embd);
-
-            if (xml_len > 0) {
-                const lfg_vocab *vocab = lfg_model_get_vocab(session->model);
-                int32_t n_tok = lfg_tokenize(vocab, session->tool_xml_buf, xml_len,
-                                             session->tool_token_buf, session->tool_token_buf_cap,
-                                             false, false);
-                if (n_tok > 0) {
-                    lfg_session_ingest_tokens(session, session->tool_token_buf, n_tok, false);
-                }
-            }
-        }
-
-        session->tools_injected = true;
-    }
-
     return true;
 }
 
@@ -1827,7 +1901,7 @@ LFG_API void lfg_checkpoint_free(lfg_checkpoint * checkpoint) {
 static void session_free_tool_entries(lfg_session *s) {
     for (int32_t i = 0; i < s->tool_count; ++i) {
         free(s->tool_entries[i].name);
-        free(s->tool_entries[i].xml_text);
+        free(s->tool_entries[i].json_text);  // malloc'd by tool_format_json()
         free(s->tool_entries[i].embedding);
     }
     free(s->tool_entries);
@@ -1895,25 +1969,25 @@ LFG_API int32_t lfg_session_register_tools(lfg_session * session,
         int32_t tok_scratch_cap = 512;
         lfg_token *tok_scratch = (lfg_token *)malloc(tok_scratch_cap * sizeof(lfg_token));
 
-        // Total XML size for pre-allocating decode-time buffer
-        int32_t total_xml_bytes = 0;
+        // Total JSON size for pre-allocating decode-time buffer
+        int32_t total_json_bytes = 0;
 
         for (int32_t i = 0; i < n_tools; ++i) {
             auto &entry = session->tool_entries[i];
-            int32_t xml_len = 0;
-            entry.xml_text = tool_format_xml(&tools[i], &xml_len);
-            entry.xml_text_len = xml_len;
+            int32_t json_len = 0;
+            entry.json_text = tool_format_json(&tools[i], &json_len);
+            entry.json_text_len = json_len;
             entry.name = strdup(tools[i].name ? tools[i].name : "");
-            total_xml_bytes += xml_len;
+            total_json_bytes += json_len;
 
-            uint64_t hash = fnv1a_hash(entry.xml_text, xml_len);
+            uint64_t hash = fnv1a_hash(entry.json_text, json_len);
 
             // Token cost
-            if (xml_len + 16 > tok_scratch_cap) {
-                tok_scratch_cap = xml_len + 16;
+            if (json_len + 16 > tok_scratch_cap) {
+                tok_scratch_cap = json_len + 16;
                 tok_scratch = (lfg_token *)realloc(tok_scratch, tok_scratch_cap * sizeof(lfg_token));
             }
-            int32_t n_tok = lfg_tokenize(vocab, entry.xml_text, xml_len,
+            int32_t n_tok = lfg_tokenize(vocab, entry.json_text, json_len,
                                          tok_scratch, tok_scratch_cap, false, false);
             entry.token_cost = (n_tok > 0) ? n_tok : 0;
 
@@ -1926,11 +2000,11 @@ LFG_API int32_t lfg_session_register_tools(lfg_session * session,
                 // Compute embedding via tool_ctx
                 lfg_memory_clear(lfg_get_memory(session->tool_ctx), true);
 
-                if (xml_len + 16 > tok_scratch_cap) {
-                    tok_scratch_cap = xml_len + 16;
+                if (json_len + 16 > tok_scratch_cap) {
+                    tok_scratch_cap = json_len + 16;
                     tok_scratch = (lfg_token *)realloc(tok_scratch, tok_scratch_cap * sizeof(lfg_token));
                 }
-                int32_t n_emb_tok = lfg_tokenize(vocab, entry.xml_text, xml_len,
+                int32_t n_emb_tok = lfg_tokenize(vocab, entry.json_text, json_len,
                                                   tok_scratch, tok_scratch_cap, true, false);
 
                 entry.embedding = (float *)calloc(n_embd, sizeof(float));
@@ -1958,13 +2032,13 @@ LFG_API int32_t lfg_session_register_tools(lfg_session * session,
         free(tok_scratch);
 
         // Pre-allocate decode-time scratch buffers
-        // XML buffer: <tools>\n + all tool XML + </tools>\n + NUL
-        int32_t xml_buf_cap = total_xml_bytes + 32;
-        session->tool_xml_buf = (char *)realloc(session->tool_xml_buf, xml_buf_cap);
-        session->tool_xml_buf_cap = xml_buf_cap;
+        // JSON buffer: "List of tools: [" + all tool JSON + "]\n" + NUL
+        int32_t json_buf_cap = total_json_bytes + 64;  // extra for header, commas, brackets
+        session->tool_json_buf = (char *)realloc(session->tool_json_buf, json_buf_cap);
+        session->tool_json_buf_cap = json_buf_cap;
 
-        // Token buffer: worst case ~ xml_buf_cap tokens (1 byte = 1 token)
-        int32_t token_buf_cap = xml_buf_cap + 32;
+        // Token buffer: worst case ~ json_buf_cap tokens (1 byte = 1 token)
+        int32_t token_buf_cap = json_buf_cap + 32;
         session->tool_token_buf = (lfg_token *)realloc(session->tool_token_buf, token_buf_cap * sizeof(lfg_token));
         session->tool_token_buf_cap = token_buf_cap;
 
@@ -2002,11 +2076,37 @@ LFG_API void lfg_session_clear_tools(lfg_session * session) {
     free(session->tool_query_embd);    session->tool_query_embd = nullptr;
     free(session->tool_score_indices); session->tool_score_indices = nullptr;
     free(session->tool_scores);        session->tool_scores = nullptr;
-    free(session->tool_xml_buf);       session->tool_xml_buf = nullptr;
-    session->tool_xml_buf_cap = 0;
+    free(session->tool_json_buf);       session->tool_json_buf = nullptr;
+    session->tool_json_buf_cap = 0;
     free(session->tool_token_buf);     session->tool_token_buf = nullptr;
     session->tool_token_buf_cap = 0;
     session->tool_n_embd = 0;
+}
+
+LFG_API int32_t lfg_session_rank_tools(lfg_session * session,
+                                       const char * query, int32_t query_len,
+                                       char * buf, int32_t buf_size) {
+    if (!session || !query || query_len <= 0) return -1;
+    if (session->tool_count <= 0 || session->tool_top_k <= 0) return -1;
+
+    // Compute query embedding via the public embed API
+    int32_t n_embd = session->tool_n_embd;
+    int32_t got = lfg_session_embed(session, query, query_len,
+                                     session->tool_query_embd, n_embd);
+    if (got <= 0) return -1;
+
+    // Rank and format into session->tool_json_buf
+    int32_t tools_len = session_rank_and_format_tools(session, session->tool_query_embd);
+    if (tools_len <= 0) return -1;
+
+    // Return required size if buf is NULL or buf_size is 0
+    if (!buf || buf_size <= 0) return tools_len;
+
+    // Copy to user buffer (truncate if needed)
+    int32_t copy_len = tools_len < buf_size ? tools_len : buf_size - 1;
+    std::memcpy(buf, session->tool_json_buf, copy_len);
+    buf[copy_len] = '\0';
+    return copy_len;
 }
 
 // ---------------------------------------------------------------------------
@@ -2443,12 +2543,408 @@ LFG_API int32_t lfg_session_embed(lfg_session * session,
 }
 
 // ---------------------------------------------------------------------------
+// Pythonic Tool Call Parser (PEG combinator-based)
+// ---------------------------------------------------------------------------
+// Parses: [func_name(key1=val1, key2=val2, ...)]
+// Output: JSON arguments string {"key1": val1, "key2": val2, ...}
+// Values: "str", 'str', 123, -3.14, True, False, None, {...}, [...]
+
+// AST tag names for semantic extraction
+static const char * TAG_TOOL_CALL = "tool_call";
+static const char * TAG_TOOL_NAME = "tool_name";
+static const char * TAG_ARG       = "arg";
+static const char * TAG_ARG_NAME  = "arg_name";
+static const char * TAG_ARG_VALUE = "arg_value";
+
+// Build the PEG grammar for Pythonic tool calls (cached as static).
+static const common_peg_arena & get_pythonic_grammar() {
+    static common_peg_arena arena = build_peg_parser([](common_peg_parser_builder & b) {
+        auto ws = b.space();
+
+        // Identifier: [a-zA-Z_][a-zA-Z0-9_]*
+        auto ident = b.sequence({
+            b.chars("[a-zA-Z_]", 1, 1),
+            b.chars("[a-zA-Z0-9_]", 0, -1)
+        });
+
+        // Single-quoted string: everything between ' delimiters (handles \' escapes)
+        // We match the content character-by-character: either \<any> or non-quote
+        auto sq_escape = b.sequence({b.literal("\\"), b.any()});
+        auto sq_char = b.choice({sq_escape, b.chars("[^']", 1, 1)});
+        auto sq_string = b.sequence({
+            b.literal("'"),
+            b.zero_or_more(sq_char),
+            b.literal("'")
+        });
+
+        // Double-quoted string: same pattern with "
+        auto dq_escape = b.sequence({b.literal("\\"), b.any()});
+        auto dq_char = b.choice({dq_escape, b.chars("[^\"]", 1, 1)});
+        auto dq_string = b.sequence({
+            b.literal("\""),
+            b.zero_or_more(dq_char),
+            b.literal("\"")
+        });
+
+        auto py_string = b.choice({sq_string, dq_string});
+
+        // Number: optional minus, digits, optional .digits, optional exponent
+        auto digits = b.chars("[0-9]", 1, -1);
+        auto opt_sign = b.optional(b.chars("[+-]", 1, 1));
+        auto frac = b.sequence({b.literal("."), digits});
+        auto exp = b.sequence({
+            b.chars("[eE]", 1, 1), opt_sign, digits
+        });
+        auto number = b.sequence({
+            b.optional(b.literal("-")),
+            digits,
+            b.optional(frac),
+            b.optional(exp)
+        });
+
+        // Python keywords
+        auto py_true  = b.literal("True");
+        auto py_false = b.literal("False");
+        auto py_none  = b.literal("None");
+
+        // Nested JSON value (object/array) — use the built-in JSON parser
+        auto json_obj = b.json_object();
+        auto json_arr = b.json_array();
+
+        // Value: string | number | keyword | nested JSON
+        auto py_value = b.tag(TAG_ARG_VALUE, b.choice({
+            py_string, number, py_true, py_false, py_none, json_obj, json_arr
+        }));
+
+        // Argument: name = value
+        auto arg = b.tag(TAG_ARG, b.sequence({
+            b.tag(TAG_ARG_NAME, ident), ws, b.literal("="), ws, py_value
+        }));
+
+        // Argument list: arg (, arg)*
+        auto arg_list = b.sequence({
+            arg,
+            b.zero_or_more(b.sequence({ws, b.literal(","), ws, arg})),
+            b.optional(b.sequence({ws, b.literal(",")}))  // trailing comma
+        });
+
+        // Single tool call: [name(args)]
+        auto tool_call = b.tag(TAG_TOOL_CALL, b.sequence({
+            b.literal("["),
+            ws,
+            b.tag(TAG_TOOL_NAME, ident),
+            ws,
+            b.literal("("),
+            ws,
+            b.optional(arg_list),
+            ws,
+            b.literal(")"),
+            ws,
+            b.literal("]")
+        }));
+
+        // Top-level: whitespace-separated tool calls
+        return b.zero_or_more(b.sequence({ws, tool_call, ws}));
+    });
+    return arena;
+}
+
+// Convert a Pythonic argument value (extracted text) to a JSON value string.
+// Handles: 'str' → "str", "str" → "str", True → true, False → false, None → null,
+// numbers pass through, nested JSON passes through.
+static std::string pythonic_value_to_json(std::string_view text) {
+    if (text.empty()) return "null";
+
+    // Python keywords
+    if (text == "True")  return "true";
+    if (text == "False") return "false";
+    if (text == "None")  return "null";
+
+    // Quoted strings — convert to JSON double-quoted string
+    if ((text.front() == '\'' || text.front() == '"') && text.size() >= 2) {
+        char quote = text.front();
+        std::string_view content = text.substr(1, text.size() - 2);
+
+        std::string result = "\"";
+        for (size_t i = 0; i < content.size(); i++) {
+            char c = content[i];
+            if (c == '\\' && i + 1 < content.size()) {
+                char esc = content[i + 1];
+                if (esc == quote) {
+                    // Escaped delimiter: \' or \"
+                    if (quote == '"') {
+                        result += "\\\"";
+                    } else {
+                        result += '\'';
+                    }
+                    i++;
+                    continue;
+                }
+                // Pass through other escape sequences
+                result += c;
+                result += esc;
+                i++;
+                continue;
+            }
+            // Unescaped double-quote inside single-quoted string needs JSON escaping
+            if (quote == '\'' && c == '"') {
+                result += "\\\"";
+                continue;
+            }
+            result += c;
+        }
+        result += '"';
+        return result;
+    }
+
+    // Numbers, nested JSON objects/arrays — pass through as-is
+    return std::string(text);
+}
+
+// Public API: parse Pythonic tool calls from text using PEG grammar.
+// Input: text like "[func(key='val')]" — may contain multiple calls separated by whitespace.
+// Fills `out` array (up to `out_cap` entries). Each entry's id, name, arguments are strdup'd;
+// caller must free them with free().
+// Returns the number of tool calls parsed.
+int32_t lfg_parse_pythonic_tool_calls(const char *text, int32_t text_len,
+                                       lfg_tool_call *out, int32_t out_cap) {
+    if (!text || text_len <= 0 || !out || out_cap <= 0) return 0;
+
+    const auto & grammar = get_pythonic_grammar();
+    common_peg_parse_context ctx(std::string(text, text_len));
+
+    auto result = grammar.parse(ctx, 0);
+    if (result.fail() || result.nodes.empty()) return 0;
+
+    int32_t count = 0;
+
+    // Walk AST: find TOOL_CALL tags, extract TOOL_NAME and ARGs within each
+    for (auto node_id : result.nodes) {
+        if (count >= out_cap) break;
+
+        const auto & node = ctx.ast.get(node_id);
+        if (node.tag != TAG_TOOL_CALL) continue;
+
+        std::string name;
+        std::string args = "{";
+        bool first_arg = true;
+
+        // Walk children of this tool_call node
+        for (auto child_id : node.children) {
+            const auto & child = ctx.ast.get(child_id);
+
+            if (child.tag == TAG_TOOL_NAME) {
+                name = std::string(child.text);
+            } else if (child.tag == TAG_ARG) {
+                // Each arg has ARG_NAME and ARG_VALUE children
+                std::string arg_name;
+                std::string arg_value;
+
+                for (auto arg_child_id : child.children) {
+                    const auto & arg_child = ctx.ast.get(arg_child_id);
+                    if (arg_child.tag == TAG_ARG_NAME) {
+                        arg_name = std::string(arg_child.text);
+                    } else if (arg_child.tag == TAG_ARG_VALUE) {
+                        arg_value = pythonic_value_to_json(arg_child.text);
+                    }
+                }
+
+                if (!arg_name.empty()) {
+                    if (!first_arg) args += ", ";
+                    first_arg = false;
+                    args += "\"";
+                    args += arg_name;
+                    args += "\": ";
+                    args += arg_value;
+                }
+            }
+        }
+
+        args += '}';
+
+        if (!name.empty()) {
+            out[count].id = nullptr;
+            out[count].name = strdup(name.c_str());
+            out[count].arguments = strdup(args.c_str());
+            count++;
+        }
+    }
+
+    return count;
+}
+
+// Parse tool calls from raw output text. Finds <|tool_call_start|>...<|tool_call_end|>
+// regions and parses the Pythonic content inside each one. Returns the number of
+// tool calls parsed and stored on the session.
+static int32_t parse_tool_calls_from_raw_output(lfg_session * session,
+                                                 const char * raw, int32_t raw_len) {
+    static const char TC_START[] = "<|tool_call_start|>";
+    static const char TC_END[]   = "<|tool_call_end|>";
+    static const int TC_START_LEN = sizeof(TC_START) - 1;
+    static const int TC_END_LEN   = sizeof(TC_END) - 1;
+
+    if (!raw || raw_len <= 0) return 0;
+
+    std::string raw_str(raw, raw_len);
+    int32_t total_calls = 0;
+
+    size_t search_pos = 0;
+    while (search_pos < raw_str.size()) {
+        size_t start_pos = raw_str.find(TC_START, search_pos);
+        if (start_pos == std::string::npos) break;
+
+        size_t content_start = start_pos + TC_START_LEN;
+        size_t end_pos = raw_str.find(TC_END, content_start);
+        if (end_pos == std::string::npos) {
+            end_pos = raw_str.size();
+        }
+
+        int32_t content_len = (int32_t)(end_pos - content_start);
+
+        // Temporary buffer for parsing — max 16 tool calls per region
+        lfg_tool_call tmp[16];
+        int32_t n = lfg_parse_pythonic_tool_calls(
+            raw_str.c_str() + content_start, content_len, tmp, 16);
+
+        for (int32_t i = 0; i < n; i++) {
+            // Ensure capacity on session
+            if (session->parsed_tool_call_count >= session->parsed_tool_call_cap) {
+                int32_t new_cap = session->parsed_tool_call_cap > 0
+                    ? session->parsed_tool_call_cap * 2 : 4;
+                session->parsed_tool_calls = (lfg_tool_call *)realloc(
+                    session->parsed_tool_calls, new_cap * sizeof(lfg_tool_call));
+                session->parsed_tool_call_cap = new_cap;
+            }
+
+            lfg_tool_call *slot = &session->parsed_tool_calls[session->parsed_tool_call_count];
+
+            // Generate unique ID
+            char id_buf[32];
+            std::snprintf(id_buf, sizeof(id_buf), "call_%d", session->tool_call_id_counter++);
+            slot->id = strdup(id_buf);
+            slot->name = tmp[i].name;        // transfer ownership
+            slot->arguments = tmp[i].arguments;  // transfer ownership
+
+            session->parsed_tool_call_count++;
+            total_calls++;
+        }
+
+        search_pos = (end_pos < raw_str.size()) ? end_pos + TC_END_LEN : raw_str.size();
+    }
+
+    return total_calls;
+}
+
+// Convert JSON arguments to Pythonic format for history reconstruction.
+// {"location":"SF","units":"celsius"} → location="SF", units="celsius"
+// Returns malloc'd string, or NULL on error. Caller must free.
+static char * json_args_to_pythonic(const char * json_args) {
+    if (!json_args || json_args[0] != '{') return nullptr;
+
+    std::string result;
+    std::string input(json_args);
+
+    // Simple state-machine JSON object parser for flat key-value pairs
+    size_t pos = 1;  // skip '{'
+    bool first = true;
+
+    while (pos < input.size()) {
+        // Skip whitespace
+        while (pos < input.size() && (input[pos] == ' ' || input[pos] == '\t' || input[pos] == '\n')) pos++;
+        if (pos >= input.size() || input[pos] == '}') break;
+
+        // Expect key string
+        if (input[pos] != '"') break;
+        size_t key_start = pos + 1;
+        size_t key_end = input.find('"', key_start);
+        if (key_end == std::string::npos) break;
+        std::string key = input.substr(key_start, key_end - key_start);
+        pos = key_end + 1;
+
+        // Skip ':'
+        while (pos < input.size() && (input[pos] == ' ' || input[pos] == ':')) pos++;
+
+        if (!first) result += ", ";
+        first = false;
+        result += key + "=";
+
+        // Parse value
+        if (pos >= input.size()) break;
+
+        if (input[pos] == '"') {
+            // String value
+            size_t val_start = pos + 1;
+            size_t val_end = val_start;
+            while (val_end < input.size()) {
+                if (input[val_end] == '\\' && val_end + 1 < input.size()) {
+                    val_end += 2;
+                    continue;
+                }
+                if (input[val_end] == '"') break;
+                val_end++;
+            }
+            result += "\"" + input.substr(val_start, val_end - val_start) + "\"";
+            pos = val_end + 1;
+        } else if (input.compare(pos, 4, "true") == 0) {
+            result += "True";
+            pos += 4;
+        } else if (input.compare(pos, 5, "false") == 0) {
+            result += "False";
+            pos += 5;
+        } else if (input.compare(pos, 4, "null") == 0) {
+            result += "None";
+            pos += 4;
+        } else if (input[pos] == '{' || input[pos] == '[') {
+            // Nested object/array — find matching close bracket
+            char open = input[pos], close = (open == '{') ? '}' : ']';
+            int depth = 1;
+            size_t nest_start = pos;
+            pos++;
+            while (pos < input.size() && depth > 0) {
+                if (input[pos] == '"') {
+                    pos++;
+                    while (pos < input.size() && input[pos] != '"') {
+                        if (input[pos] == '\\') pos++;
+                        pos++;
+                    }
+                }
+                else if (input[pos] == open) depth++;
+                else if (input[pos] == close) depth--;
+                pos++;
+            }
+            result += input.substr(nest_start, pos - nest_start);
+        } else {
+            // Number — read until comma, '}', or whitespace
+            size_t val_start = pos;
+            while (pos < input.size() && input[pos] != ',' && input[pos] != '}'
+                   && input[pos] != ' ' && input[pos] != '\n') pos++;
+            result += input.substr(val_start, pos - val_start);
+        }
+
+        // Skip comma
+        while (pos < input.size() && (input[pos] == ' ' || input[pos] == ',')) pos++;
+    }
+
+    return strdup(result.c_str());
+}
+
+// Ensure raw output buffer has enough capacity.
+static void session_ensure_raw_output_cap(lfg_session * s, int32_t needed) {
+    if (needed <= s->last_raw_output_cap) return;
+    int32_t cap = s->last_raw_output_cap;
+    while (cap < needed) cap *= 2;
+    s->last_raw_output = (char *)realloc(s->last_raw_output, cap);
+    s->last_raw_output_cap = cap;
+}
+
+// ---------------------------------------------------------------------------
 // Generate Loop API
 // ---------------------------------------------------------------------------
 
 LFG_API lfg_generate_config lfg_generate_default_config(void) {
     lfg_generate_config cfg{};
     cfg.max_tokens = 0;
+    cfg.include_history_reasoning = false;
     cfg.token_cb = nullptr;
     cfg.token_cb_data = nullptr;
     cfg.entropy_cb = nullptr;
@@ -2473,6 +2969,23 @@ LFG_API lfg_generate_result lfg_session_generate(
 
     char piece_buf[256];
     bool stopped = false;
+
+    // Clear previous tool call state
+    session_free_tool_calls(session);
+    session->last_raw_output_len = 0;
+    session->tool_call_text_len = 0;
+    session->in_tool_call = false;
+
+    // Lazy-cache tool call start/end token IDs (always — model can emit tool
+    // calls even without registered tools, e.g. via chat template)
+    if (!session->tool_call_tokens_cached) {
+        lfg_token toks[4];
+        int32_t n = lfg_tokenize(vocab, "<|tool_call_start|>", 19, toks, 4, false, true);
+        session->tool_call_start_token = (n == 1) ? toks[0] : LFG_TOKEN_NULL;
+        n = lfg_tokenize(vocab, "<|tool_call_end|>", 17, toks, 4, false, true);
+        session->tool_call_end_token = (n == 1) ? toks[0] : LFG_TOKEN_NULL;
+        session->tool_call_tokens_cached = true;
+    }
 
     // Pre-allocate embedding buffer for entropy callbacks (zero-alloc in hot path)
     float *embd_buf = nullptr;
@@ -2536,14 +3049,67 @@ LFG_API lfg_generate_result lfg_session_generate(
         lfg_session_decode(session);
         lfg_token tok = lfg_session_sample(session);
 
+        // Accumulate raw output (with special tokens) for tool call parsing
+        {
+            char raw_piece[256];
+            int32_t rn = lfg_token_to_piece(vocab, tok, raw_piece, sizeof(raw_piece), 0, true);
+            if (rn > 0) {
+                session_ensure_raw_output_cap(session, session->last_raw_output_len + rn + 1);
+                std::memcpy(session->last_raw_output + session->last_raw_output_len, raw_piece, rn);
+                session->last_raw_output_len += rn;
+                session->last_raw_output[session->last_raw_output_len] = '\0';
+            }
+        }
+
+        // Detect <|tool_call_start|> token — enter tool call accumulation mode
+        if (session->tool_call_start_token != LFG_TOKEN_NULL &&
+            tok == session->tool_call_start_token) {
+            session->in_tool_call = true;
+            session->tool_call_text_len = 0;
+        }
+
+        // Detect <|tool_call_end|> token — stop generation with TOOL_CALL reason.
+        // This is needed because special tokens don't appear in the text-based
+        // stop string matching (lfg_token_to_piece with special=false).
+        if (session->tool_call_end_token != LFG_TOKEN_NULL &&
+            tok == session->tool_call_end_token) {
+            result.stop_reason = LFG_STOP_TOOL_CALL;
+            stopped = true;
+            break;
+        }
+
         if (lfg_vocab_is_eog(vocab, tok)) {
             // Flush buffered tokens, discarding stop sequence prefix tokens
             if (stop_buf_count > 0) {
                 int32_t discard = (session->last_stop_len > 1)
                     ? (session->last_stop_len - 1) : 0;
+
+                // Text-level: suppress trailing tokens whose text forms a
+                // prefix of any stop string (e.g. "<|" before EOS when the
+                // stop string is "<|im_end|>").
+                if (session->stop_text_count > 0 && discard == 0) {
+                    // Build suffix text from buffer tail inward
+                    char tail_buf[1024];
+                    int32_t tail_len = 0;
+                    for (int32_t j = 0; j < stop_buf_count && tail_len < (int32_t)sizeof(tail_buf) - 256; j++) {
+                        std::memcpy(tail_buf + tail_len, stop_buf[j].piece, stop_buf[j].piece_len);
+                        tail_len += stop_buf[j].piece_len;
+                    }
+                    tail_buf[tail_len] = '\0';
+
+                    // Check if any stop string starts with the buffered text
+                    for (int32_t s = 0; s < session->stop_text_count; s++) {
+                        if (tail_len > 0 && tail_len <= session->stop_text_lens[s] &&
+                            std::strncmp(tail_buf, session->stop_texts[s], tail_len) == 0) {
+                            discard = stop_buf_count;
+                            break;
+                        }
+                    }
+                }
+
                 int32_t flush_n = stop_buf_count - discard;
                 if (flush_n < 0) flush_n = 0;
-                for (int32_t j = 0; j < flush_n; j++) {
+                for (int32_t j = 0; j < flush_n && !session->in_tool_call; j++) {
                     lfg_generate_action action = config.token_cb(
                         stop_buf[j].token, stop_buf[j].piece,
                         stop_buf[j].piece_len, config.token_cb_data);
@@ -2658,31 +3224,40 @@ LFG_API lfg_generate_result lfg_session_generate(
                         }
                     }
 
-                    // Flush safe whole tokens
+                    // Flush safe whole tokens (suppress during tool call)
                     for (int32_t j = 0; j < flush_n && !stopped; j++) {
-                        lfg_generate_action action = config.token_cb(
-                            stop_buf[j].token, stop_buf[j].piece,
-                            stop_buf[j].piece_len, config.token_cb_data);
-                        if (action == LFG_GENERATE_STOP) {
-                            result.stop_reason = LFG_STOP_CALLBACK;
-                            stopped = true;
+                        if (!session->in_tool_call) {
+                            lfg_generate_action action = config.token_cb(
+                                stop_buf[j].token, stop_buf[j].piece,
+                                stop_buf[j].piece_len, config.token_cb_data);
+                            if (action == LFG_GENERATE_STOP) {
+                                result.stop_reason = LFG_STOP_CALLBACK;
+                                stopped = true;
+                            }
                         }
                     }
 
                     // Emit safe prefix of partially-matched boundary token
                     if (!stopped && flush_n < stop_buf_count && chars_so_far < emit_chars) {
                         int32_t safe_chars = emit_chars - chars_so_far;
-                        lfg_generate_action action = config.token_cb(
-                            stop_buf[flush_n].token,
-                            stop_buf[flush_n].piece,
-                            safe_chars, config.token_cb_data);
-                        if (action == LFG_GENERATE_STOP) {
-                            result.stop_reason = LFG_STOP_CALLBACK;
-                            stopped = true;
+                        if (!session->in_tool_call) {
+                            lfg_generate_action action = config.token_cb(
+                                stop_buf[flush_n].token,
+                                stop_buf[flush_n].piece,
+                                safe_chars, config.token_cb_data);
+                            if (action == LFG_GENERATE_STOP) {
+                                result.stop_reason = LFG_STOP_CALLBACK;
+                                stopped = true;
+                            }
                         }
                     }
 
-                    if (!stopped) result.stop_reason = LFG_STOP_EOS;
+                    if (!stopped) {
+                        if (std::strcmp(session->stop_texts[s], "<|tool_call_end|>") == 0)
+                            result.stop_reason = LFG_STOP_TOOL_CALL;
+                        else
+                            result.stop_reason = LFG_STOP_EOS;
+                    }
                     stopped = true;
                     stop_buf_count = 0;
                     break;
@@ -2692,13 +3267,15 @@ LFG_API lfg_generate_result lfg_session_generate(
 
             // If buffer exceeds capacity, emit oldest token (confirmed safe)
             while (stop_buf_count > stop_buf_cap) {
-                lfg_generate_action action = config.token_cb(
-                    stop_buf[0].token, stop_buf[0].piece,
-                    stop_buf[0].piece_len, config.token_cb_data);
-                if (action == LFG_GENERATE_STOP) {
-                    result.stop_reason = LFG_STOP_CALLBACK;
-                    stopped = true;
-                    break;
+                if (!session->in_tool_call) {
+                    lfg_generate_action action = config.token_cb(
+                        stop_buf[0].token, stop_buf[0].piece,
+                        stop_buf[0].piece_len, config.token_cb_data);
+                    if (action == LFG_GENERATE_STOP) {
+                        result.stop_reason = LFG_STOP_CALLBACK;
+                        stopped = true;
+                        break;
+                    }
                 }
                 if (stop_buf_count > 1) {
                     std::memmove(stop_buf, stop_buf + 1,
@@ -2707,8 +3284,8 @@ LFG_API lfg_generate_result lfg_session_generate(
                 stop_buf_count--;
             }
             if (stopped) break;
-        } else if (config.token_cb) {
-            // No buffering needed — emit directly
+        } else if (config.token_cb && !session->in_tool_call) {
+            // No buffering needed — emit directly (suppress during tool call)
             int32_t n = lfg_token_to_piece(vocab, tok, piece_buf, sizeof(piece_buf), 0, false);
             if (n < 0) n = 0;
             lfg_generate_action action = config.token_cb(tok, piece_buf, n, config.token_cb_data);
@@ -2723,7 +3300,7 @@ LFG_API lfg_generate_result lfg_session_generate(
     }
 
     // Flush remaining buffered tokens on non-EOS stop (max_tokens)
-    if (stop_buf_count > 0 && !stopped) {
+    if (stop_buf_count > 0 && !stopped && !session->in_tool_call) {
         for (int32_t j = 0; j < stop_buf_count; j++) {
             lfg_generate_action action = config.token_cb(
                 stop_buf[j].token, stop_buf[j].piece,
@@ -2738,6 +3315,12 @@ LFG_API lfg_generate_result lfg_session_generate(
 
     if (!stopped) {
         result.stop_reason = LFG_STOP_MAX_TOKENS;
+    }
+
+    // Parse tool calls from raw output when generation stopped on tool_call_end
+    if (result.stop_reason == LFG_STOP_TOOL_CALL) {
+        result.n_tool_calls = parse_tool_calls_from_raw_output(
+            session, session->last_raw_output, session->last_raw_output_len);
     }
 
     // Post-loop: flush any in-progress confidence run as a final event
@@ -2784,7 +3367,7 @@ LFG_API lfg_generate_result lfg_session_prompt_generate(
     lfg_generate_result result{};
     if (!session || !prompt || prompt_len <= 0) return result;
 
-    // Tool injection: rank tools and prepend XML to the prompt text so tools
+    // Tool injection: rank tools and prepend JSON to the prompt text so tools
     // appear inside the prompt context, not between prompt and generated output.
     const char *effective_prompt = prompt;
     int32_t effective_len = prompt_len;
@@ -2795,14 +3378,14 @@ LFG_API lfg_generate_result lfg_session_prompt_generate(
         int32_t got = lfg_session_embed(session, prompt, prompt_len,
                                          session->tool_query_embd, n_embd);
         if (got > 0) {
-            int32_t xml_len = session_rank_and_format_tools(session, session->tool_query_embd);
-            if (xml_len > 0) {
-                // Prepend tool XML + newline to prompt
-                int32_t combined_len = xml_len + 1 + prompt_len;
+            int32_t tools_len = session_rank_and_format_tools(session, session->tool_query_embd);
+            if (tools_len > 0) {
+                // Prepend tool list + newline to prompt
+                int32_t combined_len = tools_len + 1 + prompt_len;
                 combined_prompt = (char *)malloc(combined_len + 1);
-                std::memcpy(combined_prompt, session->tool_xml_buf, xml_len);
-                combined_prompt[xml_len] = '\n';
-                std::memcpy(combined_prompt + xml_len + 1, prompt, prompt_len);
+                std::memcpy(combined_prompt, session->tool_json_buf, tools_len);
+                combined_prompt[tools_len] = '\n';
+                std::memcpy(combined_prompt + tools_len + 1, prompt, prompt_len);
                 combined_prompt[combined_len] = '\0';
 
                 effective_prompt = combined_prompt;
@@ -2832,6 +3415,22 @@ LFG_API lfg_generate_result lfg_session_prompt_generate(
         return result;
     }
 
+    // Capture: detokenize the actual token array so we see exactly what the model sees
+    {
+        free(session->last_formatted_prompt);
+        int32_t text_cap = n * 8;
+        session->last_formatted_prompt = (char *)malloc(text_cap);
+        int32_t text_len = lfg_detokenize(vocab, tokens, n,
+            session->last_formatted_prompt, text_cap, false, true);
+        if (text_len < 0) {
+            text_cap = -text_len;
+            session->last_formatted_prompt = (char *)realloc(session->last_formatted_prompt, text_cap);
+            text_len = lfg_detokenize(vocab, tokens, n,
+                session->last_formatted_prompt, text_cap, false, true);
+        }
+        session->last_formatted_prompt_len = text_len > 0 ? text_len : 0;
+    }
+
     // Prompt tokens must NOT be fed through the grammar sampler — grammar
     // constrains generated output only.  Pass update_sampler=false so the
     // grammar (and other accept-sensitive samplers) never see prompt tokens.
@@ -2849,11 +3448,11 @@ LFG_API lfg_generate_result lfg_session_chat_generate(
     lfg_generate_result result{};
     if (!session || !messages || n_messages == 0) return result;
 
-    // 1. Tool injection: rank tools and build XML to inject into the system message.
+    // 1. Tool injection: rank tools and build JSON to inject into the system message.
     //    This must happen BEFORE template application so the tools appear inside
     //    the prompt (system message), not between the prompt and generated output.
-    int32_t tool_xml_len = 0;
-    char *tool_xml_text = nullptr;
+    int32_t tool_json_len = 0;
+    char *tool_json_text = nullptr;
 
     if (session->tool_count > 0 && !session->tools_injected && session->tool_top_k > 0) {
         // Find last user message for query embedding
@@ -2872,9 +3471,9 @@ LFG_API lfg_generate_result lfg_session_chat_generate(
             int32_t got = lfg_session_embed(session, query_text, query_len,
                                              session->tool_query_embd, n_embd);
             if (got > 0) {
-                tool_xml_len = session_rank_and_format_tools(session, session->tool_query_embd);
-                if (tool_xml_len > 0) {
-                    tool_xml_text = session->tool_xml_buf;
+                tool_json_len = session_rank_and_format_tools(session, session->tool_query_embd);
+                if (tool_json_len > 0) {
+                    tool_json_text = session->tool_json_buf;
                 }
             }
         }
@@ -2890,7 +3489,7 @@ LFG_API lfg_generate_result lfg_session_chat_generate(
     lfg_chat_message *mod_msgs = nullptr;
     char *sys_content_buf = nullptr;
 
-    if (tool_xml_text && tool_xml_len > 0) {
+    if (tool_json_text && tool_json_len > 0) {
         // Find existing system message
         int sys_idx = -1;
         for (size_t i = 0; i < n_messages; ++i) {
@@ -2901,13 +3500,13 @@ LFG_API lfg_generate_result lfg_session_chat_generate(
         }
 
         if (sys_idx >= 0) {
-            // Append tool XML to existing system message
+            // Append tool list to existing system message
             const char *orig = messages[sys_idx].content ? messages[sys_idx].content : "";
             size_t orig_len = std::strlen(orig);
-            size_t buf_len = orig_len + 2 + tool_xml_len + 1;
+            size_t buf_len = orig_len + 2 + tool_json_len + 1;
             sys_content_buf = (char *)malloc(buf_len);
             int written = std::snprintf(sys_content_buf, buf_len, "%s\n\n%.*s",
-                                        orig, (int)tool_xml_len, tool_xml_text);
+                                        orig, (int)tool_json_len, tool_json_text);
             sys_content_buf[written] = '\0';
 
             mod_msgs = (lfg_chat_message *)malloc(n_messages * sizeof(lfg_chat_message));
@@ -2917,11 +3516,11 @@ LFG_API lfg_generate_result lfg_session_chat_generate(
             tmpl_msgs = mod_msgs;
             tmpl_n = n_messages;
         } else {
-            // Insert a new system message at the beginning with the tool XML
+            // Insert a new system message at the beginning with the tool list
             size_t new_n = n_messages + 1;
-            sys_content_buf = (char *)malloc(tool_xml_len + 1);
-            std::memcpy(sys_content_buf, tool_xml_text, tool_xml_len);
-            sys_content_buf[tool_xml_len] = '\0';
+            sys_content_buf = (char *)malloc(tool_json_len + 1);
+            std::memcpy(sys_content_buf, tool_json_text, tool_json_len);
+            sys_content_buf[tool_json_len] = '\0';
 
             mod_msgs = (lfg_chat_message *)malloc(new_n * sizeof(lfg_chat_message));
             mod_msgs[0].role = "system";
@@ -2930,6 +3529,127 @@ LFG_API lfg_generate_result lfg_session_chat_generate(
 
             tmpl_msgs = mod_msgs;
             tmpl_n = new_n;
+        }
+    }
+
+    // 2b. Strip <think>...</think> from assistant messages in history.
+    //     Saves context for multi-turn chat — reasoning is internal to the model
+    //     and doesn't need to be replayed.  Caller can set
+    //     config.include_history_reasoning=true to keep it.
+    char **stripped_bufs = nullptr;
+    int    stripped_count = 0;
+
+    if (!config.include_history_reasoning) {
+        // Count assistant messages that contain <think>
+        int n_strip = 0;
+        for (size_t i = 0; i < tmpl_n; ++i) {
+            if (tmpl_msgs[i].role && std::strcmp(tmpl_msgs[i].role, "assistant") == 0 &&
+                tmpl_msgs[i].content && std::strstr(tmpl_msgs[i].content, "<think>")) {
+                n_strip++;
+            }
+        }
+
+        if (n_strip > 0) {
+            // Ensure we have a mutable message array
+            if (!mod_msgs) {
+                mod_msgs = (lfg_chat_message *)malloc(tmpl_n * sizeof(lfg_chat_message));
+                std::memcpy(mod_msgs, tmpl_msgs, tmpl_n * sizeof(lfg_chat_message));
+                tmpl_msgs = mod_msgs;
+            }
+
+            stripped_bufs = (char **)calloc(n_strip, sizeof(char *));
+
+            for (size_t i = 0; i < tmpl_n; ++i) {
+                if (mod_msgs[i].role && std::strcmp(mod_msgs[i].role, "assistant") == 0 &&
+                    mod_msgs[i].content) {
+                    const char *think_open = std::strstr(mod_msgs[i].content, "<think>");
+                    if (!think_open) continue;
+
+                    const char *think_close = std::strstr(think_open, "</think>");
+                    if (think_close) {
+                        // Strip <think>...</think> block, keep text before and after
+                        const char *after = think_close + 8;  // len("</think>")
+                        // Skip leading whitespace after </think>
+                        while (*after == ' ' || *after == '\t' || *after == '\n' || *after == '\r') after++;
+
+                        size_t before_len = (size_t)(think_open - mod_msgs[i].content);
+                        size_t after_len = std::strlen(after);
+                        char *buf = (char *)malloc(before_len + after_len + 1);
+                        if (before_len > 0) std::memcpy(buf, mod_msgs[i].content, before_len);
+                        std::memcpy(buf + before_len, after, after_len);
+                        buf[before_len + after_len] = '\0';
+
+                        stripped_bufs[stripped_count++] = buf;
+                        mod_msgs[i].content = buf;
+                    } else {
+                        // Unclosed <think> (truncated) — strip from <think> onward
+                        size_t before_len = (size_t)(think_open - mod_msgs[i].content);
+                        char *buf = (char *)malloc(before_len + 1);
+                        if (before_len > 0) std::memcpy(buf, mod_msgs[i].content, before_len);
+                        buf[before_len] = '\0';
+
+                        stripped_bufs[stripped_count++] = buf;
+                        mod_msgs[i].content = buf;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2c. Reconstruct tool call content for assistant messages with structured tool_calls.
+    //     For multi-turn tool use, the consumer sets tool_calls[] on assistant messages
+    //     (from a previous generation). We reconstruct the Pythonic format the model expects:
+    //     <|tool_call_start|>[name(key="val")]<|tool_call_end|>\n<original content>
+    char **tc_recon_bufs = nullptr;
+    int    tc_recon_count = 0;
+    {
+        // Count assistant messages with tool_calls
+        int n_recon = 0;
+        for (size_t i = 0; i < tmpl_n; ++i) {
+            if (tmpl_msgs[i].role && std::strcmp(tmpl_msgs[i].role, "assistant") == 0 &&
+                tmpl_msgs[i].n_tool_calls > 0 && tmpl_msgs[i].tool_calls) {
+                n_recon++;
+            }
+        }
+
+        if (n_recon > 0) {
+            // Ensure we have a mutable message array
+            if (!mod_msgs) {
+                mod_msgs = (lfg_chat_message *)malloc(tmpl_n * sizeof(lfg_chat_message));
+                std::memcpy(mod_msgs, tmpl_msgs, tmpl_n * sizeof(lfg_chat_message));
+                tmpl_msgs = mod_msgs;
+            }
+
+            tc_recon_bufs = (char **)calloc(n_recon, sizeof(char *));
+
+            for (size_t i = 0; i < tmpl_n; ++i) {
+                if (!(mod_msgs[i].role && std::strcmp(mod_msgs[i].role, "assistant") == 0 &&
+                      mod_msgs[i].n_tool_calls > 0 && mod_msgs[i].tool_calls)) continue;
+
+                // Build reconstructed content
+                std::string recon;
+                for (int32_t tc = 0; tc < mod_msgs[i].n_tool_calls; ++tc) {
+                    const lfg_tool_call *call = &mod_msgs[i].tool_calls[tc];
+                    char *pythonic_args = json_args_to_pythonic(call->arguments);
+                    recon += "<|tool_call_start|>[";
+                    recon += call->name ? call->name : "";
+                    recon += "(";
+                    if (pythonic_args) {
+                        recon += pythonic_args;
+                        free(pythonic_args);
+                    }
+                    recon += ")]<|tool_call_end|>\n";
+                }
+
+                // Append original content (if any)
+                if (mod_msgs[i].content && mod_msgs[i].content[0] != '\0') {
+                    recon += mod_msgs[i].content;
+                }
+
+                tc_recon_bufs[tc_recon_count] = strdup(recon.c_str());
+                mod_msgs[i].content = tc_recon_bufs[tc_recon_count];
+                tc_recon_count++;
+            }
         }
     }
 
@@ -2952,12 +3672,12 @@ LFG_API lfg_generate_result lfg_session_chat_generate(
             int32_t prefix_tok_cap = prefix_needed + 16;
             lfg_token *prefix_toks = (lfg_token *)malloc(prefix_tok_cap * sizeof(lfg_token));
             int32_t pn = lfg_tokenize(vocab, prefix_buf, prefix_needed,
-                                       prefix_toks, prefix_tok_cap, true, false);
+                                       prefix_toks, prefix_tok_cap, true, true);
             if (pn < 0) {
                 prefix_tok_cap = -pn;
                 prefix_toks = (lfg_token *)realloc(prefix_toks, prefix_tok_cap * sizeof(lfg_token));
                 pn = lfg_tokenize(vocab, prefix_buf, prefix_needed,
-                                   prefix_toks, prefix_tok_cap, true, false);
+                                   prefix_toks, prefix_tok_cap, true, true);
             }
             session->surprise_skip_tokens = pn > 0 ? pn : 0;
             free(prefix_toks);
@@ -2968,6 +3688,10 @@ LFG_API lfg_generate_result lfg_session_chat_generate(
     // 4. Apply template: first call with NULL buf to get required size
     int32_t needed = lfg_chat_apply_template(tmpl_str, tmpl_msgs, tmpl_n, true, nullptr, 0);
     if (needed <= 0) {
+        for (int i = 0; i < stripped_count; ++i) free(stripped_bufs[i]);
+        free(stripped_bufs);
+        for (int i = 0; i < tc_recon_count; ++i) free(tc_recon_bufs[i]);
+        free(tc_recon_bufs);
         free(mod_msgs);
         free(sys_content_buf);
         lfg_set_last_error(LFG_ERROR_INVALID_ARGUMENT,
@@ -2980,6 +3704,10 @@ LFG_API lfg_generate_result lfg_session_chat_generate(
     lfg_chat_apply_template(tmpl_str, tmpl_msgs, tmpl_n, true, formatted, needed + 1);
     formatted[needed] = '\0';
 
+    for (int i = 0; i < stripped_count; ++i) free(stripped_bufs[i]);
+    free(stripped_bufs);
+    for (int i = 0; i < tc_recon_count; ++i) free(tc_recon_bufs[i]);
+    free(tc_recon_bufs);
     free(mod_msgs);
     free(sys_content_buf);
 
@@ -2987,11 +3715,11 @@ LFG_API lfg_generate_result lfg_session_chat_generate(
     const lfg_vocab *vocab = lfg_model_get_vocab(session->model);
     int32_t tok_cap = needed + 16;
     lfg_token *tokens = (lfg_token *)malloc(tok_cap * sizeof(lfg_token));
-    int32_t n = lfg_tokenize(vocab, formatted, needed, tokens, tok_cap, true, false);
+    int32_t n = lfg_tokenize(vocab, formatted, needed, tokens, tok_cap, true, true);
     if (n < 0) {
         tok_cap = -n;
         tokens = (lfg_token *)realloc(tokens, tok_cap * sizeof(lfg_token));
-        n = lfg_tokenize(vocab, formatted, needed, tokens, tok_cap, true, false);
+        n = lfg_tokenize(vocab, formatted, needed, tokens, tok_cap, true, true);
     }
     free(formatted);
 
@@ -3002,43 +3730,110 @@ LFG_API lfg_generate_result lfg_session_chat_generate(
         return result;
     }
 
+    // Capture: detokenize the actual token array so we see exactly what the model sees
+    {
+        free(session->last_formatted_prompt);
+        int32_t text_cap = n * 8; // generous estimate
+        session->last_formatted_prompt = (char *)malloc(text_cap);
+        int32_t text_len = lfg_detokenize(vocab, tokens, n,
+            session->last_formatted_prompt, text_cap, false, true);
+        if (text_len < 0) {
+            text_cap = -text_len;
+            session->last_formatted_prompt = (char *)realloc(session->last_formatted_prompt, text_cap);
+            text_len = lfg_detokenize(vocab, tokens, n,
+                session->last_formatted_prompt, text_cap, false, true);
+        }
+        session->last_formatted_prompt_len = text_len > 0 ? text_len : 0;
+    }
+
     // 6. Ingest prompt — update_sampler=false so grammar isn't fed prompt tokens
-    lfg_session_ingest_tokens(session, tokens, n, false);
+    bool ok = lfg_session_ingest_tokens(session, tokens, n, false);
     session->surprise_skip_tokens = 0;  // consumed
     free(tokens);
 
-    // 7. Auto-configure text stop string for the EOS token's text representation.
+    if (!ok) {
+        lfg_set_last_error(LFG_ERROR_INTERNAL,
+            "%s: prompt ingestion failed (prompt %d tokens may exceed n_ctx %d)",
+            __func__, n, session->config.n_ctx);
+        return result;
+    }
+
+    // 7. Auto-configure text stop strings for the EOS token's text representation,
+    //    and for <|tool_call_end|> when tools are registered.
     //    The generate loop already stops on the special EOS token, but small
     //    models sometimes generate the TEXT version (e.g. "<|im_end|>" spelled
     //    out as regular tokens) which doesn't trigger EOG detection.  Using a
     //    text-level stop string catches the text form regardless of how the
     //    tokenizer splits it.
     if (session->stop_text_count == 0) {
+        const char *stop_strs[4];
+        int32_t n_stop = 0;
+
         lfg_token eos = lfg_vocab_eos(vocab);
         char eos_text[64];
+        char close_text[66];
         int32_t eos_len = lfg_token_to_piece(vocab, eos, eos_text, sizeof(eos_text), 0, true);
         if (eos_len > 0) {
             eos_text[eos_len] = '\0';
+            stop_strs[n_stop++] = eos_text;
             // Models sometimes generate a "closing tag" variant of the EOS
-            // token text, e.g. "</|im_end|>" instead of "<|im_end|>".  Add
-            // both variants so the text stop catches either form.
+            // token text, e.g. "</|im_end|>" instead of "<|im_end|>".
             if (eos_text[0] == '<' && eos_len + 1 < (int32_t)sizeof(eos_text)) {
-                char close_text[66];
                 close_text[0] = '<';
                 close_text[1] = '/';
                 std::memcpy(close_text + 2, eos_text + 1, eos_len - 1);
                 close_text[eos_len + 1] = '\0';
-                const char *strs[] = { eos_text, close_text };
-                lfg_session_configure_stop_strings(session, strs, 2);
-            } else {
-                const char *strs[] = { eos_text };
-                lfg_session_configure_stop_strings(session, strs, 1);
+                stop_strs[n_stop++] = close_text;
             }
+        }
+
+        // Always stop on <|tool_call_end|> — the model can emit tool calls
+        // even without registered tools (e.g. via chat template with tools)
+        stop_strs[n_stop++] = "<|tool_call_end|>";
+
+        if (n_stop > 0) {
+            lfg_session_configure_stop_strings(session, stop_strs, n_stop);
         }
     }
 
     // 8. Generate
     return lfg_session_generate(session, config);
+}
+
+// ---------------------------------------------------------------------------
+// Last Formatted Prompt getter
+// ---------------------------------------------------------------------------
+
+LFG_API const char * lfg_session_get_last_prompt(lfg_session * session, int32_t * len_out) {
+    if (!session) return nullptr;
+    if (len_out) *len_out = session->last_formatted_prompt_len;
+    return session->last_formatted_prompt;
+}
+
+// ---------------------------------------------------------------------------
+// Structured Tool Call Accessors
+// ---------------------------------------------------------------------------
+
+LFG_API const lfg_tool_call * lfg_session_get_tool_calls(lfg_session * session, int32_t * n_out) {
+    if (!session) {
+        if (n_out) *n_out = 0;
+        return nullptr;
+    }
+    if (n_out) *n_out = session->parsed_tool_call_count;
+    return session->parsed_tool_calls;
+}
+
+LFG_API const char * lfg_session_get_last_output(lfg_session * session, int32_t * len_out) {
+    if (!session) {
+        if (len_out) *len_out = 0;
+        return nullptr;
+    }
+    if (len_out) *len_out = session->last_raw_output_len;
+    return session->last_raw_output;
+}
+
+LFG_API void lfg_session_set_tool_call_format(lfg_session * session, lfg_tool_call_format format) {
+    if (session) session->tool_call_format = format;
 }
 
 // ---------------------------------------------------------------------------
