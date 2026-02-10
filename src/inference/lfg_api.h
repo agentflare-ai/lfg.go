@@ -17,6 +17,12 @@ typedef enum {
     LFG_TOOL_CALL_FORMAT_JSON     = 1,  // {"name":"func","arguments":{...}}
 } lfg_tool_call_format;
 
+typedef enum {
+    LFG_TOOL_SCORE_OFF   = 0,  // Always inject tools (default, backward compat)
+    LFG_TOOL_SCORE_AUTO  = 1,  // Skip if top score doesn't exceed mean by threshold
+    LFG_TOOL_SCORE_FIXED = 2,  // Skip if top score < threshold
+} lfg_tool_score_mode;
+
 typedef struct lfg_tool_call {
     const char * id;         // "call_0", "call_1", ...
     const char * name;       // Function name
@@ -50,6 +56,8 @@ typedef struct lfg_session_config {
     bool structured_checkpointing; // Snapshot sampler state for structured decoding.
     int reasoning_budget;          // 0 = disabled. Number of tokens allowed for reasoning.
     int32_t max_tokens;            // 0 = unlimited. Max tokens to generate per reset cycle.
+    lfg_tool_score_mode tool_score_mode;  // Tool injection gating. 0 = OFF (always inject).
+    float tool_min_score;                  // Threshold value. AUTO: gap above mean. FIXED: absolute minimum.
     lfg_sampling_config sampling;
 } lfg_session_config;
 
@@ -176,10 +184,17 @@ typedef struct lfg_entropy_event {
     int32_t     n_embd;         // Embedding dimension (for embd_out sizing)
 } lfg_entropy_event;
 
+typedef enum {
+    LFG_ENTROPY_GATE_OFF   = 0,  // Disabled (no entropy events)
+    LFG_ENTROPY_GATE_FIXED = 1,  // Fire when norm >= threshold (default)
+    LFG_ENTROPY_GATE_AUTO  = 2,  // Fire when norm >= running_mean + threshold
+} lfg_entropy_gate_mode;
+
 typedef struct lfg_entropy_monitor_config {
     float    threshold;          // Normalized entropy threshold (0,1]. 0 = disabled.
     int32_t  cooldown_tokens;    // Min tokens between events.
     int32_t  ring_size;          // Ring buffer slots. 0 = default (4).
+    lfg_entropy_gate_mode gate_mode;  // Gating mode. 0 = OFF, 1 = FIXED (default), 2 = AUTO.
 } lfg_entropy_monitor_config;
 
 LFG_API lfg_entropy_monitor_config lfg_entropy_monitor_default_config(void);
@@ -222,13 +237,22 @@ typedef struct lfg_confidence_event {
     int32_t     start_pos;       // n_past at span start
     int32_t     end_pos;         // n_past at span end
     int32_t     n_embd;          // Embedding dimension (for embd_out sizing)
+    const char *span_text;       // Detokenized span text (valid until next pop). NULL if unavailable.
+    int32_t     span_text_len;   // Length in bytes (excludes NUL terminator).
 } lfg_confidence_event;
+
+typedef enum {
+    LFG_CONFIDENCE_GATE_OFF   = 0,  // Disabled (no confidence events)
+    LFG_CONFIDENCE_GATE_FIXED = 1,  // Confident when norm <= threshold (default)
+    LFG_CONFIDENCE_GATE_AUTO  = 2,  // Confident when norm <= running_mean - threshold
+} lfg_confidence_gate_mode;
 
 typedef struct lfg_confidence_monitor_config {
     float    threshold;          // Normalized entropy ceiling (0,1]. Tokens below this are "confident".
     int32_t  min_span;           // Minimum consecutive tokens to emit an event. 0 = default (5).
     int32_t  ring_size;          // Ring buffer slots. 0 = default (4).
     bool     include_reasoning;  // false (default) = skip reasoning tokens; true = include them.
+    lfg_confidence_gate_mode gate_mode;  // Gating mode. 0 = OFF, 1 = FIXED (default), 2 = AUTO.
 } lfg_confidence_monitor_config;
 
 // Called when a sustained low-entropy span ends. Receives event + mean-pooled embedding.
@@ -264,9 +288,16 @@ typedef struct lfg_surprise_event {
     int32_t     n_embd;              // Embedding dimension (for embd_out sizing)
 } lfg_surprise_event;
 
+typedef enum {
+    LFG_SURPRISE_GATE_OFF   = 0,  // Disabled (no surprise events)
+    LFG_SURPRISE_GATE_FIXED = 1,  // Token surprising when surprise >= threshold (default)
+    LFG_SURPRISE_GATE_AUTO  = 2,  // Token surprising when surprise >= prompt_mean + threshold
+} lfg_surprise_gate_mode;
+
 typedef struct lfg_surprise_monitor_config {
     float    threshold;          // Normalized surprise floor (0,1]. Above = surprising.
     bool     include_reasoning;  // false (default) = skip reasoning tokens; true = include them.
+    lfg_surprise_gate_mode gate_mode;  // Gating mode. 0 = OFF, 1 = FIXED (default), 2 = AUTO.
 } lfg_surprise_monitor_config;
 
 // Called after prompt ingestion with the aggregate surprise result.
