@@ -10,6 +10,19 @@ extern "C" {
 typedef struct lfg_session lfg_session;
 typedef struct lfg_checkpoint lfg_checkpoint;
 
+// --- Structured Tool Call Types (OpenAI-compatible) ---
+
+typedef enum {
+    LFG_TOOL_CALL_FORMAT_PYTHONIC = 0,  // [func(key='val', key2=123)]
+    LFG_TOOL_CALL_FORMAT_JSON     = 1,  // {"name":"func","arguments":{...}}
+} lfg_tool_call_format;
+
+typedef struct lfg_tool_call {
+    const char * id;         // "call_0", "call_1", ...
+    const char * name;       // Function name
+    const char * arguments;  // JSON string: '{"expression": "1 + 1"}'
+} lfg_tool_call;
+
 // Sampling parameters for a session.
 typedef struct lfg_sampling_config {
     uint32_t seed;
@@ -119,7 +132,7 @@ LFG_API void lfg_checkpoint_free(lfg_checkpoint * checkpoint);
 typedef struct lfg_tool_desc {
     const char * name;
     const char * description;
-    const char * json_schema;  // nullable
+    const char * parameters;   // JSON Schema object, nullable
 } lfg_tool_desc;
 
 // Register tools with the session. Computes & caches embeddings internally.
@@ -131,6 +144,13 @@ LFG_API int32_t lfg_session_register_tools(lfg_session * session,
 
 // Clear registered tools and free tool context.
 LFG_API void lfg_session_clear_tools(lfg_session * session);
+
+// Rank registered tools against query text. Writes formatted tool list to buf.
+// Returns bytes written (excluding NUL), or required size if buf is NULL/buf_size is 0.
+// Returns -1 on error or if no tools are registered.
+LFG_API int32_t lfg_session_rank_tools(lfg_session * session,
+                                       const char * query, int32_t query_len,
+                                       char * buf, int32_t buf_size);
 
 // --- Entropy Monitor API ---
 
@@ -285,6 +305,11 @@ typedef const char * (*lfg_generate_entropy_cb)(
 typedef struct lfg_generate_config {
     int32_t  max_tokens;          // Hard token limit. 0 = use session config.
 
+    // Chat history options (only used by lfg_session_chat_generate)
+    bool     include_history_reasoning;  // false (default) = strip <think>...</think>
+                                         // from assistant messages in history.
+                                         // Saves context for multi-turn chat.
+
     // Callbacks (nullable — NULL means no callback)
     lfg_generate_token_cb      token_cb;
     void                     * token_cb_data;
@@ -301,6 +326,7 @@ typedef enum {
     LFG_STOP_EOS        = 0,  // End-of-generation token
     LFG_STOP_MAX_TOKENS = 1,  // Hit max_tokens limit
     LFG_STOP_CALLBACK   = 2,  // Token callback returned STOP
+    LFG_STOP_TOOL_CALL  = 3,  // Model emitted <|tool_call_end|>
 } lfg_stop_reason;
 
 typedef struct lfg_generate_result {
@@ -308,6 +334,7 @@ typedef struct lfg_generate_result {
     int32_t          n_retrievals;        // Number of entropy-triggered rewind+inject cycles
     int32_t          n_confidence_spans;  // Number of confidence events fired during generation
     int32_t          n_surprise_events;   // 0 or 1 — whether input surprise event was produced
+    int32_t          n_tool_calls;        // Number of parsed tool calls (0 if none or non-tool-call stop)
     lfg_stop_reason  stop_reason;         // Why generation stopped
 } lfg_generate_result;
 
@@ -334,6 +361,35 @@ LFG_API lfg_generate_result lfg_session_chat_generate(
     lfg_session * session,
     const lfg_chat_message * messages, size_t n_messages,
     lfg_generate_config config);
+
+// --- Last Formatted Prompt ---
+
+// Returns the exact text sent to the tokenizer by the last chat_generate or
+// prompt_generate call. Useful for debugging template application, tool injection,
+// and thinking-strip behavior. Returns NULL if no generation has occurred.
+// The pointer is valid until the next generate call or session_reset/free.
+LFG_API const char * lfg_session_get_last_prompt(lfg_session * session, int32_t * len_out);
+
+// --- Structured Tool Call Accessors ---
+
+// Get parsed tool calls from the last generation (valid after LFG_STOP_TOOL_CALL).
+// Writes count to *n_out. Returns pointer to array (owned by session, valid until next generate/reset/free).
+LFG_API const lfg_tool_call * lfg_session_get_tool_calls(lfg_session * session, int32_t * n_out);
+
+// Get the raw detokenized output from the last generation (with special tokens).
+// Writes length to *len_out. Returns pointer (owned by session).
+LFG_API const char * lfg_session_get_last_output(lfg_session * session, int32_t * len_out);
+
+// Set the tool call format for parsing. Default is LFG_TOOL_CALL_FORMAT_PYTHONIC.
+LFG_API void lfg_session_set_tool_call_format(lfg_session * session, lfg_tool_call_format format);
+
+// Parse Pythonic-format tool calls from text (no session required).
+// Input: text like "[func(key='val')]" — may contain multiple calls.
+// Fills `out` array (up to `out_cap` entries). Each entry's name and arguments are
+// malloc'd strings; caller must free them. The `id` field is set to NULL.
+// Returns number of tool calls parsed.
+LFG_API int32_t lfg_parse_pythonic_tool_calls(const char * text, int32_t text_len,
+                                               lfg_tool_call * out, int32_t out_cap);
 
 // --- Model Loader C API (replaces liquid::ModelLoader) ---
 
