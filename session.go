@@ -1253,10 +1253,10 @@ func (s *Session) Embed(text string) ([]float32, error) {
 		return nil, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
 	}
 
-	// Get embedding dimension from the model. The C API requires a valid
-	// output buffer on every call (it does not support a nil/0 query pattern).
+	// Get output embedding dimension from the model. The C API requires a
+	// valid output buffer on every call (it does not support a nil/0 query pattern).
 	registerModelFuncs()
-	nEmbd := int(_lfg_model_n_embd(s.model.c))
+	nEmbd := int(_lfg_model_n_embd_out(s.model.c))
 	if nEmbd <= 0 {
 		return nil, &Error{Code: ErrorInternal, Message: "model has no embedding dimension"}
 	}
@@ -1275,6 +1275,44 @@ func (s *Session) Embed(text string) ([]float32, error) {
 		return nil, &Error{Code: ErrorInternal, Message: "failed to compute embedding"}
 	}
 	return out[:int(n)], nil
+}
+
+// EmbedTokens computes per-token, L2-normalized embeddings for the given text.
+// Returns a flat slice of n_tok * n_embd floats where each consecutive n_embd
+// floats represent one token's embedding. Use [Model.OutputEmbeddingSize] to
+// get n_embd. Allocates a per-token embedding context on the first call
+// (reused across subsequent calls).
+func (s *Session) EmbedTokens(text string) (embeddings []float32, nTokens int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == 0 {
+		return nil, 0, &Error{Code: ErrorInvalidArgument, Message: "session is closed"}
+	}
+
+	registerModelFuncs()
+	nEmbd := int(_lfg_model_n_embd_out(s.model.c))
+	if nEmbd <= 0 {
+		return nil, 0, &Error{Code: ErrorInternal, Message: "model has no embedding dimension"}
+	}
+
+	textBytes := cString(text)
+	textPtr := cStringPtr(textBytes)
+	cLen := int32(len(text))
+
+	// Allocate for up to cLen+16 tokens (same heuristic as C side).
+	tokCap := int(cLen) + 16
+	outCap := tokCap * nEmbd
+	out := make([]float32, outCap)
+
+	nTok := _lfg_session_embed_tokens(s.c, textPtr, cLen, uintptr(unsafe.Pointer(&out[0])), int32(outCap))
+	runtime.KeepAlive(textBytes)
+	if nTok <= 0 {
+		if e := getLastError(); e != nil {
+			return nil, 0, e
+		}
+		return nil, 0, &Error{Code: ErrorInternal, Message: "failed to compute per-token embeddings"}
+	}
+	return out[:int(nTok)*nEmbd], int(nTok), nil
 }
 
 // ---------------------------------------------------------------------------

@@ -598,6 +598,7 @@ var (
 	_lfg_session_configure_surprise_monitor   func(session uintptr, config uintptr) int32
 	_lfg_session_surprise_pop                 func(session uintptr, eventOut uintptr, embdOut uintptr, embdCap int32) bool
 	_lfg_session_embed                        func(session uintptr, text uintptr, textLen int32, out uintptr, outCap int32) int32
+	_lfg_session_embed_tokens                 func(session uintptr, text uintptr, textLen int32, out uintptr, outCap int32) int32
 	_lfg_session_rank_tools                  func(session uintptr, query uintptr, queryLen int32, buf uintptr, bufSize int32) int32
 	_lfg_session_get_last_prompt             func(session uintptr, lenOut uintptr) uintptr
 	_lfg_session_get_tool_calls              func(session uintptr, nOut uintptr) uintptr
@@ -664,6 +665,7 @@ func registerSessionFuncs() {
 		purego.RegisterLibFunc(&_lfg_session_configure_surprise_monitor, lib, "lfg_session_configure_surprise_monitor")
 		purego.RegisterLibFunc(&_lfg_session_surprise_pop, lib, "lfg_session_surprise_pop")
 		purego.RegisterLibFunc(&_lfg_session_embed, lib, "lfg_session_embed")
+		purego.RegisterLibFunc(&_lfg_session_embed_tokens, lib, "lfg_session_embed_tokens")
 		purego.RegisterLibFunc(&_lfg_json_schema_to_grammar, lib, "lfg_json_schema_to_grammar")
 		purego.RegisterLibFunc(&_lfg_model_load_default_config, lib, "lfg_model_load_default_config")
 		purego.RegisterLibFunc(&_lfg_load_model, lib, "lfg_load_model")
