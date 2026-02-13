@@ -215,3 +215,29 @@ const (
 	SurpriseGateFixed SurpriseGateMode = 1 // Token surprising when surprise >= threshold (default).
 	SurpriseGateAuto  SurpriseGateMode = 2 // Token surprising when surprise >= prompt_mean + threshold.
 )
+
+// StateSeqFlags controls extended state serialization behavior.
+type StateSeqFlags uint32
+
+const (
+	// StateSeqFlagsPartialOnly saves only partial (KV cache) state, omitting sampler/grammar state.
+	StateSeqFlagsPartialOnly StateSeqFlags = 1
+)
+
+// ModelMetaKey identifies a model metadata key for sampling parameter recommendations.
+type ModelMetaKey int
+
+const (
+	ModelMetaKeySamplingSequence      ModelMetaKey = 0
+	ModelMetaKeySamplingTopK          ModelMetaKey = 1
+	ModelMetaKeySamplingTopP          ModelMetaKey = 2
+	ModelMetaKeySamplingMinP          ModelMetaKey = 3
+	ModelMetaKeySamplingXTCProbability ModelMetaKey = 4
+	ModelMetaKeySamplingXTCThreshold  ModelMetaKey = 5
+	ModelMetaKeySamplingTemp          ModelMetaKey = 6
+	ModelMetaKeySamplingPenaltyLastN  ModelMetaKey = 7
+	ModelMetaKeySamplingPenaltyRepeat ModelMetaKey = 8
+	ModelMetaKeySamplingMirostat      ModelMetaKey = 9
+	ModelMetaKeySamplingMirostatTau   ModelMetaKey = 10
+	ModelMetaKeySamplingMirostatEta   ModelMetaKey = 11
+)

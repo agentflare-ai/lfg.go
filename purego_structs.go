@@ -101,8 +101,12 @@ type cLogitBias struct {
 
 // cChatMessage mirrors lfg_chat_message.
 type cChatMessage struct {
-	Role    uintptr // const char *
-	Content uintptr // const char *
+	Role       uintptr // const char *
+	Content    uintptr // const char *
+	ToolCalls  uintptr // const struct lfg_tool_call * (nullable)
+	NToolCalls int32   // int32_t (0 = none)
+	_          [4]byte // padding to 8-byte alignment
+	ToolCallID uintptr // const char * (nullable, for role="tool")
 }
 
 // cPerfContextData mirrors lfg_perf_context_data.
@@ -283,4 +287,20 @@ type cModelStats struct {
 	SizeBytes uint64
 	NVocab    int32
 	NCtxTrain int32
+}
+
+// cTokenData mirrors lfg_token_data.
+type cTokenData struct {
+	ID    int32   // lfg_token
+	Logit float32 // float
+	P     float32 // float
+}
+
+// cTokenDataArray mirrors lfg_token_data_array.
+type cTokenDataArray struct {
+	Data     uintptr // lfg_token_data *
+	Size     uintptr // size_t
+	Selected int64   // int64_t
+	Sorted   byte    // bool
+	_        [7]byte // padding to 8-byte alignment
 }

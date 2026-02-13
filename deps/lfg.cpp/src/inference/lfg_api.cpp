@@ -3645,6 +3645,7 @@ LFG_API lfg_generate_result lfg_session_generate(
                         stop_buf[0].piece_len, config.token_cb_data);
                     if (action == LFG_GENERATE_STOP) {
                         result.stop_reason = LFG_STOP_CALLBACK;
+                        total_tokens += i + 1;
                         stopped = true;
                         break;
                     }
@@ -3663,6 +3664,7 @@ LFG_API lfg_generate_result lfg_session_generate(
             lfg_generate_action action = config.token_cb(tok, piece_buf, n, config.token_cb_data);
             if (action == LFG_GENERATE_STOP) {
                 result.stop_reason = LFG_STOP_CALLBACK;
+                total_tokens += i + 1;
                 stopped = true;
                 break;
             }
@@ -3679,6 +3681,7 @@ LFG_API lfg_generate_result lfg_session_generate(
                 stop_buf[j].piece_len, config.token_cb_data);
             if (action == LFG_GENERATE_STOP) {
                 result.stop_reason = LFG_STOP_CALLBACK;
+                total_tokens += tokens_remaining;
                 stopped = true;
                 break;
             }

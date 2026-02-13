@@ -467,3 +467,93 @@ func (ctx *Context) SequenceEmbeddings(seqID SequenceID) []float32 {
 	nEmbd := int(_lfg_model_n_embd(_lfg_get_model(ctx.c)))
 	return unsafe.Slice((*float32)(unsafe.Pointer(ptr)), nEmbd)
 }
+
+// SetSampler binds a sampler to a sequence for backend-side sampling.
+// This is an EXPERIMENTAL API. The sampler is not owned by the context;
+// the caller must keep it alive and free it separately.
+func (ctx *Context) SetSampler(seqID SequenceID, sampler *Sampler) bool {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+	if ctx.c == 0 || sampler == nil {
+		return false
+	}
+	sampler.mu.Lock()
+	defer sampler.mu.Unlock()
+	if sampler.c == 0 {
+		return false
+	}
+	registerContextFuncs()
+	return _lfg_set_sampler(ctx.c, int32(seqID), sampler.c)
+}
+
+// SampledToken returns the backend-sampled token at position i after a decode
+// call with backend sampling enabled via SetSampler.
+func (ctx *Context) SampledToken(i int) Token {
+	ctx.mu.RLock()
+	defer ctx.mu.RUnlock()
+	if ctx.c == 0 {
+		return InvalidToken
+	}
+	registerContextFuncs()
+	return Token(_lfg_get_sampled_token_ith(ctx.c, int32(i)))
+}
+
+// SampledProbs returns the backend-sampled probability distribution at position i.
+// The returned slice is a view into C memory and is only valid until the next decode call.
+func (ctx *Context) SampledProbs(i int) []float32 {
+	ctx.mu.RLock()
+	defer ctx.mu.RUnlock()
+	if ctx.c == 0 {
+		return nil
+	}
+	registerContextFuncs()
+	n := _lfg_get_sampled_probs_count_ith(ctx.c, int32(i))
+	if n == 0 {
+		return nil
+	}
+	ptr := _lfg_get_sampled_probs_ith(ctx.c, int32(i))
+	if ptr == 0 {
+		return nil
+	}
+	return unsafe.Slice((*float32)(unsafe.Pointer(ptr)), int(n))
+}
+
+// SampledLogits returns the backend-sampled logits at position i.
+// The returned slice is a view into C memory and is only valid until the next decode call.
+func (ctx *Context) SampledLogits(i int) []float32 {
+	ctx.mu.RLock()
+	defer ctx.mu.RUnlock()
+	if ctx.c == 0 {
+		return nil
+	}
+	registerContextFuncs()
+	n := _lfg_get_sampled_logits_count_ith(ctx.c, int32(i))
+	if n == 0 {
+		return nil
+	}
+	ptr := _lfg_get_sampled_logits_ith(ctx.c, int32(i))
+	if ptr == 0 {
+		return nil
+	}
+	return unsafe.Slice((*float32)(unsafe.Pointer(ptr)), int(n))
+}
+
+// SampledCandidates returns the backend-sampled candidate token IDs at position i.
+// The returned slice is a view into C memory and is only valid until the next decode call.
+func (ctx *Context) SampledCandidates(i int) []Token {
+	ctx.mu.RLock()
+	defer ctx.mu.RUnlock()
+	if ctx.c == 0 {
+		return nil
+	}
+	registerContextFuncs()
+	n := _lfg_get_sampled_candidates_count_ith(ctx.c, int32(i))
+	if n == 0 {
+		return nil
+	}
+	ptr := _lfg_get_sampled_candidates_ith(ctx.c, int32(i))
+	if ptr == 0 {
+		return nil
+	}
+	return unsafe.Slice((*Token)(unsafe.Pointer(ptr)), int(n))
+}

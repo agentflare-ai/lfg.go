@@ -89,3 +89,20 @@ func SupportsRPC() bool {
 	registerBackendFuncs()
 	return _lfg_supports_rpc()
 }
+
+// FlashAttnTypeName returns the display name for a flash attention type enum value.
+func FlashAttnTypeName(t FlashAttnType) string {
+	registerBackendFuncs()
+	ptr := _lfg_flash_attn_type_name(int32(t))
+	if ptr == 0 {
+		return ""
+	}
+	return goString(ptr)
+}
+
+// MaxTensorBuftOverrides returns the maximum number of tensor buffer type overrides
+// that can be specified when loading a model.
+func MaxTensorBuftOverrides() int {
+	registerBackendFuncs()
+	return int(_lfg_max_tensor_buft_overrides())
+}

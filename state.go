@@ -169,3 +169,39 @@ func (ctx *Context) StateSeqLoadFile(path string, destSeqID SequenceID, maxToken
 	}
 	return tokens[:nTokens], nil
 }
+
+// StateSeqGetSizeExt returns the size needed to copy a single sequence's state
+// with extended flags controlling what is included.
+func (ctx *Context) StateSeqGetSizeExt(seqID SequenceID, flags StateSeqFlags) int {
+	ctx.mu.RLock()
+	defer ctx.mu.RUnlock()
+	if ctx.c == 0 {
+		return 0
+	}
+	registerStateFuncs()
+	return int(_lfg_state_seq_get_size_ext(ctx.c, int32(seqID), uint32(flags)))
+}
+
+// StateSeqGetDataExt copies a single sequence's state into dst with extended flags.
+// Returns the number of bytes written.
+func (ctx *Context) StateSeqGetDataExt(dst []byte, seqID SequenceID, flags StateSeqFlags) int {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+	if ctx.c == 0 || len(dst) == 0 {
+		return 0
+	}
+	registerStateFuncs()
+	return int(_lfg_state_seq_get_data_ext(ctx.c, uintptr(unsafe.Pointer(&dst[0])), uintptr(len(dst)), int32(seqID), uint32(flags)))
+}
+
+// StateSeqSetDataExt restores a single sequence's state from src with extended flags.
+// Returns the number of bytes read, or 0 on failure.
+func (ctx *Context) StateSeqSetDataExt(src []byte, destSeqID SequenceID, flags StateSeqFlags) int {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+	if ctx.c == 0 || len(src) == 0 {
+		return 0
+	}
+	registerStateFuncs()
+	return int(_lfg_state_seq_set_data_ext(ctx.c, uintptr(unsafe.Pointer(&src[0])), uintptr(len(src)), int32(destSeqID), uint32(flags)))
+}

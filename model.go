@@ -476,3 +476,96 @@ func (m *Model) ClassifierLabel(i uint32) string {
 	}
 	return goString(result)
 }
+
+// LoadModelFromSplits loads a model from multiple split GGUF files.
+// Automatically initializes the backend.
+func LoadModelFromSplits(paths []string, opts ...ModelOption) (*Model, error) {
+	ensureBackend()
+	registerModelFuncs()
+
+	defaults := _lfg_model_default_params()
+	cfg := ModelConfig{
+		GPULayers:    int(defaults.NGPULayers),
+		SplitMode:    SplitMode(defaults.SplitMode),
+		MainGPU:      int(defaults.MainGPU),
+		VocabOnly:    defaults.VocabOnly != 0,
+		Mmap:         defaults.UseMmap != 0,
+		Mlock:        defaults.UseMlock != 0,
+		CheckTensors: defaults.CheckTensors != 0,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	params := defaults
+	params.NGPULayers = int32(cfg.GPULayers)
+	params.SplitMode = int32(cfg.SplitMode)
+	params.MainGPU = int32(cfg.MainGPU)
+	params.VocabOnly = boolToByte(cfg.VocabOnly)
+	params.UseMmap = boolToByte(cfg.Mmap)
+	params.UseMlock = boolToByte(cfg.Mlock)
+	params.CheckTensors = boolToByte(cfg.CheckTensors)
+
+	var cbIDPtr *uintptr
+	if cfg.Progress != nil {
+		id := registerProgressCallback(cfg.Progress)
+		cbIDPtr = new(uintptr)
+		*cbIDPtr = id
+		params.ProgressCallback = getProgressTrampoline()
+		params.ProgressCallbackData = uintptr(unsafe.Pointer(cbIDPtr))
+	}
+
+	pathBytes := make([][]byte, len(paths))
+	pathPtrs := make([]uintptr, len(paths))
+	for i, p := range paths {
+		pathBytes[i] = cString(p)
+		pathPtrs[i] = cStringPtr(pathBytes[i])
+	}
+
+	var pathsPtr uintptr
+	if len(pathPtrs) > 0 {
+		pathsPtr = uintptr(unsafe.Pointer(&pathPtrs[0]))
+	}
+
+	cModel := _lfg_model_load_from_splits(pathsPtr, uintptr(len(paths)), params)
+	runtime.KeepAlive(pathBytes)
+	runtime.KeepAlive(pathPtrs)
+	runtime.KeepAlive(cbIDPtr)
+
+	if cbIDPtr != nil {
+		unregisterProgressCallback(*cbIDPtr)
+	}
+	if cModel == 0 {
+		if err := getLastError(); err != nil {
+			return nil, err
+		}
+		return nil, &Error{Code: ErrorInternal, Message: "failed to load model from splits"}
+	}
+
+	m := &Model{c: cModel}
+	runtime.SetFinalizer(m, func(m *Model) { m.Close() })
+	return m, nil
+}
+
+// SaveToFile saves the model to a GGUF file.
+func (m *Model) SaveToFile(path string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.c == 0 {
+		return
+	}
+	registerModelFuncs()
+	pathBytes := cString(path)
+	_lfg_model_save_to_file(m.c, cStringPtr(pathBytes))
+	runtime.KeepAlive(pathBytes)
+}
+
+// MetaKeyString returns the C string name for a model metadata key enum value.
+func MetaKeyString(key ModelMetaKey) string {
+	registerModelFuncs()
+	ptr := _lfg_model_meta_key_str(int32(key))
+	if ptr == 0 {
+		return ""
+	}
+	return goString(ptr)
+}

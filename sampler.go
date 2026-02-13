@@ -351,3 +351,90 @@ func (s *Sampler) PrefixSet(prefix string) {
 	_lfg_sampler_prefix_set(s.c, cStringPtr(prefixBytes))
 	runtime.KeepAlive(prefixBytes)
 }
+
+// NewReasoningBudgetSampler creates a sampler that enforces a reasoning token budget.
+// When the budget is exceeded, thinking end tokens are forced.
+func NewReasoningBudgetSampler(budget int, startTokens, endTokens []Token) *Sampler {
+	registerSamplerFuncs()
+	return newSampler(_lfg_sampler_init_reasoning_budget(
+		int32(budget),
+		tokenPtr(startTokens), uintptr(len(startTokens)),
+		tokenPtr(endTokens), uintptr(len(endTokens))))
+}
+
+// NewGrammarLazyPatternsSampler creates a lazy grammar sampler with pattern triggers.
+// The grammar is only activated when a trigger pattern or token is matched.
+func NewGrammarLazyPatternsSampler(vocab *Vocab, grammarStr, grammarRoot string, triggerPatterns []string, triggerTokens []Token) *Sampler {
+	registerSamplerFuncs()
+	strBytes := cString(grammarStr)
+	rootBytes := cString(grammarRoot)
+
+	patternBytes := make([][]byte, len(triggerPatterns))
+	patternPtrs := make([]uintptr, len(triggerPatterns))
+	for i, s := range triggerPatterns {
+		patternBytes[i] = cString(s)
+		patternPtrs[i] = cStringPtr(patternBytes[i])
+	}
+
+	var patternsPtr uintptr
+	if len(patternPtrs) > 0 {
+		patternsPtr = uintptr(unsafe.Pointer(&patternPtrs[0]))
+	}
+
+	result := _lfg_sampler_init_grammar_lazy_patterns(
+		vocab.c,
+		cStringPtr(strBytes),
+		cStringPtr(rootBytes),
+		patternsPtr, uintptr(len(triggerPatterns)),
+		tokenPtr(triggerTokens), uintptr(len(triggerTokens)))
+	runtime.KeepAlive(strBytes)
+	runtime.KeepAlive(rootBytes)
+	runtime.KeepAlive(patternBytes)
+	runtime.KeepAlive(patternPtrs)
+	return newSampler(result)
+}
+
+// NewReasoningGateSampler creates a sampler that wraps another sampler and only
+// applies it outside of reasoning (thinking) blocks delimited by start/end tokens.
+// The chain takes ownership of wrappedSampler.
+func NewReasoningGateSampler(wrappedSampler *Sampler, startTokens, endTokens []Token) *Sampler {
+	registerSamplerFuncs()
+	wrappedSampler.mu.Lock()
+	cPtr := wrappedSampler.c
+	wrappedSampler.owned = false
+	runtime.SetFinalizer(wrappedSampler, nil)
+	wrappedSampler.mu.Unlock()
+
+	return newSampler(_lfg_sampler_init_reasoning_gate(
+		cPtr,
+		tokenPtr(startTokens), uintptr(len(startTokens)),
+		tokenPtr(endTokens), uintptr(len(endTokens))))
+}
+
+// Apply applies the sampler to a token data array, modifying logits and probabilities in-place.
+func (s *Sampler) Apply(data []TokenData) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.c == 0 || len(data) == 0 {
+		return
+	}
+	registerSamplerFuncs()
+
+	cData := make([]cTokenData, len(data))
+	for i, d := range data {
+		cData[i] = cTokenData{ID: int32(d.ID), Logit: d.Logit, P: d.P}
+	}
+
+	arr := cTokenDataArray{
+		Data:     uintptr(unsafe.Pointer(&cData[0])),
+		Size:     uintptr(len(cData)),
+		Selected: -1,
+	}
+	_lfg_sampler_apply(s.c, uintptr(unsafe.Pointer(&arr)))
+
+	for i := range data {
+		data[i].ID = Token(cData[i].ID)
+		data[i].Logit = cData[i].Logit
+		data[i].P = cData[i].P
+	}
+}

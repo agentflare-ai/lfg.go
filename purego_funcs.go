@@ -31,7 +31,9 @@ var (
 	_lfg_supports_rpc       func() bool
 	_lfg_error_string       func(code int32) uintptr
 	_lfg_get_last_error     func(buf uintptr, bufSize uintptr) int32
-	_lfg_clear_last_error   func()
+	_lfg_clear_last_error           func()
+	_lfg_flash_attn_type_name       func(flashAttnType int32) uintptr
+	_lfg_max_tensor_buft_overrides  func() uintptr
 )
 
 func registerBackendFuncs() {
@@ -56,6 +58,8 @@ func registerBackendFuncs() {
 		purego.RegisterLibFunc(&_lfg_error_string, lib, "lfg_error_string")
 		purego.RegisterLibFunc(&_lfg_get_last_error, lib, "lfg_get_last_error")
 		purego.RegisterLibFunc(&_lfg_clear_last_error, lib, "lfg_clear_last_error")
+		purego.RegisterLibFunc(&_lfg_flash_attn_type_name, lib, "lfg_flash_attn_type_name")
+		purego.RegisterLibFunc(&_lfg_max_tensor_buft_overrides, lib, "lfg_max_tensor_buft_overrides")
 	})
 }
 
@@ -96,6 +100,9 @@ var (
 	_lfg_model_chat_template          func(model uintptr, name uintptr) uintptr
 	_lfg_model_n_cls_out              func(model uintptr) uint32
 	_lfg_model_cls_label              func(model uintptr, i uint32) uintptr
+	_lfg_model_load_from_splits       func(paths uintptr, nPaths uintptr, params cModelParams) uintptr
+	_lfg_model_save_to_file           func(model uintptr, pathModel uintptr)
+	_lfg_model_meta_key_str           func(key int32) uintptr
 )
 
 func registerModelFuncs() {
@@ -134,6 +141,9 @@ func registerModelFuncs() {
 		purego.RegisterLibFunc(&_lfg_model_chat_template, lib, "lfg_model_chat_template")
 		purego.RegisterLibFunc(&_lfg_model_n_cls_out, lib, "lfg_model_n_cls_out")
 		purego.RegisterLibFunc(&_lfg_model_cls_label, lib, "lfg_model_cls_label")
+		purego.RegisterLibFunc(&_lfg_model_load_from_splits, lib, "lfg_model_load_from_splits")
+		purego.RegisterLibFunc(&_lfg_model_save_to_file, lib, "lfg_model_save_to_file")
+		purego.RegisterLibFunc(&_lfg_model_meta_key_str, lib, "lfg_model_meta_key_str")
 	})
 }
 
@@ -236,7 +246,15 @@ var (
 	_lfg_get_logits_ith         func(ctx uintptr, i int32) uintptr
 	_lfg_get_embeddings         func(ctx uintptr) uintptr
 	_lfg_get_embeddings_ith     func(ctx uintptr, i int32) uintptr
-	_lfg_get_embeddings_seq     func(ctx uintptr, seqID int32) uintptr
+	_lfg_get_embeddings_seq             func(ctx uintptr, seqID int32) uintptr
+	_lfg_set_sampler                    func(ctx uintptr, seqID int32, smpl uintptr) bool
+	_lfg_get_sampled_token_ith          func(ctx uintptr, i int32) int32
+	_lfg_get_sampled_probs_ith          func(ctx uintptr, i int32) uintptr
+	_lfg_get_sampled_probs_count_ith    func(ctx uintptr, i int32) uint32
+	_lfg_get_sampled_logits_ith         func(ctx uintptr, i int32) uintptr
+	_lfg_get_sampled_logits_count_ith   func(ctx uintptr, i int32) uint32
+	_lfg_get_sampled_candidates_ith       func(ctx uintptr, i int32) uintptr
+	_lfg_get_sampled_candidates_count_ith func(ctx uintptr, i int32) uint32
 )
 
 func registerContextFuncs() {
@@ -268,6 +286,14 @@ func registerContextFuncs() {
 		purego.RegisterLibFunc(&_lfg_get_embeddings, lib, "lfg_get_embeddings")
 		purego.RegisterLibFunc(&_lfg_get_embeddings_ith, lib, "lfg_get_embeddings_ith")
 		purego.RegisterLibFunc(&_lfg_get_embeddings_seq, lib, "lfg_get_embeddings_seq")
+		purego.RegisterLibFunc(&_lfg_set_sampler, lib, "lfg_set_sampler")
+		purego.RegisterLibFunc(&_lfg_get_sampled_token_ith, lib, "lfg_get_sampled_token_ith")
+		purego.RegisterLibFunc(&_lfg_get_sampled_probs_ith, lib, "lfg_get_sampled_probs_ith")
+		purego.RegisterLibFunc(&_lfg_get_sampled_probs_count_ith, lib, "lfg_get_sampled_probs_count_ith")
+		purego.RegisterLibFunc(&_lfg_get_sampled_logits_ith, lib, "lfg_get_sampled_logits_ith")
+		purego.RegisterLibFunc(&_lfg_get_sampled_logits_count_ith, lib, "lfg_get_sampled_logits_count_ith")
+		purego.RegisterLibFunc(&_lfg_get_sampled_candidates_ith, lib, "lfg_get_sampled_candidates_ith")
+		purego.RegisterLibFunc(&_lfg_get_sampled_candidates_count_ith, lib, "lfg_get_sampled_candidates_count_ith")
 	})
 }
 
@@ -373,8 +399,12 @@ var (
 	_lfg_sampler_init_adaptive_p      func(target float32, decay float32, seed uint32) uintptr
 	_lfg_sampler_init_logit_bias      func(nVocab int32, nLogitBias int32, logitBias uintptr) uintptr
 	_lfg_sampler_init_infill          func(vocab uintptr) uintptr
-	_lfg_sampler_init_prefix          func(vocab uintptr, prefix uintptr) uintptr
-	_lfg_sampler_prefix_set           func(smpl uintptr, prefix uintptr)
+	_lfg_sampler_init_prefix                func(vocab uintptr, prefix uintptr) uintptr
+	_lfg_sampler_prefix_set                 func(smpl uintptr, prefix uintptr)
+	_lfg_sampler_init_reasoning_budget      func(budget int32, startTokens uintptr, nStart uintptr, endTokens uintptr, nEnd uintptr) uintptr
+	_lfg_sampler_init_grammar_lazy_patterns func(vocab uintptr, grammarStr uintptr, grammarRoot uintptr, triggerPatterns uintptr, numTriggerPatterns uintptr, triggerTokens uintptr, numTriggerTokens uintptr) uintptr
+	_lfg_sampler_init_reasoning_gate        func(wrappedSampler uintptr, startTokens uintptr, nStart uintptr, endTokens uintptr, nEnd uintptr) uintptr
+	_lfg_sampler_apply                      func(smpl uintptr, curP uintptr)
 )
 
 func registerSamplerFuncs() {
@@ -416,6 +446,10 @@ func registerSamplerFuncs() {
 		purego.RegisterLibFunc(&_lfg_sampler_init_infill, lib, "lfg_sampler_init_infill")
 		purego.RegisterLibFunc(&_lfg_sampler_init_prefix, lib, "lfg_sampler_init_prefix")
 		purego.RegisterLibFunc(&_lfg_sampler_prefix_set, lib, "lfg_sampler_prefix_set")
+		purego.RegisterLibFunc(&_lfg_sampler_init_reasoning_budget, lib, "lfg_sampler_init_reasoning_budget")
+		purego.RegisterLibFunc(&_lfg_sampler_init_grammar_lazy_patterns, lib, "lfg_sampler_init_grammar_lazy_patterns")
+		purego.RegisterLibFunc(&_lfg_sampler_init_reasoning_gate, lib, "lfg_sampler_init_reasoning_gate")
+		purego.RegisterLibFunc(&_lfg_sampler_apply, lib, "lfg_sampler_apply")
 	})
 }
 
@@ -475,7 +509,10 @@ var (
 	_lfg_state_seq_get_data  func(ctx uintptr, dst uintptr, size uintptr, seqID int32) uintptr
 	_lfg_state_seq_set_data  func(ctx uintptr, src uintptr, size uintptr, destSeqID int32) uintptr
 	_lfg_state_seq_save_file func(ctx uintptr, filepath uintptr, seqID int32, tokens uintptr, nTokenCount uintptr) uintptr
-	_lfg_state_seq_load_file func(ctx uintptr, filepath uintptr, destSeqID int32, tokens uintptr, nTokenCap uintptr, nTokenCountOut uintptr) uintptr
+	_lfg_state_seq_load_file     func(ctx uintptr, filepath uintptr, destSeqID int32, tokens uintptr, nTokenCap uintptr, nTokenCountOut uintptr) uintptr
+	_lfg_state_seq_get_size_ext  func(ctx uintptr, seqID int32, flags uint32) uintptr
+	_lfg_state_seq_get_data_ext  func(ctx uintptr, dst uintptr, size uintptr, seqID int32, flags uint32) uintptr
+	_lfg_state_seq_set_data_ext  func(ctx uintptr, src uintptr, size uintptr, destSeqID int32, flags uint32) uintptr
 )
 
 func registerStateFuncs() {
@@ -494,6 +531,9 @@ func registerStateFuncs() {
 		purego.RegisterLibFunc(&_lfg_state_seq_set_data, lib, "lfg_state_seq_set_data")
 		purego.RegisterLibFunc(&_lfg_state_seq_save_file, lib, "lfg_state_seq_save_file")
 		purego.RegisterLibFunc(&_lfg_state_seq_load_file, lib, "lfg_state_seq_load_file")
+		purego.RegisterLibFunc(&_lfg_state_seq_get_size_ext, lib, "lfg_state_seq_get_size_ext")
+		purego.RegisterLibFunc(&_lfg_state_seq_get_data_ext, lib, "lfg_state_seq_get_data_ext")
+		purego.RegisterLibFunc(&_lfg_state_seq_set_data_ext, lib, "lfg_state_seq_set_data_ext")
 	})
 }
 
