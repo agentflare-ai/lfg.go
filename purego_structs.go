@@ -53,39 +53,39 @@ type cModelParams struct {
 
 // cContextParams mirrors struct lfg_context_params.
 type cContextParams struct {
-	NCtx            uint32
-	NBatch          uint32
-	NUBatch         uint32
-	NSeqMax         uint32
-	NThreads        int32
-	NThreadsBatch   int32
-	RopeScalingType int32 // enum lfg_rope_scaling_type
-	PoolingType     int32 // enum lfg_pooling_type
-	AttentionType   int32 // enum lfg_attention_type
-	FlashAttnType   int32 // enum lfg_flash_attn_type
-	RopeFreqBase    float32
-	RopeFreqScale   float32
-	YarnExtFactor   float32
-	YarnAttnFactor  float32
-	YarnBetaFast    float32
-	YarnBetaSlow    float32
-	YarnOrigCtx     uint32
-	DefragThold     float32
-	CbEval          uintptr // ggml_backend_sched_eval_callback
-	CbEvalUserData  uintptr // void *
-	TypeK           int32   // enum ggml_type
-	TypeV           int32   // enum ggml_type
-	AbortCallback   uintptr // ggml_abort_callback
+	NCtx              uint32
+	NBatch            uint32
+	NUBatch           uint32
+	NSeqMax           uint32
+	NThreads          int32
+	NThreadsBatch     int32
+	RopeScalingType   int32 // enum lfg_rope_scaling_type
+	PoolingType       int32 // enum lfg_pooling_type
+	AttentionType     int32 // enum lfg_attention_type
+	FlashAttnType     int32 // enum lfg_flash_attn_type
+	RopeFreqBase      float32
+	RopeFreqScale     float32
+	YarnExtFactor     float32
+	YarnAttnFactor    float32
+	YarnBetaFast      float32
+	YarnBetaSlow      float32
+	YarnOrigCtx       uint32
+	DefragThold       float32
+	CbEval            uintptr // ggml_backend_sched_eval_callback
+	CbEvalUserData    uintptr // void *
+	TypeK             int32   // enum ggml_type
+	TypeV             int32   // enum ggml_type
+	AbortCallback     uintptr // ggml_abort_callback
 	AbortCallbackData uintptr // void *
-	Embeddings      byte // bool
-	OffloadKQV      byte // bool
-	NoPerf          byte // bool
-	OpOffload       byte // bool
-	SWAFull         byte // bool
-	KVUnified       byte // bool
-	_               [2]byte // padding
-	Samplers        uintptr // struct lfg_sampler_seq_config *
-	NSamplers       uintptr // size_t
+	Embeddings        byte    // bool
+	OffloadKQV        byte    // bool
+	NoPerf            byte    // bool
+	OpOffload         byte    // bool
+	SWAFull           byte    // bool
+	KVUnified         byte    // bool
+	_                 [2]byte // padding
+	Samplers          uintptr // struct lfg_sampler_seq_config *
+	NSamplers         uintptr // size_t
 }
 
 // cSamplerChainParams mirrors lfg_sampler_chain_params.
@@ -215,6 +215,7 @@ type cSurpriseEvent struct {
 // cSurpriseMonitorConfig mirrors lfg_surprise_monitor_config.
 type cSurpriseMonitorConfig struct {
 	Threshold        float32
+	RingSize         int32
 	IncludeReasoning byte // bool
 	_                [3]byte
 	GateMode         int32 // lfg_surprise_gate_mode
@@ -243,12 +244,6 @@ type cGenerateConfig struct {
 	_                       [3]byte // padding to 8
 	TokenCB                 uintptr // lfg_generate_token_cb
 	TokenCBData             uintptr // void *
-	EntropyCB               uintptr // lfg_generate_entropy_cb
-	EntropyCBData           uintptr // void *
-	ConfidenceCB            uintptr // lfg_generate_confidence_cb
-	ConfidenceCBData        uintptr // void *
-	SurpriseCB              uintptr // lfg_generate_surprise_cb
-	SurpriseCBData          uintptr // void *
 	ToolCallCB              uintptr // lfg_tool_call_cb
 	ToolCallCBData          uintptr // void *
 	MaxToolRounds           int32   // 0 = default (5)

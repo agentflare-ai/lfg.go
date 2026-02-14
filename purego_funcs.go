@@ -16,24 +16,24 @@ import (
 var (
 	backendFuncsOnce sync.Once
 
-	_lfg_backend_init       func()
-	_lfg_backend_free       func()
-	_lfg_api_version_string func() uintptr
-	_lfg_api_version        func(major, minor, patch *uint32)
-	_lfg_abi_version        func() uint32
-	_lfg_print_system_info  func() uintptr
-	_lfg_time_us            func() int64
-	_lfg_max_devices        func() uintptr
-	_lfg_max_parallel_sequences func() uintptr
-	_lfg_supports_mmap      func() bool
-	_lfg_supports_mlock     func() bool
-	_lfg_supports_gpu_offload func() bool
-	_lfg_supports_rpc       func() bool
-	_lfg_error_string       func(code int32) uintptr
-	_lfg_get_last_error     func(buf uintptr, bufSize uintptr) int32
-	_lfg_clear_last_error           func()
-	_lfg_flash_attn_type_name       func(flashAttnType int32) uintptr
-	_lfg_max_tensor_buft_overrides  func() uintptr
+	_lfg_backend_init              func()
+	_lfg_backend_free              func()
+	_lfg_api_version_string        func() uintptr
+	_lfg_api_version               func(major, minor, patch *uint32)
+	_lfg_abi_version               func() uint32
+	_lfg_print_system_info         func() uintptr
+	_lfg_time_us                   func() int64
+	_lfg_max_devices               func() uintptr
+	_lfg_max_parallel_sequences    func() uintptr
+	_lfg_supports_mmap             func() bool
+	_lfg_supports_mlock            func() bool
+	_lfg_supports_gpu_offload      func() bool
+	_lfg_supports_rpc              func() bool
+	_lfg_error_string              func(code int32) uintptr
+	_lfg_get_last_error            func(buf uintptr, bufSize uintptr) int32
+	_lfg_clear_last_error          func()
+	_lfg_flash_attn_type_name      func(flashAttnType int32) uintptr
+	_lfg_max_tensor_buft_overrides func() uintptr
 )
 
 func registerBackendFuncs() {
@@ -70,39 +70,39 @@ func registerBackendFuncs() {
 var (
 	modelFuncsOnce sync.Once
 
-	_lfg_model_default_params         func() cModelParams
-	_lfg_model_load_from_file         func(path uintptr, params cModelParams) uintptr
-	_lfg_model_free                   func(model uintptr)
-	_lfg_model_get_vocab              func(model uintptr) uintptr
-	_lfg_model_n_ctx_train            func(model uintptr) int32
-	_lfg_model_n_embd                 func(model uintptr) int32
-	_lfg_model_n_embd_inp             func(model uintptr) int32
-	_lfg_model_n_embd_out             func(model uintptr) int32
-	_lfg_model_n_layer                func(model uintptr) int32
-	_lfg_model_n_head                 func(model uintptr) int32
-	_lfg_model_n_head_kv              func(model uintptr) int32
-	_lfg_model_n_swa                  func(model uintptr) int32
-	_lfg_model_rope_freq_scale_train  func(model uintptr) float32
-	_lfg_model_rope_type              func(model uintptr) int32
-	_lfg_model_size                   func(model uintptr) uint64
-	_lfg_model_n_params               func(model uintptr) uint64
-	_lfg_model_desc                   func(model uintptr, buf uintptr, bufSize uintptr) int32
-	_lfg_model_meta_val_str           func(model uintptr, key uintptr, buf uintptr, bufSize uintptr) int32
-	_lfg_model_meta_count             func(model uintptr) int32
-	_lfg_model_meta_key_by_index      func(model uintptr, i int32, buf uintptr, bufSize uintptr) int32
-	_lfg_model_meta_val_str_by_index  func(model uintptr, i int32, buf uintptr, bufSize uintptr) int32
-	_lfg_model_has_encoder            func(model uintptr) bool
-	_lfg_model_has_decoder            func(model uintptr) bool
-	_lfg_model_decoder_start_token    func(model uintptr) int32
-	_lfg_model_is_recurrent           func(model uintptr) bool
-	_lfg_model_is_hybrid              func(model uintptr) bool
-	_lfg_model_is_diffusion           func(model uintptr) bool
-	_lfg_model_chat_template          func(model uintptr, name uintptr) uintptr
-	_lfg_model_n_cls_out              func(model uintptr) uint32
-	_lfg_model_cls_label              func(model uintptr, i uint32) uintptr
-	_lfg_model_load_from_splits       func(paths uintptr, nPaths uintptr, params cModelParams) uintptr
-	_lfg_model_save_to_file           func(model uintptr, pathModel uintptr)
-	_lfg_model_meta_key_str           func(key int32) uintptr
+	_lfg_model_default_params        func() cModelParams
+	_lfg_model_load_from_file        func(path uintptr, params cModelParams) uintptr
+	_lfg_model_free                  func(model uintptr)
+	_lfg_model_get_vocab             func(model uintptr) uintptr
+	_lfg_model_n_ctx_train           func(model uintptr) int32
+	_lfg_model_n_embd                func(model uintptr) int32
+	_lfg_model_n_embd_inp            func(model uintptr) int32
+	_lfg_model_n_embd_out            func(model uintptr) int32
+	_lfg_model_n_layer               func(model uintptr) int32
+	_lfg_model_n_head                func(model uintptr) int32
+	_lfg_model_n_head_kv             func(model uintptr) int32
+	_lfg_model_n_swa                 func(model uintptr) int32
+	_lfg_model_rope_freq_scale_train func(model uintptr) float32
+	_lfg_model_rope_type             func(model uintptr) int32
+	_lfg_model_size                  func(model uintptr) uint64
+	_lfg_model_n_params              func(model uintptr) uint64
+	_lfg_model_desc                  func(model uintptr, buf uintptr, bufSize uintptr) int32
+	_lfg_model_meta_val_str          func(model uintptr, key uintptr, buf uintptr, bufSize uintptr) int32
+	_lfg_model_meta_count            func(model uintptr) int32
+	_lfg_model_meta_key_by_index     func(model uintptr, i int32, buf uintptr, bufSize uintptr) int32
+	_lfg_model_meta_val_str_by_index func(model uintptr, i int32, buf uintptr, bufSize uintptr) int32
+	_lfg_model_has_encoder           func(model uintptr) bool
+	_lfg_model_has_decoder           func(model uintptr) bool
+	_lfg_model_decoder_start_token   func(model uintptr) int32
+	_lfg_model_is_recurrent          func(model uintptr) bool
+	_lfg_model_is_hybrid             func(model uintptr) bool
+	_lfg_model_is_diffusion          func(model uintptr) bool
+	_lfg_model_chat_template         func(model uintptr, name uintptr) uintptr
+	_lfg_model_n_cls_out             func(model uintptr) uint32
+	_lfg_model_cls_label             func(model uintptr, i uint32) uintptr
+	_lfg_model_load_from_splits      func(paths uintptr, nPaths uintptr, params cModelParams) uintptr
+	_lfg_model_save_to_file          func(model uintptr, pathModel uintptr)
+	_lfg_model_meta_key_str          func(key int32) uintptr
 )
 
 func registerModelFuncs() {
@@ -224,35 +224,35 @@ func registerVocabFuncs() {
 var (
 	contextFuncsOnce sync.Once
 
-	_lfg_context_default_params func() cContextParams
-	_lfg_init_from_model        func(model uintptr, params cContextParams) uintptr
-	_lfg_free                   func(ctx uintptr)
-	_lfg_get_model              func(ctx uintptr) uintptr
-	_lfg_get_memory             func(ctx uintptr) uintptr
-	_lfg_pooling_type           func(ctx uintptr) int32
-	_lfg_n_ctx                  func(ctx uintptr) uint32
-	_lfg_n_ctx_seq              func(ctx uintptr) uint32
-	_lfg_n_batch                func(ctx uintptr) uint32
-	_lfg_n_ubatch               func(ctx uintptr) uint32
-	_lfg_n_seq_max              func(ctx uintptr) uint32
-	_lfg_set_n_threads          func(ctx uintptr, nThreads int32, nThreadsBatch int32)
-	_lfg_n_threads              func(ctx uintptr) int32
-	_lfg_n_threads_batch        func(ctx uintptr) int32
-	_lfg_set_embeddings         func(ctx uintptr, embeddings bool)
-	_lfg_set_causal_attn        func(ctx uintptr, causalAttn bool)
-	_lfg_set_warmup             func(ctx uintptr, warmup bool)
-	_lfg_synchronize            func(ctx uintptr)
-	_lfg_get_logits             func(ctx uintptr) uintptr
-	_lfg_get_logits_ith         func(ctx uintptr, i int32) uintptr
-	_lfg_get_embeddings         func(ctx uintptr) uintptr
-	_lfg_get_embeddings_ith     func(ctx uintptr, i int32) uintptr
-	_lfg_get_embeddings_seq             func(ctx uintptr, seqID int32) uintptr
-	_lfg_set_sampler                    func(ctx uintptr, seqID int32, smpl uintptr) bool
-	_lfg_get_sampled_token_ith          func(ctx uintptr, i int32) int32
-	_lfg_get_sampled_probs_ith          func(ctx uintptr, i int32) uintptr
-	_lfg_get_sampled_probs_count_ith    func(ctx uintptr, i int32) uint32
-	_lfg_get_sampled_logits_ith         func(ctx uintptr, i int32) uintptr
-	_lfg_get_sampled_logits_count_ith   func(ctx uintptr, i int32) uint32
+	_lfg_context_default_params           func() cContextParams
+	_lfg_init_from_model                  func(model uintptr, params cContextParams) uintptr
+	_lfg_free                             func(ctx uintptr)
+	_lfg_get_model                        func(ctx uintptr) uintptr
+	_lfg_get_memory                       func(ctx uintptr) uintptr
+	_lfg_pooling_type                     func(ctx uintptr) int32
+	_lfg_n_ctx                            func(ctx uintptr) uint32
+	_lfg_n_ctx_seq                        func(ctx uintptr) uint32
+	_lfg_n_batch                          func(ctx uintptr) uint32
+	_lfg_n_ubatch                         func(ctx uintptr) uint32
+	_lfg_n_seq_max                        func(ctx uintptr) uint32
+	_lfg_set_n_threads                    func(ctx uintptr, nThreads int32, nThreadsBatch int32)
+	_lfg_n_threads                        func(ctx uintptr) int32
+	_lfg_n_threads_batch                  func(ctx uintptr) int32
+	_lfg_set_embeddings                   func(ctx uintptr, embeddings bool)
+	_lfg_set_causal_attn                  func(ctx uintptr, causalAttn bool)
+	_lfg_set_warmup                       func(ctx uintptr, warmup bool)
+	_lfg_synchronize                      func(ctx uintptr)
+	_lfg_get_logits                       func(ctx uintptr) uintptr
+	_lfg_get_logits_ith                   func(ctx uintptr, i int32) uintptr
+	_lfg_get_embeddings                   func(ctx uintptr) uintptr
+	_lfg_get_embeddings_ith               func(ctx uintptr, i int32) uintptr
+	_lfg_get_embeddings_seq               func(ctx uintptr, seqID int32) uintptr
+	_lfg_set_sampler                      func(ctx uintptr, seqID int32, smpl uintptr) bool
+	_lfg_get_sampled_token_ith            func(ctx uintptr, i int32) int32
+	_lfg_get_sampled_probs_ith            func(ctx uintptr, i int32) uintptr
+	_lfg_get_sampled_probs_count_ith      func(ctx uintptr, i int32) uint32
+	_lfg_get_sampled_logits_ith           func(ctx uintptr, i int32) uintptr
+	_lfg_get_sampled_logits_count_ith     func(ctx uintptr, i int32) uint32
 	_lfg_get_sampled_candidates_ith       func(ctx uintptr, i int32) uintptr
 	_lfg_get_sampled_candidates_count_ith func(ctx uintptr, i int32) uint32
 )
@@ -368,37 +368,37 @@ func registerMemoryFuncs() {
 var (
 	samplerFuncsOnce sync.Once
 
-	_lfg_sampler_chain_default_params func() cSamplerChainParams
-	_lfg_sampler_chain_init           func(params cSamplerChainParams) uintptr
-	_lfg_sampler_chain_add            func(chain uintptr, smpl uintptr)
-	_lfg_sampler_chain_get            func(chain uintptr, i int32) uintptr
-	_lfg_sampler_chain_n              func(chain uintptr) int32
-	_lfg_sampler_chain_remove         func(chain uintptr, i int32) uintptr
-	_lfg_sampler_free                 func(smpl uintptr)
-	_lfg_sampler_name                 func(smpl uintptr) uintptr
-	_lfg_sampler_accept               func(smpl uintptr, token int32)
-	_lfg_sampler_reset                func(smpl uintptr)
-	_lfg_sampler_clone                func(smpl uintptr) uintptr
-	_lfg_sampler_get_seed             func(smpl uintptr) uint32
-	_lfg_sampler_sample               func(smpl uintptr, ctx uintptr, idx int32) int32
-	_lfg_sampler_init_greedy          func() uintptr
-	_lfg_sampler_init_dist            func(seed uint32) uintptr
-	_lfg_sampler_init_top_k           func(k int32) uintptr
-	_lfg_sampler_init_top_p           func(p float32, minKeep uintptr) uintptr
-	_lfg_sampler_init_min_p           func(p float32, minKeep uintptr) uintptr
-	_lfg_sampler_init_typical         func(p float32, minKeep uintptr) uintptr
-	_lfg_sampler_init_temp            func(t float32) uintptr
-	_lfg_sampler_init_temp_ext        func(t float32, delta float32, exponent float32) uintptr
-	_lfg_sampler_init_xtc             func(p float32, t float32, minKeep uintptr, seed uint32) uintptr
-	_lfg_sampler_init_top_n_sigma     func(n float32) uintptr
-	_lfg_sampler_init_mirostat        func(nVocab int32, seed uint32, tau float32, eta float32, m int32) uintptr
-	_lfg_sampler_init_mirostat_v2     func(seed uint32, tau float32, eta float32) uintptr
-	_lfg_sampler_init_grammar         func(vocab uintptr, grammarStr uintptr, grammarRoot uintptr) uintptr
-	_lfg_sampler_init_penalties       func(penaltyLastN int32, penaltyRepeat float32, penaltyFreq float32, penaltyPresent float32) uintptr
-	_lfg_sampler_init_dry             func(vocab uintptr, nCtxTrain int32, multiplier float32, base float32, allowedLength int32, penaltyLastN int32, seqBreakers uintptr, numBreakers uintptr) uintptr
-	_lfg_sampler_init_adaptive_p      func(target float32, decay float32, seed uint32) uintptr
-	_lfg_sampler_init_logit_bias      func(nVocab int32, nLogitBias int32, logitBias uintptr) uintptr
-	_lfg_sampler_init_infill          func(vocab uintptr) uintptr
+	_lfg_sampler_chain_default_params       func() cSamplerChainParams
+	_lfg_sampler_chain_init                 func(params cSamplerChainParams) uintptr
+	_lfg_sampler_chain_add                  func(chain uintptr, smpl uintptr)
+	_lfg_sampler_chain_get                  func(chain uintptr, i int32) uintptr
+	_lfg_sampler_chain_n                    func(chain uintptr) int32
+	_lfg_sampler_chain_remove               func(chain uintptr, i int32) uintptr
+	_lfg_sampler_free                       func(smpl uintptr)
+	_lfg_sampler_name                       func(smpl uintptr) uintptr
+	_lfg_sampler_accept                     func(smpl uintptr, token int32)
+	_lfg_sampler_reset                      func(smpl uintptr)
+	_lfg_sampler_clone                      func(smpl uintptr) uintptr
+	_lfg_sampler_get_seed                   func(smpl uintptr) uint32
+	_lfg_sampler_sample                     func(smpl uintptr, ctx uintptr, idx int32) int32
+	_lfg_sampler_init_greedy                func() uintptr
+	_lfg_sampler_init_dist                  func(seed uint32) uintptr
+	_lfg_sampler_init_top_k                 func(k int32) uintptr
+	_lfg_sampler_init_top_p                 func(p float32, minKeep uintptr) uintptr
+	_lfg_sampler_init_min_p                 func(p float32, minKeep uintptr) uintptr
+	_lfg_sampler_init_typical               func(p float32, minKeep uintptr) uintptr
+	_lfg_sampler_init_temp                  func(t float32) uintptr
+	_lfg_sampler_init_temp_ext              func(t float32, delta float32, exponent float32) uintptr
+	_lfg_sampler_init_xtc                   func(p float32, t float32, minKeep uintptr, seed uint32) uintptr
+	_lfg_sampler_init_top_n_sigma           func(n float32) uintptr
+	_lfg_sampler_init_mirostat              func(nVocab int32, seed uint32, tau float32, eta float32, m int32) uintptr
+	_lfg_sampler_init_mirostat_v2           func(seed uint32, tau float32, eta float32) uintptr
+	_lfg_sampler_init_grammar               func(vocab uintptr, grammarStr uintptr, grammarRoot uintptr) uintptr
+	_lfg_sampler_init_penalties             func(penaltyLastN int32, penaltyRepeat float32, penaltyFreq float32, penaltyPresent float32) uintptr
+	_lfg_sampler_init_dry                   func(vocab uintptr, nCtxTrain int32, multiplier float32, base float32, allowedLength int32, penaltyLastN int32, seqBreakers uintptr, numBreakers uintptr) uintptr
+	_lfg_sampler_init_adaptive_p            func(target float32, decay float32, seed uint32) uintptr
+	_lfg_sampler_init_logit_bias            func(nVocab int32, nLogitBias int32, logitBias uintptr) uintptr
+	_lfg_sampler_init_infill                func(vocab uintptr) uintptr
 	_lfg_sampler_init_prefix                func(vocab uintptr, prefix uintptr) uintptr
 	_lfg_sampler_prefix_set                 func(smpl uintptr, prefix uintptr)
 	_lfg_sampler_init_reasoning_budget      func(budget int32, startTokens uintptr, nStart uintptr, endTokens uintptr, nEnd uintptr) uintptr
@@ -460,17 +460,17 @@ func registerSamplerFuncs() {
 var (
 	adapterFuncsOnce sync.Once
 
-	_lfg_adapter_lora_init                      func(model uintptr, path uintptr) uintptr
-	_lfg_adapter_meta_val_str                   func(adapter uintptr, key uintptr, buf uintptr, bufSize uintptr) int32
-	_lfg_adapter_meta_count                     func(adapter uintptr) int32
-	_lfg_adapter_meta_key_by_index              func(adapter uintptr, i int32, buf uintptr, bufSize uintptr) int32
-	_lfg_adapter_meta_val_str_by_index          func(adapter uintptr, i int32, buf uintptr, bufSize uintptr) int32
-	_lfg_adapter_get_alora_n_invocation_tokens  func(adapter uintptr) uint64
-	_lfg_adapter_get_alora_invocation_tokens    func(adapter uintptr) uintptr
-	_lfg_set_adapter_lora                       func(ctx uintptr, adapter uintptr, scale float32) int32
-	_lfg_rm_adapter_lora                        func(ctx uintptr, adapter uintptr) int32
-	_lfg_clear_adapter_lora                     func(ctx uintptr)
-	_lfg_apply_adapter_cvec                     func(ctx uintptr, data uintptr, dataLen uintptr, nEmbd int32, ilStart int32, ilEnd int32) int32
+	_lfg_adapter_lora_init                     func(model uintptr, path uintptr) uintptr
+	_lfg_adapter_meta_val_str                  func(adapter uintptr, key uintptr, buf uintptr, bufSize uintptr) int32
+	_lfg_adapter_meta_count                    func(adapter uintptr) int32
+	_lfg_adapter_meta_key_by_index             func(adapter uintptr, i int32, buf uintptr, bufSize uintptr) int32
+	_lfg_adapter_meta_val_str_by_index         func(adapter uintptr, i int32, buf uintptr, bufSize uintptr) int32
+	_lfg_adapter_get_alora_n_invocation_tokens func(adapter uintptr) uint64
+	_lfg_adapter_get_alora_invocation_tokens   func(adapter uintptr) uintptr
+	_lfg_set_adapter_lora                      func(ctx uintptr, adapter uintptr, scale float32) int32
+	_lfg_rm_adapter_lora                       func(ctx uintptr, adapter uintptr) int32
+	_lfg_clear_adapter_lora                    func(ctx uintptr)
+	_lfg_apply_adapter_cvec                    func(ctx uintptr, data uintptr, dataLen uintptr, nEmbd int32, ilStart int32, ilEnd int32) int32
 )
 
 func registerAdapterFuncs() {
@@ -500,19 +500,19 @@ func registerAdapterFuncs() {
 var (
 	stateFuncsOnce sync.Once
 
-	_lfg_state_get_size      func(ctx uintptr) uintptr
-	_lfg_state_get_data      func(ctx uintptr, dst uintptr, size uintptr) uintptr
-	_lfg_state_set_data      func(ctx uintptr, src uintptr, size uintptr) uintptr
-	_lfg_state_load_file     func(ctx uintptr, path uintptr, tokens uintptr, nTokenCap uintptr, nTokenCountOut uintptr) bool
-	_lfg_state_save_file     func(ctx uintptr, path uintptr, tokens uintptr, nTokenCount uintptr) bool
-	_lfg_state_seq_get_size  func(ctx uintptr, seqID int32) uintptr
-	_lfg_state_seq_get_data  func(ctx uintptr, dst uintptr, size uintptr, seqID int32) uintptr
-	_lfg_state_seq_set_data  func(ctx uintptr, src uintptr, size uintptr, destSeqID int32) uintptr
-	_lfg_state_seq_save_file func(ctx uintptr, filepath uintptr, seqID int32, tokens uintptr, nTokenCount uintptr) uintptr
-	_lfg_state_seq_load_file     func(ctx uintptr, filepath uintptr, destSeqID int32, tokens uintptr, nTokenCap uintptr, nTokenCountOut uintptr) uintptr
-	_lfg_state_seq_get_size_ext  func(ctx uintptr, seqID int32, flags uint32) uintptr
-	_lfg_state_seq_get_data_ext  func(ctx uintptr, dst uintptr, size uintptr, seqID int32, flags uint32) uintptr
-	_lfg_state_seq_set_data_ext  func(ctx uintptr, src uintptr, size uintptr, destSeqID int32, flags uint32) uintptr
+	_lfg_state_get_size         func(ctx uintptr) uintptr
+	_lfg_state_get_data         func(ctx uintptr, dst uintptr, size uintptr) uintptr
+	_lfg_state_set_data         func(ctx uintptr, src uintptr, size uintptr) uintptr
+	_lfg_state_load_file        func(ctx uintptr, path uintptr, tokens uintptr, nTokenCap uintptr, nTokenCountOut uintptr) bool
+	_lfg_state_save_file        func(ctx uintptr, path uintptr, tokens uintptr, nTokenCount uintptr) bool
+	_lfg_state_seq_get_size     func(ctx uintptr, seqID int32) uintptr
+	_lfg_state_seq_get_data     func(ctx uintptr, dst uintptr, size uintptr, seqID int32) uintptr
+	_lfg_state_seq_set_data     func(ctx uintptr, src uintptr, size uintptr, destSeqID int32) uintptr
+	_lfg_state_seq_save_file    func(ctx uintptr, filepath uintptr, seqID int32, tokens uintptr, nTokenCount uintptr) uintptr
+	_lfg_state_seq_load_file    func(ctx uintptr, filepath uintptr, destSeqID int32, tokens uintptr, nTokenCap uintptr, nTokenCountOut uintptr) uintptr
+	_lfg_state_seq_get_size_ext func(ctx uintptr, seqID int32, flags uint32) uintptr
+	_lfg_state_seq_get_data_ext func(ctx uintptr, dst uintptr, size uintptr, seqID int32, flags uint32) uintptr
+	_lfg_state_seq_set_data_ext func(ctx uintptr, src uintptr, size uintptr, destSeqID int32, flags uint32) uintptr
 )
 
 func registerStateFuncs() {
@@ -566,12 +566,12 @@ func registerChatFuncs() {
 var (
 	perfFuncsOnce sync.Once
 
-	_lfg_perf_context       func(ctx uintptr) cPerfContextData
-	_lfg_perf_context_print func(ctx uintptr)
-	_lfg_perf_context_reset func(ctx uintptr)
-	_lfg_perf_sampler       func(chain uintptr) cPerfSamplerData
-	_lfg_perf_sampler_print func(chain uintptr)
-	_lfg_perf_sampler_reset func(chain uintptr)
+	_lfg_perf_context           func(ctx uintptr) cPerfContextData
+	_lfg_perf_context_print     func(ctx uintptr)
+	_lfg_perf_context_reset     func(ctx uintptr)
+	_lfg_perf_sampler           func(chain uintptr) cPerfSamplerData
+	_lfg_perf_sampler_print     func(chain uintptr)
+	_lfg_perf_sampler_reset     func(chain uintptr)
 	_lfg_memory_breakdown_print func(ctx uintptr)
 )
 
@@ -637,20 +637,23 @@ var (
 	_lfg_surprise_monitor_default_config      func() cSurpriseMonitorConfig
 	_lfg_session_configure_surprise_monitor   func(session uintptr, config uintptr) int32
 	_lfg_session_surprise_pop                 func(session uintptr, eventOut uintptr, embdOut uintptr, embdCap int32) bool
+	_lfg_session_surprise_pending             func(session uintptr) int32
+	_lfg_session_surprise_flush               func(session uintptr)
+	_lfg_session_surprise_counter             func(session uintptr) uintptr
 	_lfg_session_embed                        func(session uintptr, text uintptr, textLen int32, out uintptr, outCap int32) int32
 	_lfg_session_embed_tokens                 func(session uintptr, text uintptr, textLen int32, out uintptr, outCap int32) int32
-	_lfg_session_rank_tools                  func(session uintptr, query uintptr, queryLen int32, buf uintptr, bufSize int32) int32
-	_lfg_session_get_last_prompt             func(session uintptr, lenOut uintptr) uintptr
-	_lfg_session_get_tool_calls              func(session uintptr, nOut uintptr) uintptr
-	_lfg_session_get_last_output             func(session uintptr, lenOut uintptr) uintptr
-	_lfg_session_set_tool_call_format        func(session uintptr, format int32)
-	_lfg_parse_pythonic_tool_calls           func(text uintptr, textLen int32, out uintptr, outCap int32) int32
-	_lfg_json_schema_to_grammar              func(jsonSchema uintptr, forceGBNF bool, buf uintptr, bufSize uintptr) int32
-	_lfg_model_load_default_config           func() cModelLoadConfig
-	_lfg_load_model                          func(config uintptr) uintptr
-	_lfg_model_get_stats                     func(model uintptr) cModelStats
-	_free                                    func(ptr uintptr)
-	_malloc                                  func(size uintptr) uintptr
+	_lfg_session_rank_tools                   func(session uintptr, query uintptr, queryLen int32, buf uintptr, bufSize int32) int32
+	_lfg_session_get_last_prompt              func(session uintptr, lenOut uintptr) uintptr
+	_lfg_session_get_tool_calls               func(session uintptr, nOut uintptr) uintptr
+	_lfg_session_get_last_output              func(session uintptr, lenOut uintptr) uintptr
+	_lfg_session_set_tool_call_format         func(session uintptr, format int32)
+	_lfg_parse_pythonic_tool_calls            func(text uintptr, textLen int32, out uintptr, outCap int32) int32
+	_lfg_json_schema_to_grammar               func(jsonSchema uintptr, forceGBNF bool, buf uintptr, bufSize uintptr) int32
+	_lfg_model_load_default_config            func() cModelLoadConfig
+	_lfg_load_model                           func(config uintptr) uintptr
+	_lfg_model_get_stats                      func(model uintptr) cModelStats
+	_free                                     func(ptr uintptr)
+	_malloc                                   func(size uintptr) uintptr
 )
 
 func registerSessionFuncs() {
@@ -704,6 +707,9 @@ func registerSessionFuncs() {
 		purego.RegisterLibFunc(&_lfg_surprise_monitor_default_config, lib, "lfg_surprise_monitor_default_config")
 		purego.RegisterLibFunc(&_lfg_session_configure_surprise_monitor, lib, "lfg_session_configure_surprise_monitor")
 		purego.RegisterLibFunc(&_lfg_session_surprise_pop, lib, "lfg_session_surprise_pop")
+		purego.RegisterLibFunc(&_lfg_session_surprise_pending, lib, "lfg_session_surprise_pending")
+		purego.RegisterLibFunc(&_lfg_session_surprise_flush, lib, "lfg_session_surprise_flush")
+		purego.RegisterLibFunc(&_lfg_session_surprise_counter, lib, "lfg_session_surprise_counter")
 		purego.RegisterLibFunc(&_lfg_session_embed, lib, "lfg_session_embed")
 		purego.RegisterLibFunc(&_lfg_session_embed_tokens, lib, "lfg_session_embed_tokens")
 		purego.RegisterLibFunc(&_lfg_json_schema_to_grammar, lib, "lfg_json_schema_to_grammar")
@@ -722,10 +728,10 @@ func registerSessionFuncs() {
 var (
 	generateFuncsOnce sync.Once
 
-	_lfg_generate_default_config      func() cGenerateConfig
-	_lfg_session_generate             func(session uintptr, config cGenerateConfig) cGenerateResult
-	_lfg_session_prompt_generate      func(session uintptr, prompt uintptr, promptLen int32, addBOS bool, config cGenerateConfig) cGenerateResult
-	_lfg_session_chat_generate        func(session uintptr, messages uintptr, nMessages uintptr, config cGenerateConfig) cGenerateResult
+	_lfg_generate_default_config func() cGenerateConfig
+	_lfg_session_generate        func(session uintptr, config cGenerateConfig) cGenerateResult
+	_lfg_session_prompt_generate func(session uintptr, prompt uintptr, promptLen int32, addBOS bool, config cGenerateConfig) cGenerateResult
+	_lfg_session_chat_generate   func(session uintptr, messages uintptr, nMessages uintptr, config cGenerateConfig) cGenerateResult
 )
 
 func registerGenerateFuncs() {

@@ -198,9 +198,6 @@ lfg.GenerateConfig{
 	MaxTokens:               256,
 	IncludeHistoryReasoning: false,          // include <think> blocks in chat history
 	TokenCallback:           func(...) ...,  // per token (optional)
-	EntropyCallback:         func(...) ...,  // high entropy rewind+inject (optional)
-	ConfidenceCallback:      func(...) ...,  // confident span end (optional)
-	SurpriseCallback:        func(...) ...,  // prompt surprise (optional)
 	ToolCallCallback:        func(...) ...,  // auto-executed tool observation (optional)
 	MaxToolRounds:           5,              // max auto-execution rounds (0 = default 5)
 }
@@ -320,36 +317,40 @@ The C-side generate loop (`ChatGenerate`, `PromptGenerate`, `GenerateFromState`)
 
 ### Entropy Monitor
 
-Detect high-entropy tokens during generation and optionally inject context:
+Detect high-entropy regions during generation:
 
 ```go
 cfg := lfg.EntropyMonitorConfig{Threshold: 0.5, CooldownTokens: 2, RingSize: 8}
 nEmbd, _ := session.ConfigureEntropyMonitor(&cfg)
 
-result, _ := session.PromptGenerate("prompt", true, lfg.GenerateConfig{
-	MaxTokens: 256,
-	EntropyCallback: func(event lfg.EntropyEvent, embedding []float32) string {
-		return "injected context" // or "" to skip
-	},
-})
-// result.Retrievals = number of rewind+inject cycles
+_, _ = session.PromptGenerate("prompt", true, lfg.GenerateConfig{MaxTokens: 256})
+for {
+	emb := make([]float32, nEmbd)
+	event, ok := session.EntropyPop(emb)
+	if !ok {
+		break
+	}
+	fmt.Printf("entropy=%.3f norm=%.3f token=%d\n", event.Entropy, event.Normalized, event.Token)
+}
 ```
 
 ### Confidence Monitor
 
-Detect sustained low-entropy spans (where the model is confident):
+Detect sustained low-entropy spans (where the model is confident) via queue pop:
 
 ```go
 cfg := lfg.ConfidenceMonitorConfig{Threshold: 0.3, MinSpan: 5, RingSize: 4}
 nEmbd, _ := session.ConfigureConfidenceMonitor(&cfg)
 
-result, _ := session.PromptGenerate("prompt", true, lfg.GenerateConfig{
-	MaxTokens: 256,
-	ConfidenceCallback: func(event lfg.ConfidenceEvent, embedding []float32) {
-		fmt.Printf("Confident span: %d tokens, text: %q\n", event.SpanLength, event.SpanText)
-	},
-})
-// result.ConfidenceSpans = number of confidence events
+_, _ = session.PromptGenerate("prompt", true, lfg.GenerateConfig{MaxTokens: 256})
+for {
+	emb := make([]float32, nEmbd)
+	event, ok := session.ConfidencePop(emb)
+	if !ok {
+		break
+	}
+	fmt.Printf("Confident span: %d tokens, text: %q\n", event.SpanLength, event.SpanText)
+}
 ```
 
 ### Surprise Monitor
@@ -357,16 +358,19 @@ result, _ := session.PromptGenerate("prompt", true, lfg.GenerateConfig{
 Measure how surprising the input prompt is to the model:
 
 ```go
-cfg := lfg.SurpriseMonitorConfig{Threshold: 0.5}
+cfg := lfg.SurpriseMonitorConfig{Threshold: 0.5, RingSize: 8}
 nEmbd, _ := session.ConfigureSurpriseMonitor(&cfg)
 
-result, _ := session.PromptGenerate("prompt", true, lfg.GenerateConfig{
-	MaxTokens: 256,
-	SurpriseCallback: func(event lfg.SurpriseEvent, embedding []float32) {
-		fmt.Printf("Surprise: mean=%.3f, %d/%d tokens above threshold\n",
-			event.MeanSurprise, event.NAboveThreshold, event.NTokensEvaluated)
-	},
-})
+_, _ = session.PromptGenerate("prompt", true, lfg.GenerateConfig{MaxTokens: 256})
+for {
+	emb := make([]float32, nEmbd)
+	event, ok := session.SurprisePop(emb)
+	if !ok {
+		break
+	}
+	fmt.Printf("Surprise: mean=%.3f, %d/%d tokens above threshold\n",
+		event.MeanSurprise, event.NAboveThreshold, event.NTokensEvaluated)
+}
 ```
 
 ## License

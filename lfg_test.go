@@ -168,6 +168,53 @@ func TestLoadModelBadPath(t *testing.T) {
 	t.Logf("Expected error: %v", err)
 }
 
+func TestNewSessionNilModel(t *testing.T) {
+	_, err := NewSession(nil)
+	if err == nil {
+		t.Fatal("expected error for nil model")
+	}
+}
+
+func TestNewContextNilModel(t *testing.T) {
+	_, err := NewContext(nil)
+	if err == nil {
+		t.Fatal("expected error for nil model")
+	}
+}
+
+func TestLoadAdapterLoRANilModel(t *testing.T) {
+	_, err := LoadAdapterLoRA(nil, "dummy.lora")
+	if err == nil {
+		t.Fatal("expected error for nil model")
+	}
+}
+
+func TestSessionCallbackReentryGuards(t *testing.T) {
+	s := &Session{callbackDepth: 1}
+
+	if err := s.ConfigureStructured("root ::= \"ok\"", "root"); err == nil {
+		t.Fatal("expected ConfigureStructured callback reentry error")
+	}
+	if _, err := s.RegisterTools([]ToolDesc{{Name: "x", Description: "y"}}, 1); err == nil {
+		t.Fatal("expected RegisterTools callback reentry error")
+	}
+	if _, err := s.Embed("hello"); err == nil {
+		t.Fatal("expected Embed callback reentry error")
+	}
+	if _, _, err := s.EmbedTokens("hello"); err == nil {
+		t.Fatal("expected EmbedTokens callback reentry error")
+	}
+	if err := s.Close(); err == nil {
+		t.Fatal("expected Close callback reentry error")
+	}
+	if got := s.Sample(); got != InvalidToken {
+		t.Fatalf("Sample = %d, want %d", got, InvalidToken)
+	}
+	if got := s.LastPrompt(); got != "" {
+		t.Fatalf("LastPrompt = %q, want empty", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Model Properties
 // ---------------------------------------------------------------------------
@@ -2426,8 +2473,8 @@ func TestDefaultGenerateConfig(t *testing.T) {
 	if cfg.TokenCallback != nil {
 		t.Fatal("DefaultGenerateConfig().TokenCallback should be nil")
 	}
-	if cfg.EntropyCallback != nil {
-		t.Fatal("DefaultGenerateConfig().EntropyCallback should be nil")
+	if cfg.ToolCallCallback != nil {
+		t.Fatal("DefaultGenerateConfig().ToolCallCallback should be nil")
 	}
 }
 
@@ -3594,4 +3641,165 @@ func TestGenerateLoopConfidenceSpansZeroWithoutMonitor(t *testing.T) {
 		t.Fatalf("ConfidenceSpans = %d, want 0 without confidence monitor", result.ConfidenceSpans)
 	}
 	t.Logf("ConfidenceSpans = 0 without monitor (tokens=%d)", result.TokenCount)
+}
+
+func TestMonitorPopConcurrentWithPromptGenerate(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(SamplingConfig{Seed: 42, Temp: 0.8}),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	nEntropy, err := s.ConfigureEntropyMonitor(&EntropyMonitorConfig{Threshold: 0.3, CooldownTokens: 2, RingSize: 8})
+	if err != nil {
+		t.Fatalf("ConfigureEntropyMonitor: %v", err)
+	}
+	nConfidence, err := s.ConfigureConfidenceMonitor(&ConfidenceMonitorConfig{Threshold: 0.6, MinSpan: 2, RingSize: 8})
+	if err != nil {
+		t.Fatalf("ConfigureConfidenceMonitor: %v", err)
+	}
+	nSurprise, err := s.ConfigureSurpriseMonitor(&SurpriseMonitorConfig{Threshold: 0.4, RingSize: 8})
+	if err != nil {
+		t.Fatalf("ConfigureSurpriseMonitor: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, genErr := s.PromptGenerate("Summarize the history of computing in 5 bullet points.", true, GenerateConfig{
+			MaxTokens: 64,
+		})
+		errCh <- genErr
+	}()
+
+	var entropyEvents, confidenceEvents, surpriseEvents int
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.After(30 * time.Second)
+
+	entropyBuf := make([]float32, max(int(nEntropy), 1))
+	confidenceBuf := make([]float32, max(int(nConfidence), 1))
+	surpriseBuf := make([]float32, max(int(nSurprise), 1))
+
+	for {
+		select {
+		case genErr := <-errCh:
+			if genErr != nil {
+				t.Fatalf("PromptGenerate: %v", genErr)
+			}
+			t.Logf("concurrent monitor pop during generate: entropy=%d confidence=%d surprise=%d",
+				entropyEvents, confidenceEvents, surpriseEvents)
+			return
+		case <-timeout:
+			t.Fatal("timed out waiting for generate + concurrent monitor pops")
+		case <-ticker.C:
+			for {
+				_, ok := s.EntropyPop(entropyBuf)
+				if !ok {
+					break
+				}
+				entropyEvents++
+			}
+			for {
+				_, ok := s.ConfidencePop(confidenceBuf)
+				if !ok {
+					break
+				}
+				confidenceEvents++
+			}
+			for {
+				_, ok := s.SurprisePop(surpriseBuf)
+				if !ok {
+					break
+				}
+				surpriseEvents++
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Surprise Monitor API
+// ---------------------------------------------------------------------------
+
+func TestDefaultSurpriseMonitorConfig(t *testing.T) {
+	cfg := DefaultSurpriseMonitorConfig()
+	t.Logf("DefaultSurpriseMonitorConfig: Threshold=%.2f, RingSize=%d", cfg.Threshold, cfg.RingSize)
+}
+
+func TestSessionConfigureSurpriseMonitor(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	cfg := SurpriseMonitorConfig{
+		Threshold: 0.5,
+		RingSize:  8,
+	}
+	nEmbd, err := s.ConfigureSurpriseMonitor(&cfg)
+	if err != nil {
+		t.Fatalf("ConfigureSurpriseMonitor: %v", err)
+	}
+	if nEmbd <= 0 {
+		t.Fatalf("ConfigureSurpriseMonitor returned n_embd=%d, want > 0", nEmbd)
+	}
+	t.Logf("Surprise monitor configured, n_embd=%d", nEmbd)
+
+	nEmbd, err = s.ConfigureSurpriseMonitor(nil)
+	if err != nil {
+		t.Fatalf("ConfigureSurpriseMonitor(nil): %v", err)
+	}
+	if nEmbd != 0 {
+		t.Fatalf("ConfigureSurpriseMonitor(nil) returned n_embd=%d, want 0", nEmbd)
+	}
+}
+
+func TestSessionSurprisePendingAndFlush(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	if n := s.SurprisePending(); n != 0 {
+		t.Fatalf("SurprisePending = %d, want 0 before configuring", n)
+	}
+	s.SurpriseFlush()
+}
+
+func TestSessionSurprisePopEmpty(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	_, ok := s.SurprisePop(nil)
+	if ok {
+		t.Fatal("SurprisePop returned true without monitor configured")
+	}
+}
+
+func TestSessionSurpriseCounterNil(t *testing.T) {
+	m := requireModel(t)
+
+	s, err := NewSession(m, WithSessionNCtx(512))
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	_ = s.SurpriseCounter()
 }

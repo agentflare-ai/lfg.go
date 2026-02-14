@@ -7,10 +7,12 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 
@@ -54,12 +56,15 @@ type (
 		nAboveThreshold  int32
 		nTokensEvaluated int32
 	}
-	statusMsg     string
-	errMsg        struct{ err error }
-	modelLoaded   struct {
-		model   *lfg.Model
-		session *lfg.Session
-		memory  *vectorMemory
+	statusMsg   string
+	errMsg      struct{ err error }
+	modelLoaded struct {
+		model           *lfg.Model
+		session         *lfg.Session
+		memory          *vectorMemory
+		nEntropyEmbd    int32
+		nConfidenceEmbd int32
+		nSurpriseEmbd   int32
 	}
 )
 
@@ -220,6 +225,190 @@ func (a *tokenAccumulator) text() string {
 	return sb.String()
 }
 
+type entropyMonitorEvent struct {
+	event     lfg.EntropyEvent
+	embedding []float32
+}
+
+type confidenceMonitorEvent struct {
+	event     lfg.ConfidenceEvent
+	embedding []float32
+}
+
+type surpriseMonitorEvent struct {
+	event     lfg.SurpriseEvent
+	embedding []float32
+}
+
+func cloneEmbedding(buf []float32, n int32) []float32 {
+	if n <= 0 {
+		return nil
+	}
+	size := int(n)
+	if size > len(buf) {
+		size = len(buf)
+	}
+	if size <= 0 {
+		return nil
+	}
+	out := make([]float32, size)
+	copy(out, buf[:size])
+	return out
+}
+
+func startEntropyPump(session *lfg.Session, nEmbd int32, done <-chan struct{}, out chan<- entropyMonitorEvent, wg *sync.WaitGroup) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(out)
+
+		counter := session.EntropyCounter()
+		var seen int32
+		if counter != nil {
+			seen = atomic.LoadInt32(counter)
+		}
+
+		buf := make([]float32, max(int(nEmbd), 1))
+		popAll := func() bool {
+			for {
+				event, ok := session.EntropyPop(buf)
+				if !ok {
+					return false
+				}
+				select {
+				case out <- entropyMonitorEvent{event: event, embedding: cloneEmbedding(buf, event.NEmbedding)}:
+				case <-done:
+					return true
+				}
+			}
+		}
+
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				popAll()
+				return
+			case <-ticker.C:
+				if counter != nil {
+					cur := atomic.LoadInt32(counter)
+					if cur == seen {
+						continue
+					}
+					seen = cur
+				}
+				if popAll() {
+					return
+				}
+			}
+		}
+	}()
+}
+
+func startConfidencePump(session *lfg.Session, nEmbd int32, done <-chan struct{}, out chan<- confidenceMonitorEvent, wg *sync.WaitGroup) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(out)
+
+		counter := session.ConfidenceCounter()
+		var seen int32
+		if counter != nil {
+			seen = atomic.LoadInt32(counter)
+		}
+
+		buf := make([]float32, max(int(nEmbd), 1))
+		popAll := func() bool {
+			for {
+				event, ok := session.ConfidencePop(buf)
+				if !ok {
+					return false
+				}
+				select {
+				case out <- confidenceMonitorEvent{event: event, embedding: cloneEmbedding(buf, event.NEmbedding)}:
+				case <-done:
+					return true
+				}
+			}
+		}
+
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				popAll()
+				return
+			case <-ticker.C:
+				if counter != nil {
+					cur := atomic.LoadInt32(counter)
+					if cur == seen {
+						continue
+					}
+					seen = cur
+				}
+				if popAll() {
+					return
+				}
+			}
+		}
+	}()
+}
+
+func startSurprisePump(session *lfg.Session, nEmbd int32, done <-chan struct{}, out chan<- surpriseMonitorEvent, wg *sync.WaitGroup) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(out)
+
+		counter := session.SurpriseCounter()
+		var seen int32
+		if counter != nil {
+			seen = atomic.LoadInt32(counter)
+		}
+
+		buf := make([]float32, max(int(nEmbd), 1))
+		popAll := func() bool {
+			for {
+				event, ok := session.SurprisePop(buf)
+				if !ok {
+					return false
+				}
+				select {
+				case out <- surpriseMonitorEvent{event: event, embedding: cloneEmbedding(buf, event.NEmbedding)}:
+				case <-done:
+					return true
+				}
+			}
+		}
+
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				popAll()
+				return
+			case <-ticker.C:
+				if counter != nil {
+					cur := atomic.LoadInt32(counter)
+					if cur == seen {
+						continue
+					}
+					seen = cur
+				}
+				if popAll() {
+					return
+				}
+			}
+		}
+	}()
+}
+
 // ---------------------------------------------------------------------------
 // Agent Turn Logic
 // ---------------------------------------------------------------------------
@@ -238,14 +427,39 @@ func runAgentTurn(
 	memory.store(userText, "user")
 
 	// Build message array: system + history + user.
-	messages := make([]lfg.ChatMessage, 0, len(history)+2)
+	messages := make([]lfg.ChatMessage, 0, len(history)+3)
 	messages = append(messages, lfg.ChatMessage{Role: "system", Content: systemPrompt})
 	messages = append(messages, history...)
+
+	// Pre-retrieve memory for the incoming user message.
+	if memory.count() > 0 {
+		if retrieved := memory.searchByText(userText, 3); len(retrieved) > 0 {
+			contextText := strings.Join(retrieved, "\n")
+			messages = append(messages, lfg.ChatMessage{
+				Role:    "system",
+				Content: "Relevant context:\n" + contextText,
+			})
+			eventCh <- memRetrievalMsg{text: contextText, count: len(retrieved)}
+		}
+	}
+
 	messages = append(messages, lfg.ChatMessage{Role: "user", Content: userText})
 
 	accum := &tokenAccumulator{}
 
 	session.Reset()
+	session.EntropyFlush()
+	session.ConfidenceFlush()
+	session.SurpriseFlush()
+
+	entropyEvents := make(chan entropyMonitorEvent, 64)
+	confidenceEvents := make(chan confidenceMonitorEvent, 64)
+	surpriseEvents := make(chan surpriseMonitorEvent, 32)
+	stopPumps := make(chan struct{})
+	var pumpWG sync.WaitGroup
+	startEntropyPump(session, cfg.entropyNEmbd, stopPumps, entropyEvents, &pumpWG)
+	startConfidencePump(session, cfg.confidenceNEmbd, stopPumps, confidenceEvents, &pumpWG)
+	startSurprisePump(session, cfg.surpriseNEmbd, stopPumps, surpriseEvents, &pumpWG)
 
 	genCfg := lfg.GenerateConfig{
 		MaxTokens: cfg.maxTokens,
@@ -254,51 +468,86 @@ func runAgentTurn(
 			eventCh <- tokenMsg(piece)
 			return lfg.GenerateContinue
 		},
-		EntropyCallback: func(event lfg.EntropyEvent, embedding []float32) string {
-			if embedding == nil || memory.count() == 0 {
-				return ""
-			}
-			results := memory.search(embedding, 3)
-			if len(results) > 0 {
-				eventCh <- memRetrievalMsg{
-					text:  strings.Join(results, "\n"),
-					count: len(results),
-				}
-				return "Relevant context:\n" + strings.Join(results, "\n")
-			}
-			return ""
-		},
-		ConfidenceCallback: func(event lfg.ConfidenceEvent, embedding []float32) {
-			if embedding == nil {
-				return
-			}
-			storeText := stripThinking(accum.extractLastN(int(event.SpanLength)))
-			if storeText == "" {
-				return
-			}
-			embCopy := make([]float32, len(embedding))
-			copy(embCopy, embedding)
-			memory.storeWithEmbedding(storeText, embCopy, "confidence")
-			eventCh <- memStoredMsg{text: storeText, spanLength: event.SpanLength}
-		},
-		SurpriseCallback: func(event lfg.SurpriseEvent, embedding []float32) {
-			if embedding != nil && userText != "" {
-				embCopy := make([]float32, len(embedding))
-				copy(embCopy, embedding)
-				memory.storeWithEmbedding(userText, embCopy, "surprise")
-			}
-			eventCh <- memSurpriseMsg{
-				inputText:        userText,
-				meanSurprise:     event.MeanSurprise,
-				nAboveThreshold:  event.NAboveThreshold,
-				nTokensEvaluated: event.NTokensEvaluated,
-			}
-		},
 	}
 
-	_, err := session.ChatGenerate(messages, genCfg)
-	if err != nil {
-		eventCh <- statusMsg(fmt.Sprintf("Error: %v", err))
+	processEntropy := func(e entropyMonitorEvent) {
+		if len(e.embedding) == 0 || memory.count() == 0 {
+			return
+		}
+		results := memory.search(e.embedding, 3)
+		if len(results) == 0 {
+			return
+		}
+		eventCh <- memRetrievalMsg{
+			text:  strings.Join(results, "\n"),
+			count: len(results),
+		}
+	}
+
+	processConfidence := func(e confidenceMonitorEvent) {
+		if len(e.embedding) == 0 {
+			return
+		}
+		storeText := stripThinking(e.event.SpanText)
+		if storeText == "" {
+			return
+		}
+		memory.storeWithEmbedding(storeText, append([]float32(nil), e.embedding...), "confidence")
+		eventCh <- memStoredMsg{text: storeText, spanLength: e.event.SpanLength}
+	}
+
+	processSurprise := func(e surpriseMonitorEvent) {
+		if len(e.embedding) > 0 && userText != "" {
+			memory.storeWithEmbedding(userText, append([]float32(nil), e.embedding...), "surprise")
+		}
+		eventCh <- memSurpriseMsg{
+			inputText:        userText,
+			meanSurprise:     e.event.MeanSurprise,
+			nAboveThreshold:  e.event.NAboveThreshold,
+			nTokensEvaluated: e.event.NTokensEvaluated,
+		}
+	}
+
+	type generateResult struct {
+		err error
+	}
+	genDone := make(chan generateResult, 1)
+	go func() {
+		_, err := session.ChatGenerate(messages, genCfg)
+		genDone <- generateResult{err: err}
+	}()
+
+	var genErr error
+running:
+	for {
+		select {
+		case e := <-entropyEvents:
+			processEntropy(e)
+		case e := <-confidenceEvents:
+			processConfidence(e)
+		case e := <-surpriseEvents:
+			processSurprise(e)
+		case done := <-genDone:
+			genErr = done.err
+			break running
+		}
+	}
+
+	close(stopPumps)
+	pumpWG.Wait()
+
+	for e := range entropyEvents {
+		processEntropy(e)
+	}
+	for e := range confidenceEvents {
+		processConfidence(e)
+	}
+	for e := range surpriseEvents {
+		processSurprise(e)
+	}
+
+	if genErr != nil {
+		eventCh <- statusMsg(fmt.Sprintf("Error: %v", genErr))
 		return
 	}
 
@@ -316,9 +565,12 @@ type agentConfig struct {
 	ctxSize             int
 	temperature         float32
 	entropyThreshold    float32
+	entropyNEmbd        int32
 	confidenceThreshold float32
 	confidenceMinSpan   int32
+	confidenceNEmbd     int32
 	surpriseThreshold   float32
+	surpriseNEmbd       int32
 	maxTokens           int32
 	gpuLayers           int
 	reasoningBudget     int
@@ -411,24 +663,40 @@ func (m model) loadModelCmd() tea.Cmd {
 			return errMsg{err: fmt.Errorf("create session: %w", err)}
 		}
 
-		// Entropy monitor — triggers memory RETRIEVAL on uncertainty.
-		session.ConfigureEntropyMonitor(&lfg.EntropyMonitorConfig{
+		// Entropy monitor — async retrieval signal queue.
+		nEntropyEmbd, err := session.ConfigureEntropyMonitor(&lfg.EntropyMonitorConfig{
 			Threshold:      cfg.entropyThreshold,
 			CooldownTokens: 5,
 			RingSize:       8,
 		})
+		if err != nil {
+			session.Close()
+			mdl.Close()
+			return errMsg{err: fmt.Errorf("configure entropy monitor: %w", err)}
+		}
 
-		// Confidence monitor — triggers memory STORAGE on confident spans.
-		session.ConfigureConfidenceMonitor(&lfg.ConfidenceMonitorConfig{
+		// Confidence monitor — async confident-span storage queue.
+		nConfidenceEmbd, err := session.ConfigureConfidenceMonitor(&lfg.ConfidenceMonitorConfig{
 			Threshold: cfg.confidenceThreshold,
 			MinSpan:   cfg.confidenceMinSpan,
 			RingSize:  8,
 		})
+		if err != nil {
+			session.Close()
+			mdl.Close()
+			return errMsg{err: fmt.Errorf("configure confidence monitor: %w", err)}
+		}
 
-		// Surprise monitor — detects novel/surprising input during prompt ingestion.
-		session.ConfigureSurpriseMonitor(&lfg.SurpriseMonitorConfig{
+		// Surprise monitor — async prompt novelty queue.
+		nSurpriseEmbd, err := session.ConfigureSurpriseMonitor(&lfg.SurpriseMonitorConfig{
 			Threshold: cfg.surpriseThreshold,
+			RingSize:  8,
 		})
+		if err != nil {
+			session.Close()
+			mdl.Close()
+			return errMsg{err: fmt.Errorf("configure surprise monitor: %w", err)}
+		}
 
 		// Reasoning tokens for thinking support.
 		vocab := mdl.Vocab()
@@ -443,7 +711,14 @@ func (m model) loadModelCmd() tea.Cmd {
 
 		mem := newVectorMemory(session)
 
-		return modelLoaded{model: mdl, session: session, memory: mem}
+		return modelLoaded{
+			model:           mdl,
+			session:         session,
+			memory:          mem,
+			nEntropyEmbd:    nEntropyEmbd,
+			nConfidenceEmbd: nConfidenceEmbd,
+			nSurpriseEmbd:   nSurpriseEmbd,
+		}
 	}
 }
 
@@ -521,6 +796,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lfgModel = msg.model
 		m.session = msg.session
 		m.memory = msg.memory
+		m.config.entropyNEmbd = msg.nEntropyEmbd
+		m.config.confidenceNEmbd = msg.nConfidenceEmbd
+		m.config.surpriseNEmbd = msg.nSurpriseEmbd
 		m.loaded = true
 		m.status = "Ready"
 		return m, nil

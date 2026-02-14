@@ -5,6 +5,7 @@ package lfg
 import (
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -199,15 +200,21 @@ func WithSessionSampling(sc SamplingConfig) SessionOption {
 
 // Session wraps the high-level lfg_session API.
 type Session struct {
-	mu    sync.Mutex
-	c     uintptr
-	model *Model // prevent GC
+	mu            sync.RWMutex
+	generateMu    sync.Mutex
+	c             uintptr
+	model         *Model    // prevent GC
+	toolFnIDs     []uintptr // active tool callback IDs for this session
+	callbackDepth int32     // >0 while running user callback inside generate loop
 }
 
 // NewSession creates a new high-level session. Automatically initializes the backend.
 func NewSession(model *Model, opts ...SessionOption) (*Session, error) {
 	ensureBackend()
 	registerSessionFuncs()
+	if model == nil {
+		return nil, &Error{Code: ErrorInvalidArgument, Message: "model is nil"}
+	}
 
 	model.mu.RLock()
 	if model.c == 0 {
@@ -236,10 +243,25 @@ func NewSession(model *Model, opts ...SessionOption) (*Session, error) {
 	return s, nil
 }
 
+func (s *Session) inGenerateCallback() bool {
+	return atomic.LoadInt32(&s.callbackDepth) > 0
+}
+
+func callbackReentryError() error {
+	return &Error{Code: ErrorInvalidArgument, Message: "session methods cannot be called from generate callbacks"}
+}
+
 // Close frees session resources. Safe to call multiple times.
 func (s *Session) Close() error {
+	if s.inGenerateCallback() {
+		return callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.toolFnIDs) > 0 {
+		unregisterToolFns(s.toolFnIDs)
+		s.toolFnIDs = nil
+	}
 	if s.c != 0 {
 		_lfg_session_free(s.c)
 		s.c = 0
@@ -250,6 +272,9 @@ func (s *Session) Close() error {
 
 // Reset resets the session state.
 func (s *Session) Reset() {
+	if s.inGenerateCallback() {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -261,6 +286,9 @@ func (s *Session) Reset() {
 // ConfigureStructured sets up structured decoding with a grammar or JSON schema.
 // If grammarOrSchema starts with '{', it is treated as a JSON schema.
 func (s *Session) ConfigureStructured(grammarOrSchema, rootRule string) error {
+	if s.inGenerateCallback() {
+		return callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -290,6 +318,9 @@ func (s *Session) ConfigureStructured(grammarOrSchema, rootRule string) error {
 // ConfigureReasoning configures tokens that delimit a reasoning/thinking block.
 // Structured constraints are suspended while inside these blocks.
 func (s *Session) ConfigureReasoning(startTokens, endTokens []Token) {
+	if s.inGenerateCallback() {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -305,6 +336,9 @@ func (s *Session) ConfigureReasoning(startTokens, endTokens []Token) {
 // When any sequence is matched during sampling, generation returns EOS.
 // Pass nil or an empty slice to clear stop sequences.
 func (s *Session) ConfigureStopSequences(sequences [][]Token) error {
+	if s.inGenerateCallback() {
+		return callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -348,6 +382,9 @@ func (s *Session) ConfigureStopSequences(sequences [][]Token) error {
 // IngestTokens feeds tokens into the session.
 // If updateSampler is true, the sampler state is updated.
 func (s *Session) IngestTokens(tokens []Token, updateSampler bool) error {
+	if s.inGenerateCallback() {
+		return callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -370,6 +407,9 @@ func (s *Session) IngestTokens(tokens []Token, updateSampler bool) error {
 
 // Decode runs a decode step.
 func (s *Session) Decode() error {
+	if s.inGenerateCallback() {
+		return callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -388,6 +428,9 @@ func (s *Session) Decode() error {
 
 // Sample samples a single token from the current logits.
 func (s *Session) Sample() Token {
+	if s.inGenerateCallback() {
+		return InvalidToken
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -398,6 +441,9 @@ func (s *Session) Sample() Token {
 
 // HealToken performs token healing on the last token.
 func (s *Session) HealToken() error {
+	if s.inGenerateCallback() {
+		return callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -417,6 +463,9 @@ func (s *Session) HealToken() error {
 // Logits copies logits from the session into the provided buffer.
 // If out is nil, returns the required buffer size.
 func (s *Session) Logits(out []float32) int {
+	if s.inGenerateCallback() {
+		return 0
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -430,6 +479,9 @@ func (s *Session) Logits(out []float32) int {
 
 // VocabSize returns the vocabulary size for this session.
 func (s *Session) VocabSize() int {
+	if s.inGenerateCallback() {
+		return 0
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -471,6 +523,9 @@ type Checkpoint struct {
 
 // CreateCheckpoint creates a snapshot of the current session state.
 func (s *Session) CreateCheckpoint() *Checkpoint {
+	if s.inGenerateCallback() {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -512,6 +567,9 @@ func DefaultCheckpointRestoreOptions() CheckpointRestoreOptions {
 
 // RestoreCheckpoint restores the session to a checkpoint with default options.
 func (s *Session) RestoreCheckpoint(cp *Checkpoint) error {
+	if s.inGenerateCallback() {
+		return callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -533,6 +591,9 @@ func (s *Session) RestoreCheckpoint(cp *Checkpoint) error {
 
 // RestoreCheckpointEx restores the session with custom options.
 func (s *Session) RestoreCheckpointEx(cp *Checkpoint, opts CheckpointRestoreOptions) error {
+	if s.inGenerateCallback() {
+		return callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -603,11 +664,16 @@ type ToolDesc struct {
 
 var (
 	toolFnMu        sync.Mutex
-	toolFnMap       = make(map[uintptr]ToolFn)
+	toolFnMap       = make(map[uintptr]toolFnEntry)
 	toolFnNextID    uintptr
 	toolFnTrampOnce sync.Once
 	toolFnTramp     uintptr
 )
+
+type toolFnEntry struct {
+	fn      ToolFn
+	session *Session
+}
 
 func initToolFnTrampoline() {
 	toolFnTrampOnce.Do(func() {
@@ -619,16 +685,20 @@ func initToolFnTrampoline() {
 			if userData == 0 {
 				return 0
 			}
-			id := *(*uintptr)(unsafe.Pointer(userData))
+			id := userData
 			toolFnMu.Lock()
-			fn, ok := toolFnMap[id]
+			entry, ok := toolFnMap[id]
 			toolFnMu.Unlock()
-			if !ok || fn == nil {
+			if !ok || entry.fn == nil {
 				return 0
+			}
+			if entry.session != nil {
+				atomic.AddInt32(&entry.session.callbackDepth, 1)
+				defer atomic.AddInt32(&entry.session.callbackDepth, -1)
 			}
 
 			goArgs := goString(argsPtr)
-			result, err := fn(goArgs)
+			result, err := entry.fn(goArgs)
 			if err != nil {
 				result = "error: " + err.Error()
 			}
@@ -647,12 +717,12 @@ func initToolFnTrampoline() {
 	})
 }
 
-func registerToolFn(fn ToolFn) uintptr {
+func registerToolFn(session *Session, fn ToolFn) uintptr {
 	toolFnMu.Lock()
 	defer toolFnMu.Unlock()
 	toolFnNextID++
 	id := toolFnNextID
-	toolFnMap[id] = fn
+	toolFnMap[id] = toolFnEntry{fn: fn, session: session}
 	return id
 }
 
@@ -670,6 +740,9 @@ func unregisterToolFns(ids []uintptr) {
 // on the first decode call. Pass 0 to disable injection.
 // Returns the number of tools registered.
 func (s *Session) RegisterTools(tools []ToolDesc, topK int32) (int32, error) {
+	if s.inGenerateCallback() {
+		return 0, callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -683,7 +756,6 @@ func (s *Session) RegisterTools(tools []ToolDesc, topK int32) (int32, error) {
 	cDescs := make([]cToolDesc, len(tools))
 	keepAlive := make([][]byte, 0, len(tools)*3)
 	var fnIDs []uintptr
-	var fnIDPtrs []*uintptr // prevent GC
 
 	for i, t := range tools {
 		nameBytes := cString(t.Name)
@@ -698,20 +770,16 @@ func (s *Session) RegisterTools(tools []ToolDesc, topK int32) (int32, error) {
 		}
 		if t.Fn != nil {
 			initToolFnTrampoline()
-			id := registerToolFn(t.Fn)
+			id := registerToolFn(s, t.Fn)
 			fnIDs = append(fnIDs, id)
-			idPtr := new(uintptr)
-			*idPtr = id
-			fnIDPtrs = append(fnIDPtrs, idPtr)
 			cDescs[i].Fn = toolFnTramp
-			cDescs[i].FnUserData = uintptr(unsafe.Pointer(idPtr))
+			cDescs[i].FnUserData = id
 		}
 	}
 
 	n := _lfg_session_register_tools(s.c, uintptr(unsafe.Pointer(&cDescs[0])), int32(len(tools)), topK)
 	runtime.KeepAlive(keepAlive)
 	runtime.KeepAlive(cDescs)
-	runtime.KeepAlive(fnIDPtrs)
 	if n < 0 {
 		unregisterToolFns(fnIDs)
 		if err := getLastError(); err != nil {
@@ -719,13 +787,22 @@ func (s *Session) RegisterTools(tools []ToolDesc, topK int32) (int32, error) {
 		}
 		return 0, &Error{Code: ErrorInternal, Message: "failed to register tools"}
 	}
+	unregisterToolFns(s.toolFnIDs)
+	s.toolFnIDs = fnIDs
 	return n, nil
 }
 
 // ClearTools removes all registered tools and frees the tool ranking context.
 func (s *Session) ClearTools() {
+	if s.inGenerateCallback() {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.toolFnIDs) > 0 {
+		unregisterToolFns(s.toolFnIDs)
+		s.toolFnIDs = nil
+	}
 	if s.c == 0 {
 		return
 	}
@@ -772,6 +849,9 @@ func DefaultEntropyMonitorConfig() EntropyMonitorConfig {
 // the embedding buffer passed to EntropyPop.
 // Pass nil to disable the entropy monitor (returns 0, nil).
 func (s *Session) ConfigureEntropyMonitor(config *EntropyMonitorConfig) (int32, error) {
+	if s.inGenerateCallback() {
+		return 0, callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -804,8 +884,11 @@ func (s *Session) ConfigureEntropyMonitor(config *EntropyMonitorConfig) (int32, 
 // Pass nil for embeddingOut to skip embedding copy.
 // Returns the event and true if an event was available, or a zero event and false if no events are pending.
 func (s *Session) EntropyPop(embeddingOut []float32) (EntropyEvent, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.inGenerateCallback() {
+		return EntropyEvent{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.c == 0 {
 		return EntropyEvent{}, false
 	}
@@ -836,8 +919,11 @@ func (s *Session) EntropyPop(embeddingOut []float32) (EntropyEvent, bool) {
 
 // EntropyPending returns the number of pending (unread) entropy events.
 func (s *Session) EntropyPending() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.inGenerateCallback() {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.c == 0 {
 		return 0
 	}
@@ -846,8 +932,11 @@ func (s *Session) EntropyPending() int {
 
 // EntropyFlush discards all pending entropy events without reading them.
 func (s *Session) EntropyFlush() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.inGenerateCallback() {
+		return
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.c == 0 {
 		return
 	}
@@ -859,8 +948,11 @@ func (s *Session) EntropyFlush() {
 // Callers can poll this with sync/atomic.LoadInt32 or use platform-specific wait mechanisms.
 // Returns nil if the session is closed or the entropy monitor is not configured.
 func (s *Session) EntropyCounter() *int32 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.inGenerateCallback() {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.c == 0 {
 		return nil
 	}
@@ -874,6 +966,9 @@ func (s *Session) EntropyCounter() *int32 {
 // Rewind rewinds the session to an entropy checkpoint. Truncates the KV cache
 // and resets the sampler. The checkpointID comes from EntropyEvent.CheckpointID.
 func (s *Session) Rewind(checkpointID int32) error {
+	if s.inGenerateCallback() {
+		return callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -893,8 +988,11 @@ func (s *Session) Rewind(checkpointID int32) error {
 // LastEntropy returns the normalized entropy from the last Sample() call.
 // Returns -1 if no sample has been performed.
 func (s *Session) LastEntropy() float32 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.inGenerateCallback() {
+		return -1
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.c == 0 {
 		return -1
 	}
@@ -943,6 +1041,9 @@ func DefaultConfidenceMonitorConfig() ConfidenceMonitorConfig {
 // the embedding buffer passed to ConfidencePop.
 // Pass nil to disable the confidence monitor (returns 0, nil).
 func (s *Session) ConfigureConfidenceMonitor(config *ConfidenceMonitorConfig) (int32, error) {
+	if s.inGenerateCallback() {
+		return 0, callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -976,8 +1077,11 @@ func (s *Session) ConfigureConfidenceMonitor(config *ConfidenceMonitorConfig) (i
 // Pass nil for embeddingOut to skip embedding copy.
 // Returns the event and true if an event was available, or a zero event and false if no events are pending.
 func (s *Session) ConfidencePop(embeddingOut []float32) (ConfidenceEvent, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.inGenerateCallback() {
+		return ConfidenceEvent{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.c == 0 {
 		return ConfidenceEvent{}, false
 	}
@@ -1008,8 +1112,11 @@ func (s *Session) ConfidencePop(embeddingOut []float32) (ConfidenceEvent, bool) 
 
 // ConfidencePending returns the number of pending (unread) confidence events.
 func (s *Session) ConfidencePending() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.inGenerateCallback() {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.c == 0 {
 		return 0
 	}
@@ -1018,8 +1125,11 @@ func (s *Session) ConfidencePending() int {
 
 // ConfidenceFlush discards all pending confidence events without reading them.
 func (s *Session) ConfidenceFlush() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.inGenerateCallback() {
+		return
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.c == 0 {
 		return
 	}
@@ -1030,8 +1140,11 @@ func (s *Session) ConfidenceFlush() {
 // each time a confidence event is written to the ring buffer.
 // Returns nil if the session is closed or the confidence monitor is not configured.
 func (s *Session) ConfidenceCounter() *int32 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.inGenerateCallback() {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.c == 0 {
 		return nil
 	}
@@ -1059,6 +1172,7 @@ type SurpriseEvent struct {
 // SurpriseMonitorConfig configures the surprise monitor.
 type SurpriseMonitorConfig struct {
 	Threshold        float32          // Normalized surprise floor (0,1]. Above = surprising.
+	RingSize         int32            // Ring buffer slots. 0 = default (4).
 	IncludeReasoning bool             // false (default) = skip reasoning tokens; true = include them.
 	GateMode         SurpriseGateMode // Gating mode. Off, Fixed (default), or Auto.
 }
@@ -1069,6 +1183,7 @@ func DefaultSurpriseMonitorConfig() SurpriseMonitorConfig {
 	c := _lfg_surprise_monitor_default_config()
 	return SurpriseMonitorConfig{
 		Threshold:        c.Threshold,
+		RingSize:         c.RingSize,
 		IncludeReasoning: c.IncludeReasoning != 0,
 		GateMode:         SurpriseGateMode(c.GateMode),
 	}
@@ -1079,6 +1194,9 @@ func DefaultSurpriseMonitorConfig() SurpriseMonitorConfig {
 // the embedding buffer passed to SurprisePop.
 // Pass nil to disable the surprise monitor (returns 0, nil).
 func (s *Session) ConfigureSurpriseMonitor(config *SurpriseMonitorConfig) (int32, error) {
+	if s.inGenerateCallback() {
+		return 0, callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -1092,6 +1210,7 @@ func (s *Session) ConfigureSurpriseMonitor(config *SurpriseMonitorConfig) (int32
 
 	cConfig := cSurpriseMonitorConfig{
 		Threshold:        config.Threshold,
+		RingSize:         config.RingSize,
 		IncludeReasoning: boolToByte(config.IncludeReasoning),
 		GateMode:         int32(config.GateMode),
 	}
@@ -1110,8 +1229,11 @@ func (s *Session) ConfigureSurpriseMonitor(config *SurpriseMonitorConfig) (int32
 // Pass nil for embeddingOut to skip embedding copy.
 // Returns the event and true if an event was available, or a zero event and false if no events are pending.
 func (s *Session) SurprisePop(embeddingOut []float32) (SurpriseEvent, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.inGenerateCallback() {
+		return SurpriseEvent{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.c == 0 {
 		return SurpriseEvent{}, false
 	}
@@ -1138,11 +1260,59 @@ func (s *Session) SurprisePop(embeddingOut []float32) (SurpriseEvent, bool) {
 	}, true
 }
 
+// SurprisePending returns the number of pending (unread) surprise events.
+func (s *Session) SurprisePending() int {
+	if s.inGenerateCallback() {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.c == 0 {
+		return 0
+	}
+	return int(_lfg_session_surprise_pending(s.c))
+}
+
+// SurpriseFlush discards all pending surprise events without reading them.
+func (s *Session) SurpriseFlush() {
+	if s.inGenerateCallback() {
+		return
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.c == 0 {
+		return
+	}
+	_lfg_session_surprise_flush(s.c)
+}
+
+// SurpriseCounter returns a pointer to an atomic write counter that is incremented
+// each time a surprise event is written to the ring buffer.
+// Returns nil if the session is closed or the surprise monitor is not configured.
+func (s *Session) SurpriseCounter() *int32 {
+	if s.inGenerateCallback() {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.c == 0 {
+		return nil
+	}
+	p := _lfg_session_surprise_counter(s.c)
+	if p == 0 {
+		return nil
+	}
+	return (*int32)(unsafe.Pointer(p))
+}
+
 // ConfigureStopStrings sets text-based stop strings for generation.
 // Unlike token-level stop sequences, text stops are encoding-independent
 // (same text always matches regardless of how the tokenizer splits it).
 // Pass nil or an empty slice to clear stop strings.
 func (s *Session) ConfigureStopStrings(strings []string) error {
+	if s.inGenerateCallback() {
+		return callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -1247,6 +1417,9 @@ func LoadModelSimple(path string, opts ...ModelOption) (*Model, error) {
 // Returns the embedding vector on success. Allocates an embedding context on
 // the first call (reused across subsequent calls).
 func (s *Session) Embed(text string) ([]float32, error) {
+	if s.inGenerateCallback() {
+		return nil, callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -1283,6 +1456,9 @@ func (s *Session) Embed(text string) ([]float32, error) {
 // get n_embd. Allocates a per-token embedding context on the first call
 // (reused across subsequent calls).
 func (s *Session) EmbedTokens(text string) (embeddings []float32, nTokens int, err error) {
+	if s.inGenerateCallback() {
+		return nil, 0, callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -1322,6 +1498,9 @@ func (s *Session) EmbedTokens(text string) (embeddings []float32, nTokens int, e
 // RankTools ranks registered tools against a query string.
 // Returns a JSON string with the ranking results.
 func (s *Session) RankTools(query string) (string, error) {
+	if s.inGenerateCallback() {
+		return "", callbackReentryError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -1360,6 +1539,9 @@ func (s *Session) RankTools(query string) (string, error) {
 // LastPrompt returns the fully-formatted prompt from the last chat_generate call.
 // The returned string is owned by the session and valid until the next generate/reset/free.
 func (s *Session) LastPrompt() string {
+	if s.inGenerateCallback() {
+		return ""
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -1375,6 +1557,9 @@ func (s *Session) LastPrompt() string {
 // Valid after a generate call that stopped with StopReasonToolCall.
 // The returned data is owned by the session and valid until the next generate/reset/free.
 func (s *Session) ToolCalls() []ToolCall {
+	if s.inGenerateCallback() {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -1402,6 +1587,9 @@ func (s *Session) ToolCalls() []ToolCall {
 // LastOutput returns the raw text output from the last generation.
 // The returned string is owned by the session and valid until the next generate/reset/free.
 func (s *Session) LastOutput() string {
+	if s.inGenerateCallback() {
+		return ""
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {
@@ -1415,6 +1603,9 @@ func (s *Session) LastOutput() string {
 
 // SetToolCallFormat sets the format used for tool call parsing.
 func (s *Session) SetToolCallFormat(format ToolCallFormat) {
+	if s.inGenerateCallback() {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.c == 0 {

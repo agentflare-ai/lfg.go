@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -717,138 +716,148 @@ func TestChatGenerateWithReasoning(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Generate Loop with Entropy + Confidence Callbacks
+// Generate Loop + Monitor Queues
 // ---------------------------------------------------------------------------
 
-func TestGenerateLoopWithEntropyCallback(t *testing.T) {
+func TestGenerateLoopWithEntropyQueue(t *testing.T) {
 	s := freshSession(t)
 
-	s.ConfigureEntropyMonitor(&lfg.EntropyMonitorConfig{
+	nEmbd, err := s.ConfigureEntropyMonitor(&lfg.EntropyMonitorConfig{
 		Threshold:      0.3,
 		CooldownTokens: 3,
 		RingSize:       8,
 	})
+	if err != nil {
+		t.Fatalf("ConfigureEntropyMonitor: %v", err)
+	}
 
-	var (
-		text           string
-		entropyEvents  int
-		entropyMu      sync.Mutex
-	)
-
+	var text string
 	result, err := s.PromptGenerate("Tell me about the history of computing", true, lfg.GenerateConfig{
 		MaxTokens: 50,
 		TokenCallback: func(token lfg.Token, piece string) lfg.GenerateAction {
 			text += piece
 			return lfg.GenerateContinue
 		},
-		EntropyCallback: func(event lfg.EntropyEvent, embedding []float32) string {
-			entropyMu.Lock()
-			entropyEvents++
-			entropyMu.Unlock()
-			return "" // don't inject anything
-		},
 	})
 	if err != nil {
 		t.Fatalf("PromptGenerate: %v", err)
 	}
 
-	t.Logf("Generated %d tokens, %d entropy events, %d retrievals",
-		result.TokenCount, entropyEvents, result.Retrievals)
+	entropyEvents := 0
+	for {
+		emb := make([]float32, nEmbd)
+		_, ok := s.EntropyPop(emb)
+		if !ok {
+			break
+		}
+		entropyEvents++
+	}
+
+	t.Logf("Generated %d tokens, entropy events=%d", result.TokenCount, entropyEvents)
 	t.Logf("Text: %q", text)
 }
 
-func TestGenerateLoopWithConfidenceCallback(t *testing.T) {
+func TestGenerateLoopWithConfidenceQueue(t *testing.T) {
 	s := freshSession(t)
 
-	s.ConfigureConfidenceMonitor(&lfg.ConfidenceMonitorConfig{
+	nEmbd, err := s.ConfigureConfidenceMonitor(&lfg.ConfidenceMonitorConfig{
 		Threshold: 0.5,
 		MinSpan:   3,
 		RingSize:  8,
 	})
+	if err != nil {
+		t.Fatalf("ConfigureConfidenceMonitor: %v", err)
+	}
 
-	var (
-		text       string
-		confEvents int
-		confMu     sync.Mutex
-	)
-
+	var text string
 	result, err := s.PromptGenerate("The capital of France is Paris, and it is known for", true, lfg.GenerateConfig{
 		MaxTokens: 40,
 		TokenCallback: func(token lfg.Token, piece string) lfg.GenerateAction {
 			text += piece
 			return lfg.GenerateContinue
 		},
-		ConfidenceCallback: func(event lfg.ConfidenceEvent, embedding []float32) {
-			confMu.Lock()
-			confEvents++
-			confMu.Unlock()
-		},
 	})
 	if err != nil {
 		t.Fatalf("PromptGenerate: %v", err)
 	}
 
-	t.Logf("Generated %d tokens, %d confidence events, %d confidence spans",
-		result.TokenCount, confEvents, result.ConfidenceSpans)
+	confEvents := 0
+	for {
+		emb := make([]float32, nEmbd)
+		_, ok := s.ConfidencePop(emb)
+		if !ok {
+			break
+		}
+		confEvents++
+	}
+
+	t.Logf("Generated %d tokens, confidence events=%d", result.TokenCount, confEvents)
 	t.Logf("Text: %q", text)
 }
 
-func TestGenerateLoopWithEntropyInjection(t *testing.T) {
+func TestGenerateLoopWithEntropyRetrievalFromQueue(t *testing.T) {
 	s := freshSession(t)
+	vm := newVectorMemory(s)
+	vm.store("Context: Go is a programming language created by Google.", "confidence")
 
-	s.ConfigureEntropyMonitor(&lfg.EntropyMonitorConfig{
-		Threshold:      0.2, // low threshold to trigger
+	nEmbd, err := s.ConfigureEntropyMonitor(&lfg.EntropyMonitorConfig{
+		Threshold:      0.2,
 		CooldownTokens: 2,
 		RingSize:       8,
 	})
+	if err != nil {
+		t.Fatalf("ConfigureEntropyMonitor: %v", err)
+	}
 
 	var text string
-	injections := 0
-
 	result, err := s.PromptGenerate("What are the main features of", true, lfg.GenerateConfig{
 		MaxTokens: 60,
 		TokenCallback: func(token lfg.Token, piece string) lfg.GenerateAction {
 			text += piece
 			return lfg.GenerateContinue
 		},
-		EntropyCallback: func(event lfg.EntropyEvent, embedding []float32) string {
-			injections++
-			if injections <= 1 {
-				return "Context: Go is a programming language created by Google."
-			}
-			return ""
-		},
 	})
 	if err != nil {
 		t.Fatalf("PromptGenerate: %v", err)
 	}
 
-	t.Logf("Generated %d tokens, %d injection callbacks, %d retrievals",
-		result.TokenCount, injections, result.Retrievals)
+	retrievalHits := 0
+	for {
+		emb := make([]float32, nEmbd)
+		event, ok := s.EntropyPop(emb)
+		if !ok {
+			break
+		}
+		if event.NEmbedding > 0 && len(vm.search(emb[:event.NEmbedding], 1)) > 0 {
+			retrievalHits++
+		}
+	}
+
+	t.Logf("Generated %d tokens, queue retrieval hits=%d", result.TokenCount, retrievalHits)
 	t.Logf("Text: %q", text)
 }
 
-func TestGenerateLoopBothCallbacks(t *testing.T) {
+func TestGenerateLoopWithBothMonitorQueues(t *testing.T) {
 	s := freshSession(t)
 
-	s.ConfigureEntropyMonitor(&lfg.EntropyMonitorConfig{
+	entropyN, err := s.ConfigureEntropyMonitor(&lfg.EntropyMonitorConfig{
 		Threshold:      0.3,
 		CooldownTokens: 3,
 		RingSize:       8,
 	})
-	s.ConfigureConfidenceMonitor(&lfg.ConfidenceMonitorConfig{
+	if err != nil {
+		t.Fatalf("ConfigureEntropyMonitor: %v", err)
+	}
+	confN, err := s.ConfigureConfidenceMonitor(&lfg.ConfidenceMonitorConfig{
 		Threshold: 0.4,
 		MinSpan:   3,
 		RingSize:  8,
 	})
+	if err != nil {
+		t.Fatalf("ConfigureConfidenceMonitor: %v", err)
+	}
 
-	var (
-		text           string
-		entropyEvents  int
-		confEvents     int
-		mu             sync.Mutex
-	)
-
+	var text string
 	result, err := s.PromptGenerate(
 		"Artificial intelligence is transforming many industries including healthcare and finance",
 		true,
@@ -858,27 +867,35 @@ func TestGenerateLoopBothCallbacks(t *testing.T) {
 				text += piece
 				return lfg.GenerateContinue
 			},
-			EntropyCallback: func(event lfg.EntropyEvent, embedding []float32) string {
-				mu.Lock()
-				entropyEvents++
-				mu.Unlock()
-				return ""
-			},
-			ConfidenceCallback: func(event lfg.ConfidenceEvent, embedding []float32) {
-				mu.Lock()
-				confEvents++
-				mu.Unlock()
-			},
 		},
 	)
 	if err != nil {
 		t.Fatalf("PromptGenerate: %v", err)
 	}
 
+	entropyEvents := 0
+	for {
+		emb := make([]float32, entropyN)
+		_, ok := s.EntropyPop(emb)
+		if !ok {
+			break
+		}
+		entropyEvents++
+	}
+
+	confEvents := 0
+	for {
+		emb := make([]float32, confN)
+		_, ok := s.ConfidencePop(emb)
+		if !ok {
+			break
+		}
+		confEvents++
+	}
+
 	t.Logf("Generated %d tokens, entropy_events=%d, confidence_events=%d",
 		result.TokenCount, entropyEvents, confEvents)
-	t.Logf("Result: retrievals=%d, confidence_spans=%d, stop=%d",
-		result.Retrievals, result.ConfidenceSpans, result.StopReason)
+	t.Logf("stop=%d", result.StopReason)
 }
 
 // ---------------------------------------------------------------------------
@@ -894,28 +911,28 @@ func TestChatGenerateWithMonitors(t *testing.T) {
 	endTokens, _ := vocab.Tokenize("</think>", false, true)
 	s.ConfigureReasoning(startTokens, endTokens)
 
-	s.ConfigureEntropyMonitor(&lfg.EntropyMonitorConfig{
+	entropyN, err := s.ConfigureEntropyMonitor(&lfg.EntropyMonitorConfig{
 		Threshold:      0.6,
 		CooldownTokens: 5,
 		RingSize:       8,
 	})
-	s.ConfigureConfidenceMonitor(&lfg.ConfidenceMonitorConfig{
+	if err != nil {
+		t.Fatalf("ConfigureEntropyMonitor: %v", err)
+	}
+	confN, err := s.ConfigureConfidenceMonitor(&lfg.ConfidenceMonitorConfig{
 		Threshold: 0.3,
 		MinSpan:   5,
 		RingSize:  8,
 	})
+	if err != nil {
+		t.Fatalf("ConfigureConfidenceMonitor: %v", err)
+	}
 
 	vm := newVectorMemory(s)
 	vm.store("The user's name is Alice", "user")
 	vm.store("Alice works at a tech company", "confidence")
 
-	var (
-		text           string
-		entropyEvents  int
-		confEvents     int
-		mu             sync.Mutex
-	)
-
+	var text string
 	s.Reset()
 	result, err := s.ChatGenerate(
 		[]lfg.ChatMessage{
@@ -928,31 +945,34 @@ func TestChatGenerateWithMonitors(t *testing.T) {
 				text += piece
 				return lfg.GenerateContinue
 			},
-			EntropyCallback: func(event lfg.EntropyEvent, embedding []float32) string {
-				mu.Lock()
-				entropyEvents++
-				mu.Unlock()
-				if embedding != nil && vm.count() > 0 {
-					results := vm.search(embedding, 3)
-					if len(results) > 0 {
-						return "Relevant context:\n" + strings.Join(results, "\n")
-					}
-				}
-				return ""
-			},
-			ConfidenceCallback: func(event lfg.ConfidenceEvent, embedding []float32) {
-				mu.Lock()
-				confEvents++
-				mu.Unlock()
-			},
 		},
 	)
 	if err != nil {
 		t.Fatalf("ChatGenerate: %v", err)
 	}
 
-	t.Logf("Chat with monitors: %d tokens, entropy=%d, confidence=%d, retrievals=%d",
-		result.TokenCount, entropyEvents, confEvents, result.Retrievals)
+	entropyEvents := 0
+	for {
+		emb := make([]float32, entropyN)
+		_, ok := s.EntropyPop(emb)
+		if !ok {
+			break
+		}
+		entropyEvents++
+	}
+
+	confEvents := 0
+	for {
+		emb := make([]float32, confN)
+		_, ok := s.ConfidencePop(emb)
+		if !ok {
+			break
+		}
+		confEvents++
+	}
+
+	t.Logf("Chat with monitors: %d tokens, entropy=%d, confidence=%d",
+		result.TokenCount, entropyEvents, confEvents)
 	t.Logf("Output: %q", text)
 
 	if text == "" {
@@ -998,10 +1018,10 @@ func TestAgentTurnRespond(t *testing.T) {
 	go runAgentTurn(s, vm, nil, "Hello, how are you?", eventCh, cfg)
 
 	var (
-		gotResponse    bool
-		gotDone        bool
-		tokens         []string
-		responseText   string
+		gotResponse  bool
+		gotDone      bool
+		tokens       []string
+		responseText string
 	)
 
 	for msg := range eventCh {
@@ -1160,12 +1180,6 @@ func TestEmbedDoesNotCorruptChatGenerate(t *testing.T) {
 			TokenCallback: func(token lfg.Token, piece string) lfg.GenerateAction {
 				*text += piece
 				return lfg.GenerateContinue
-			},
-			EntropyCallback: func(event lfg.EntropyEvent, embedding []float32) string {
-				return "" // no injection
-			},
-			ConfidenceCallback: func(event lfg.ConfidenceEvent, embedding []float32) {
-				// no-op
 			},
 		}
 	}
