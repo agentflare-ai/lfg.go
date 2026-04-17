@@ -54,7 +54,6 @@ typedef struct lfg_session_config {
     int n_batch;
     bool enable_healing;
     bool structured_checkpointing; // Snapshot sampler state for structured decoding.
-    int reasoning_budget;          // 0 = disabled. Number of tokens allowed for reasoning.
     int32_t max_tokens;            // 0 = unlimited. Max tokens to generate per reset cycle.
     lfg_tool_score_mode tool_score_mode;  // Tool injection gating. 0 = OFF (always inject).
     float tool_min_score;                  // Threshold value. AUTO: gap above mean. FIXED: absolute minimum.
@@ -338,6 +337,11 @@ typedef enum { LFG_GENERATE_CONTINUE = 0, LFG_GENERATE_STOP = 1 } lfg_generate_a
 typedef lfg_generate_action (*lfg_generate_token_cb)(
     lfg_token token, const char * piece, int32_t piece_len, void * user_data);
 
+// Optional live entropy hook. Called after sampling, before token ingest.
+// Return non-NULL text to rewind to the event checkpoint and inject context.
+typedef const char *(*lfg_generate_entropy_cb)(
+    const lfg_entropy_event * event, const float * embedding, void * user_data);
+
 typedef struct lfg_generate_config {
     int32_t  max_tokens;          // Hard token limit. 0 = use session config.
 
@@ -349,6 +353,11 @@ typedef struct lfg_generate_config {
     // Streaming callback (nullable — NULL means no callback)
     lfg_generate_token_cb      token_cb;
     void                     * token_cb_data;
+
+    // Live entropy interception (nullable — NULL means caller can consume
+    // entropy events later via lfg_session_entropy_pop()).
+    lfg_generate_entropy_cb    entropy_cb;
+    void                     * entropy_cb_data;
 
     // Auto tool execution (observational callback + round limit)
     lfg_tool_call_cb           tool_call_cb;       // nullable, fired after each auto-executed tool call
@@ -366,7 +375,7 @@ typedef enum {
 
 typedef struct lfg_generate_result {
     int32_t          n_tokens;            // Tokens generated
-    int32_t          n_retrievals;        // Reserved (always 0). Retrieval is caller-orchestrated via entropy_pop.
+    int32_t          n_retrievals;        // Live entropy rewinds/injections performed during generation.
     int32_t          n_confidence_spans;  // Reserved (always 0). Consume confidence events via confidence_pop.
     int32_t          n_surprise_events;   // Reserved (always 0). Consume surprise events via surprise_pop.
     int32_t          n_tool_calls;        // Number of parsed tool calls (0 if none or non-tool-call stop)
@@ -397,6 +406,39 @@ LFG_API lfg_generate_result lfg_session_chat_generate(
     lfg_session * session,
     const lfg_chat_message * messages, size_t n_messages,
     lfg_generate_config config);
+
+// --- Guardrails API ---
+
+typedef enum {
+    LFG_GUARDRAIL_LEVEL_NONE           = 0,
+    LFG_GUARDRAIL_LEVEL_L3_OFF         = 1,
+    LFG_GUARDRAIL_LEVEL_L2_OFF         = 2,
+    LFG_GUARDRAIL_LEVEL_RETRIEVAL_MIN  = 3,
+    LFG_GUARDRAIL_LEVEL_RETRIEVAL_OFF  = 4,
+    LFG_GUARDRAIL_LEVEL_WRITES_OFF     = 5,
+    LFG_GUARDRAIL_LEVEL_TRAINING_OFF   = 6,
+} lfg_guardrail_level;
+
+typedef struct lfg_guardrail_config {
+    bool     enabled;
+    int32_t  window_size;          // Rolling window size for percentiles (default 64)
+    float    p50_tps_min;          // Minimum p50 tokens/sec (0 = disable)
+    float    p95_latency_ms_max;   // Maximum p95 latency in ms (0 = disable)
+    size_t   memory_cap_bytes;     // Reserved for future memory guardrails (0 = disable)
+} lfg_guardrail_config;
+
+typedef struct lfg_guardrail_stats {
+    int32_t             window_size;
+    int32_t             sample_count;
+    float               p50_tps;
+    float               p95_latency_ms;
+    lfg_guardrail_level level;
+    size_t              memory_bytes;
+} lfg_guardrail_stats;
+
+LFG_API lfg_guardrail_config lfg_guardrail_default_config(void);
+LFG_API bool lfg_session_configure_guardrails(lfg_session * session, const lfg_guardrail_config * config);
+LFG_API bool lfg_session_get_guardrail_stats(lfg_session * session, lfg_guardrail_stats * out);
 
 // --- Last Formatted Prompt ---
 
