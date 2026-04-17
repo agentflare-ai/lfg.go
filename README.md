@@ -5,6 +5,7 @@ Go bindings for [LFG (Liquid Foundation Generation)](deps/lfg.cpp), a high-perfo
 ## Overview
 
 `lfg.go` provides a Go interface to the `lfg.cpp` library using [purego](https://github.com/ebitengine/purego) for dynamic library loading — no CGO required. This means `CGO_ENABLED=0` builds work out of the box.
+The vendored native runtime lives in [`deps/lfg.cpp`](deps/lfg.cpp) and tracks the upstream open-source release.
 
 ## Prerequisites
 
@@ -15,7 +16,7 @@ Go bindings for [LFG (Liquid Foundation Generation)](deps/lfg.cpp), a high-perfo
 
 | OS | Arch | Library |
 |---|---|---|
-| macOS | arm64 | `liblfg.dylib` |
+| macOS | arm64 | `liblfg-macos-aarch64.dylib` |
 | Linux | amd64 | `liblfg-linux-x86_64.so` |
 | Linux | arm64 | `liblfg-linux-aarch64.so` |
 
@@ -24,8 +25,9 @@ Go bindings for [LFG (Liquid Foundation Generation)](deps/lfg.cpp), a high-perfo
 The library is located at runtime in this order:
 
 1. `LFG_LIB_PATH` environment variable (explicit path to the shared library)
-2. `deps/lfg.cpp/dist/` relative to the source directory
-3. System search paths (`dlopen` defaults)
+2. `deps/lfg.cpp/dist/lib/` relative to the source directory
+3. Legacy `deps/lfg.cpp/dist/` relative to the source directory
+4. System search paths (`dlopen` defaults)
 
 ## Building
 
@@ -198,6 +200,7 @@ lfg.GenerateConfig{
 	MaxTokens:               256,
 	IncludeHistoryReasoning: false,          // include <think> blocks in chat history
 	TokenCallback:           func(...) ...,  // per token (optional)
+	EntropyCallback:         func(...) ...,  // live entropy rewind/injection hook (optional)
 	ToolCallCallback:        func(...) ...,  // auto-executed tool observation (optional)
 	MaxToolRounds:           5,              // max auto-execution rounds (0 = default 5)
 }
@@ -334,6 +337,21 @@ for {
 }
 ```
 
+Or intercept high-entropy events inline during generation and inject context immediately:
+
+```go
+_, _ = session.PromptGenerate("prompt", true, lfg.GenerateConfig{
+	MaxTokens: 256,
+	EntropyCallback: func(event lfg.EntropyEvent, embedding []float32) string {
+		if len(embedding) == 0 {
+			return ""
+		}
+		// Return text to rewind to event.CheckpointID and inject it before continuing.
+		return "Relevant retrieved context goes here."
+	},
+})
+```
+
 ### Confidence Monitor
 
 Detect sustained low-entropy spans (where the model is confident) via queue pop:
@@ -375,4 +393,4 @@ for {
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+Apache-2.0. See [LICENSE](LICENSE) for details.

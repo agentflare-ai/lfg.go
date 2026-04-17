@@ -51,3 +51,20 @@ func cStringPtr(b []byte) uintptr {
 	}
 	return uintptr(unsafe.Pointer(&b[0]))
 }
+
+// mallocCString allocates a NUL-terminated C string via native malloc.
+// The caller is responsible for ensuring native code eventually frees it.
+func mallocCString(s string) uintptr {
+	registerSessionFuncs()
+
+	n := len(s)
+	ptr := _malloc(uintptr(n + 1))
+	if ptr == 0 {
+		return 0
+	}
+
+	dst := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), n+1)
+	copy(dst, s)
+	dst[n] = 0
+	return ptr
+}

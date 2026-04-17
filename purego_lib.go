@@ -13,30 +13,30 @@ import (
 )
 
 var (
-	libOnce  sync.Once
+	libOnce   sync.Once
 	libHandle uintptr
-	libErr   error
+	libErr    error
 )
 
-func libraryName() string {
+func libraryNames() []string {
 	switch runtime.GOOS {
 	case "darwin":
-		return "liblfg.dylib"
+		return []string{"liblfg-macos-aarch64.dylib", "liblfg.dylib"}
 	case "linux":
 		switch runtime.GOARCH {
 		case "amd64":
-			return "liblfg-linux-x86_64.so"
+			return []string{"liblfg-linux-x86_64.so"}
 		case "arm64":
-			return "liblfg-linux-aarch64.so"
+			return []string{"liblfg-linux-aarch64.so"}
 		}
 	}
-	return ""
+	return nil
 }
 
 func loadLibrary() (uintptr, error) {
 	libOnce.Do(func() {
-		name := libraryName()
-		if name == "" {
+		names := libraryNames()
+		if len(names) == 0 {
 			libErr = fmt.Errorf("lfg: unsupported platform %s/%s", runtime.GOOS, runtime.GOARCH)
 			return
 		}
@@ -49,17 +49,30 @@ func loadLibrary() (uintptr, error) {
 			}
 		}
 
-		// 2. Relative to source directory (deps/lfg.cpp/dist/)
+		// 2. Relative to source directory (deps/lfg.cpp/dist/lib/, then legacy dist/)
 		_, thisFile, _, _ := runtime.Caller(0)
-		distDir := filepath.Join(filepath.Dir(thisFile), "deps", "lfg.cpp", "dist")
-		relPath := filepath.Join(distDir, name)
-		libHandle, libErr = purego.Dlopen(relPath, purego.RTLD_NOW|purego.RTLD_GLOBAL)
-		if libErr == nil {
-			return
+		baseDir := filepath.Join(filepath.Dir(thisFile), "deps", "lfg.cpp", "dist")
+		searchDirs := []string{
+			filepath.Join(baseDir, "lib"),
+			baseDir,
+		}
+		for _, dir := range searchDirs {
+			for _, name := range names {
+				relPath := filepath.Join(dir, name)
+				libHandle, libErr = purego.Dlopen(relPath, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+				if libErr == nil {
+					return
+				}
+			}
 		}
 
 		// 3. System search (dlopen default paths)
-		libHandle, libErr = purego.Dlopen(name, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+		for _, name := range names {
+			libHandle, libErr = purego.Dlopen(name, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+			if libErr == nil {
+				return
+			}
+		}
 	})
 	return libHandle, libErr
 }

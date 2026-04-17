@@ -2,3 +2,5 @@ lfg-macos-arm64
 lfg-linux-amd64
 lfg-linux-arm64
 lfg-windows-amd64.exe
+models/
+chat.plan.md

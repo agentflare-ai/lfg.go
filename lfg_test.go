@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // testModel is the shared model instance loaded once in TestMain.
@@ -2473,8 +2474,17 @@ func TestDefaultGenerateConfig(t *testing.T) {
 	if cfg.TokenCallback != nil {
 		t.Fatal("DefaultGenerateConfig().TokenCallback should be nil")
 	}
+	if cfg.EntropyCallback != nil {
+		t.Fatal("DefaultGenerateConfig().EntropyCallback should be nil")
+	}
 	if cfg.ToolCallCallback != nil {
 		t.Fatal("DefaultGenerateConfig().ToolCallCallback should be nil")
+	}
+}
+
+func TestGenerateConfigLayout(t *testing.T) {
+	if got := unsafe.Sizeof(cGenerateConfig{}); got != 64 {
+		t.Fatalf("sizeof(cGenerateConfig) = %d, want 64", got)
 	}
 }
 
@@ -3306,6 +3316,111 @@ func TestGenerateLoopRetrievalsZeroWithoutEntropy(t *testing.T) {
 
 	if result.Retrievals != 0 {
 		t.Fatalf("expected 0 retrievals without entropy monitor, got %d", result.Retrievals)
+	}
+}
+
+func TestGenerateLoopEntropyCallbackNoInjection(t *testing.T) {
+	m := requireModel(t)
+
+	sc := DefaultSamplingConfig()
+	sc.Seed = 42
+	sc.Temp = 0.8
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(sc),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	nEmbd, err := s.ConfigureEntropyMonitor(&EntropyMonitorConfig{
+		Threshold:      0.1,
+		CooldownTokens: 1,
+		RingSize:       8,
+	})
+	if err != nil {
+		t.Fatalf("ConfigureEntropyMonitor: %v", err)
+	}
+
+	callbacks := 0
+	result, err := s.PromptGenerate("The meaning of life is", true, GenerateConfig{
+		MaxTokens: 16,
+		EntropyCallback: func(event EntropyEvent, embedding []float32) string {
+			callbacks++
+			if event.NEmbedding > 0 && len(embedding) != int(event.NEmbedding) {
+				t.Fatalf("entropy embedding len = %d, want %d", len(embedding), event.NEmbedding)
+			}
+			if event.NEmbedding == 0 && len(embedding) != 0 {
+				t.Fatalf("entropy embedding len = %d, want 0", len(embedding))
+			}
+			return ""
+		},
+	})
+	if err != nil {
+		t.Fatalf("PromptGenerate: %v", err)
+	}
+
+	if callbacks == 0 {
+		t.Fatal("expected entropy callback to fire at least once")
+	}
+	if result.Retrievals != 0 {
+		t.Fatalf("expected 0 retrievals without injection, got %d", result.Retrievals)
+	}
+	if nEmbd > 0 && callbacks > 0 {
+		t.Logf("Entropy callback observed embedding length %d", nEmbd)
+	}
+}
+
+func TestGenerateLoopEntropyCallbackInjection(t *testing.T) {
+	m := requireModel(t)
+
+	sc := DefaultSamplingConfig()
+	sc.Seed = 42
+	sc.Temp = 0.8
+
+	s, err := NewSession(m,
+		WithSessionNCtx(512),
+		WithSessionSampling(sc),
+	)
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer s.Close()
+
+	_, err = s.ConfigureEntropyMonitor(&EntropyMonitorConfig{
+		Threshold:      0.1,
+		CooldownTokens: 1,
+		RingSize:       8,
+	})
+	if err != nil {
+		t.Fatalf("ConfigureEntropyMonitor: %v", err)
+	}
+
+	injected := false
+	result, err := s.PromptGenerate("The meaning of life is", true, GenerateConfig{
+		MaxTokens: 16,
+		EntropyCallback: func(event EntropyEvent, embedding []float32) string {
+			if injected {
+				return ""
+			}
+			injected = true
+			if event.NEmbedding > 0 && len(embedding) != int(event.NEmbedding) {
+				t.Fatalf("entropy embedding len = %d, want %d", len(embedding), event.NEmbedding)
+			}
+			return " context: Paris is the capital of France."
+		},
+	})
+	if err != nil {
+		t.Fatalf("PromptGenerate: %v", err)
+	}
+
+	if !injected {
+		t.Fatal("expected entropy callback to inject at least once")
+	}
+	if result.Retrievals <= 0 {
+		t.Fatalf("expected retrieval count > 0 after injection, got %d", result.Retrievals)
 	}
 }
 

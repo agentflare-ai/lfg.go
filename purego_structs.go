@@ -244,6 +244,8 @@ type cGenerateConfig struct {
 	_                       [3]byte // padding to 8
 	TokenCB                 uintptr // lfg_generate_token_cb
 	TokenCBData             uintptr // void *
+	EntropyCB               uintptr // lfg_generate_entropy_cb
+	EntropyCBData           uintptr // void *
 	ToolCallCB              uintptr // lfg_tool_call_cb
 	ToolCallCBData          uintptr // void *
 	MaxToolRounds           int32   // 0 = default (5)
