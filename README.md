@@ -1,16 +1,17 @@
 # lfg.go
 
-Go bindings for [LFG (Liquid Foundation Generation)](deps/lfg.cpp), a high-performance inference engine for Liquid AI LFM models.
+Go bindings for [LFG (Liquid Foundation Generation)](deps/lfg.cpp), the native inference runtime for Liquid AI's Liquid Foundation Models (LFMs).
 
 ## Overview
 
-`lfg.go` provides a Go interface to the `lfg.cpp` library using [purego](https://github.com/ebitengine/purego) for dynamic library loading — no CGO required. This means `CGO_ENABLED=0` builds work out of the box.
-The vendored native runtime lives in [`deps/lfg.cpp`](deps/lfg.cpp) and tracks the upstream open-source release.
+`lfg.go` exposes the `lfg.cpp` session API to Go via [purego](https://github.com/ebitengine/purego), so applications can load the native runtime dynamically without CGO. Standard `CGO_ENABLED=0` builds work out of the box, and the vendored runtime in [`deps/lfg.cpp`](deps/lfg.cpp) tracks the upstream open-source release.
 
-## Prerequisites
+The package is intended for Liquid Foundation Models. Although models are loaded from GGUF files, compatibility should be treated as LFM-specific rather than as support for arbitrary GGUF models.
+
+## Requirements
 
 - **Go**: 1.22+
-- **Shared library**: A pre-built `liblfg` shared library for your platform
+- **Native runtime**: A prebuilt `liblfg` shared library for your platform
 
 ### Supported Platforms
 
@@ -20,9 +21,9 @@ The vendored native runtime lives in [`deps/lfg.cpp`](deps/lfg.cpp) and tracks t
 | Linux | amd64 | `liblfg-linux-x86_64.so` |
 | Linux | arm64 | `liblfg-linux-aarch64.so` |
 
-### Library Resolution
+### Library Discovery
 
-The library is located at runtime in this order:
+At runtime, `lfg.go` resolves the shared library in this order:
 
 1. `LFG_LIB_PATH` environment variable (explicit path to the shared library)
 2. `deps/lfg.cpp/dist/lib/` relative to the source directory
@@ -47,9 +48,9 @@ make vet     # go vet (with -unsafeptr=false for purego)
 
 ## Quick Start
 
-### Chat Generation (Recommended)
+### Chat Generation
 
-The highest-level API. Formats messages with the model's chat template, tokenizes, and generates in a single call:
+The highest-level API formats messages with the model chat template, tokenizes them, and runs generation in a single call:
 
 ```go
 package main
