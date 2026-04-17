@@ -22,6 +22,7 @@
 #include <vector>
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 
 // ---------------------------------------------------------------------------
 // Application state (shared between main and inference thread)
@@ -42,26 +43,43 @@ struct ChatMessage {
         thinking_out.clear();
         output_out.clear();
 
-        size_t open_pos = text.find(THINK_OPEN);
-        if (open_pos == std::string::npos) {
-            // No thinking block — everything is output
-            output_out = text;
-            return;
+        // Parse sequentially so multiple <think> blocks don't reclassify
+        // already-emitted content.
+        size_t i = 0;
+        while (i < text.size()) {
+            size_t open_pos = text.find(THINK_OPEN, i);
+            if (open_pos == std::string::npos) {
+                output_out.append(text.substr(i));
+                break;
+            }
+            output_out.append(text.substr(i, open_pos - i));
+            size_t content_start = open_pos + OPEN_LEN;
+            size_t close_pos = text.find(THINK_CLOSE, content_start);
+            if (close_pos == std::string::npos) {
+                thinking_out.append(text.substr(content_start));
+                break;
+            }
+            thinking_out.append(text.substr(content_start, close_pos - content_start));
+            i = close_pos + CLOSE_LEN;
         }
+    }
 
-        // Text before <think> (if any) is output
-        output_out = text.substr(0, open_pos);
+    bool has_unclosed_think() const {
+        static const char *THINK_OPEN  = "<think>";
+        static const char *THINK_CLOSE = "</think>";
+        static const size_t OPEN_LEN  = 7;
+        static const size_t CLOSE_LEN = 8;
 
-        size_t think_start = open_pos + OPEN_LEN;
-        size_t close_pos = text.find(THINK_CLOSE, think_start);
-        if (close_pos == std::string::npos) {
-            // Still thinking (no close tag yet)
-            thinking_out = text.substr(think_start);
-        } else {
-            thinking_out = text.substr(think_start, close_pos - think_start);
-            // Text after </think> is output
-            output_out += text.substr(close_pos + CLOSE_LEN);
+        size_t i = 0;
+        while (i < text.size()) {
+            size_t open_pos = text.find(THINK_OPEN, i);
+            if (open_pos == std::string::npos) return false;
+            size_t content_start = open_pos + OPEN_LEN;
+            size_t close_pos = text.find(THINK_CLOSE, content_start);
+            if (close_pos == std::string::npos) return true;
+            i = close_pos + CLOSE_LEN;
         }
+        return false;
     }
 };
 
@@ -386,6 +404,16 @@ struct AppState {
     lfg_model *model = nullptr;
     lfg_session *session = nullptr;
     bool model_loaded = false;
+    std::atomic<bool> model_loading{false};
+    std::atomic<bool> model_load_finished{false};
+    lfg_model *pending_model = nullptr;
+    lfg_session *pending_session = nullptr;
+    lfg_model_stats pending_model_stats = {};
+    int32_t pending_entropy_n_embd = 0;
+    int32_t pending_confidence_n_embd = 0;
+    int32_t pending_surprise_n_embd = 0;
+    std::string pending_model_log;
+    std::string pending_model_error;
     lfg_model_stats model_stats = {};
 
     // Generation
@@ -408,6 +436,10 @@ struct AppState {
     bool entropy_enabled = false;
     bool confidence_enabled = false;
     bool surprise_enabled = false;
+    int32_t entropy_n_embd = 0;
+    int32_t confidence_n_embd = 0;
+    int32_t surprise_n_embd = 0;
+    bool monitors_reconfigure_pending = false;
 
     // Status bar
     float last_entropy = -1.0f;
@@ -509,6 +541,8 @@ static void surprise_callback(
     }
 
     state->surprise_log.push_back(std::move(entry));
+    state->last_surprise_count = event->n_above_threshold;
+    state->last_surprise_mean = event->mean_surprise;
 }
 
 // ---------------------------------------------------------------------------
@@ -601,6 +635,69 @@ static void confidence_callback(
     state->confidence_log.push_back(std::move(entry));
 }
 
+// Drain queued monitor events after generation (queue-based API).
+// Note: entropy injection here is informational only; generation is already complete.
+static void drain_monitors(AppState *state) {
+    if (!state || !state->session) return;
+
+    bool entropy_enabled = false;
+    bool confidence_enabled = false;
+    bool surprise_enabled = false;
+    int32_t entropy_n_embd = 0;
+    int32_t confidence_n_embd = 0;
+    int32_t surprise_n_embd = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(state->mtx);
+        entropy_enabled = state->entropy_enabled;
+        confidence_enabled = state->confidence_enabled;
+        surprise_enabled = state->surprise_enabled;
+        entropy_n_embd = state->entropy_n_embd;
+        confidence_n_embd = state->confidence_n_embd;
+        surprise_n_embd = state->surprise_n_embd;
+    }
+
+    if (entropy_enabled) {
+        std::vector<float> embd;
+        float *buf = nullptr;
+        if (entropy_n_embd > 0) {
+            embd.resize(entropy_n_embd);
+            buf = embd.data();
+        }
+        lfg_entropy_event ev;
+        while (lfg_session_entropy_pop(state->session, &ev, buf, entropy_n_embd)) {
+            const char *inject = entropy_callback(&ev, buf, state);
+            (void)inject;
+        }
+    }
+
+    if (confidence_enabled) {
+        std::vector<float> embd;
+        float *buf = nullptr;
+        if (confidence_n_embd > 0) {
+            embd.resize(confidence_n_embd);
+            buf = embd.data();
+        }
+        lfg_confidence_event ev;
+        while (lfg_session_confidence_pop(state->session, &ev, buf, confidence_n_embd)) {
+            confidence_callback(&ev, buf, state);
+        }
+    }
+
+    if (surprise_enabled) {
+        std::vector<float> embd;
+        float *buf = nullptr;
+        if (surprise_n_embd > 0) {
+            embd.resize(surprise_n_embd);
+            buf = embd.data();
+        }
+        lfg_surprise_event ev;
+        while (lfg_session_surprise_pop(state->session, &ev, buf, surprise_n_embd)) {
+            surprise_callback(&ev, buf, state);
+        }
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Tool call observation callback (for Tools tab logging)
@@ -636,6 +733,7 @@ static void inference_thread_func(AppState *state) {
     // Build message array from chat history
     std::vector<ChatMessage> msgs_copy;
     lfg_generate_config gen_cfg;
+    bool use_live_entropy = false;
     {
         std::lock_guard<std::mutex> lock(state->mtx);
         msgs_copy = state->messages;
@@ -647,6 +745,12 @@ static void inference_thread_func(AppState *state) {
         // Auto tool execution: tool_call_observer logs to Tools tab
         gen_cfg.tool_call_cb = tool_call_observer;
         gen_cfg.tool_call_cb_data = state;
+        use_live_entropy = state->entropy_enabled;
+    }
+
+    if (use_live_entropy) {
+        gen_cfg.entropy_cb = entropy_callback;
+        gen_cfg.entropy_cb_data = state;
     }
 
     // Convert to lfg_chat_message array.
@@ -697,10 +801,14 @@ static void inference_thread_func(AppState *state) {
         int32_t needed = lfg_session_rank_tools(state->session,
             rank_query.c_str(), (int32_t)rank_query.size(), nullptr, 0);
         if (needed > 0) {
-            rank_output.resize(needed);
-            lfg_session_rank_tools(state->session,
+            // Allocate +1 for NUL terminator required by C API.
+            std::vector<char> rank_buf((size_t)needed + 1);
+            int32_t written = lfg_session_rank_tools(state->session,
                 rank_query.c_str(), (int32_t)rank_query.size(),
-                &rank_output[0], needed + 1);
+                rank_buf.data(), (int32_t)rank_buf.size());
+            if (written > 0) {
+                rank_output.assign(rank_buf.data(), (size_t)written);
+            }
         }
     }
 
@@ -713,6 +821,10 @@ static void inference_thread_func(AppState *state) {
             raw_output.assign(out_ptr, static_cast<size_t>(out_len));
         }
     }
+
+    // Drain queued monitor events now that generation is complete.
+    // Entropy events are consumed live when the demo enables the entropy hook.
+    drain_monitors(state);
 
     {
         std::lock_guard<std::mutex> lock(state->mtx);
@@ -769,13 +881,22 @@ static void recreate_session(AppState *state) {
 
     // Configure monitors
     if (state->entropy_enabled) {
-        lfg_session_configure_entropy_monitor(state->session, &state->entropy_cfg);
+        state->entropy_n_embd =
+            lfg_session_configure_entropy_monitor(state->session, &state->entropy_cfg);
+    } else {
+        state->entropy_n_embd = 0;
     }
     if (state->confidence_enabled) {
-        lfg_session_configure_confidence_monitor(state->session, &state->confidence_cfg);
+        state->confidence_n_embd =
+            lfg_session_configure_confidence_monitor(state->session, &state->confidence_cfg);
+    } else {
+        state->confidence_n_embd = 0;
     }
     if (state->surprise_enabled) {
-        lfg_session_configure_surprise_monitor(state->session, &state->surprise_cfg);
+        state->surprise_n_embd =
+            lfg_session_configure_surprise_monitor(state->session, &state->surprise_cfg);
+    } else {
+        state->surprise_n_embd = 0;
     }
 
     // Register tools
@@ -792,6 +913,67 @@ static void recreate_session(AppState *state) {
     state->needs_session_recreate = false;
     state->log_buffer += "Session created (n_ctx=" + std::to_string(state->session_cfg.n_ctx) +
                          ", threads=" + std::to_string(state->session_cfg.n_threads) + ")\n";
+}
+
+// Poll async model loading completion and finalize on the UI thread.
+static void poll_model_load_completion(AppState *state) {
+    if (!state->model_load_finished.load()) return;
+
+    lfg_model *loaded_model = nullptr;
+    lfg_session *loaded_session = nullptr;
+    lfg_model_stats loaded_stats = {};
+    int32_t entropy_n_embd = 0;
+    int32_t confidence_n_embd = 0;
+    int32_t surprise_n_embd = 0;
+    std::string load_log;
+    std::string load_error;
+
+    {
+        std::lock_guard<std::mutex> lock(state->mtx);
+        if (!state->model_load_finished.load()) return;
+
+        state->model_load_finished.store(false);
+        loaded_model = state->pending_model;
+        loaded_session = state->pending_session;
+        loaded_stats = state->pending_model_stats;
+        entropy_n_embd = state->pending_entropy_n_embd;
+        confidence_n_embd = state->pending_confidence_n_embd;
+        surprise_n_embd = state->pending_surprise_n_embd;
+        load_log = state->pending_model_log;
+        state->pending_model = nullptr;
+        state->pending_session = nullptr;
+        state->pending_model_stats = {};
+        state->pending_entropy_n_embd = 0;
+        state->pending_confidence_n_embd = 0;
+        state->pending_surprise_n_embd = 0;
+        state->pending_model_log.clear();
+        load_error = state->pending_model_error;
+        state->pending_model_error.clear();
+    }
+
+    if (loaded_model && loaded_session) {
+        state->model = loaded_model;
+        state->session = loaded_session;
+        state->model_stats = loaded_stats;
+        state->entropy_n_embd = entropy_n_embd;
+        state->confidence_n_embd = confidence_n_embd;
+        state->surprise_n_embd = surprise_n_embd;
+        state->model_loaded = true;
+        state->needs_session_recreate = false;
+        state->log_buffer += "Model loaded. Params: " +
+            std::to_string(state->model_stats.n_params) +
+            ", vocab: " + std::to_string(state->model_stats.n_vocab) +
+            ", ctx_train: " + std::to_string(state->model_stats.n_ctx_train) + "\n";
+        state->log_buffer += "Session created (n_ctx=" + std::to_string(state->session_cfg.n_ctx) +
+                             ", threads=" + std::to_string(state->session_cfg.n_threads) + ")\n";
+        if (!load_log.empty()) {
+            state->log_buffer += load_log;
+        }
+    } else {
+        state->log_buffer += load_error.empty()
+            ? "ERROR: Failed to load model\n"
+            : (load_error + "\n");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -892,30 +1074,136 @@ static void draw_model_panel(AppState *state) {
         }
     }
 
-    bool can_load = !state->model_loaded && !state->generating;
-    bool can_unload = state->model_loaded && !state->generating;
+    bool can_load = !state->model_loaded && !state->model_loading.load() && !state->generating;
+    bool can_unload = state->model_loaded && !state->model_loading.load() && !state->generating;
 
     if (!can_load) ImGui::BeginDisabled();
     if (ImGui::Button("Load Model")) {
-        state->log_buffer += "Loading model: " + std::string(model_path_buf) + "...\n";
-
-        lfg_model_load_config load_cfg = lfg_model_load_default_config();
-        load_cfg.model_path = model_path_buf;
-
-        state->model = lfg_load_model(&load_cfg);
-        if (state->model) {
-            state->model_loaded = true;
-            state->model_stats = lfg_model_get_stats(state->model);
-            state->log_buffer += "Model loaded. Params: " +
-                std::to_string(state->model_stats.n_params) +
-                ", vocab: " + std::to_string(state->model_stats.n_vocab) +
-                ", ctx_train: " + std::to_string(state->model_stats.n_ctx_train) + "\n";
-
-            // Create session with current config
-            recreate_session(state);
-        } else {
-            state->log_buffer += "ERROR: Failed to load model\n";
+        const std::string model_path = model_path_buf;
+        lfg_session_config session_cfg_snapshot = {};
+        lfg_entropy_monitor_config entropy_cfg_snapshot = {};
+        lfg_confidence_monitor_config confidence_cfg_snapshot = {};
+        lfg_surprise_monitor_config surprise_cfg_snapshot = {};
+        bool entropy_enabled_snapshot = false;
+        bool confidence_enabled_snapshot = false;
+        bool surprise_enabled_snapshot = false;
+        bool tools_enabled_snapshot = false;
+        int32_t tool_top_k_snapshot = 0;
+        {
+            std::lock_guard<std::mutex> lock(state->mtx);
+            state->model_loading.store(true);
+            state->model_load_finished.store(false);
+            state->pending_model = nullptr;
+            state->pending_session = nullptr;
+            state->pending_model_stats = {};
+            state->pending_entropy_n_embd = 0;
+            state->pending_confidence_n_embd = 0;
+            state->pending_surprise_n_embd = 0;
+            state->pending_model_log.clear();
+            state->pending_model_error.clear();
+            session_cfg_snapshot = state->session_cfg;
+            entropy_cfg_snapshot = state->entropy_cfg;
+            confidence_cfg_snapshot = state->confidence_cfg;
+            surprise_cfg_snapshot = state->surprise_cfg;
+            entropy_enabled_snapshot = state->entropy_enabled;
+            confidence_enabled_snapshot = state->confidence_enabled;
+            surprise_enabled_snapshot = state->surprise_enabled;
+            tools_enabled_snapshot = state->tools_enabled;
+            tool_top_k_snapshot = state->tool_top_k;
+            state->log_buffer += "Loading model: " + model_path + "...\n";
         }
+
+        std::thread([state, model_path, session_cfg_snapshot,
+                     entropy_cfg_snapshot, confidence_cfg_snapshot, surprise_cfg_snapshot,
+                     entropy_enabled_snapshot, confidence_enabled_snapshot, surprise_enabled_snapshot,
+                     tools_enabled_snapshot, tool_top_k_snapshot]() {
+            auto t_start = std::chrono::steady_clock::now();
+            auto ms_since_start = [&]() -> double {
+                auto now = std::chrono::steady_clock::now();
+                return std::chrono::duration<double, std::milli>(now - t_start).count();
+            };
+
+            lfg_model_load_config load_cfg = lfg_model_load_default_config();
+            load_cfg.model_path = model_path.c_str();
+
+            lfg_model *loaded = lfg_load_model(&load_cfg);
+            lfg_session *loaded_session = nullptr;
+            lfg_model_stats loaded_stats = {};
+            int32_t entropy_n_embd = 0;
+            int32_t confidence_n_embd = 0;
+            int32_t surprise_n_embd = 0;
+            std::string load_log;
+            std::string load_error;
+
+            if (!loaded) {
+                load_error = "ERROR: Failed to load model";
+            } else {
+                char line[128];
+                std::snprintf(line, sizeof(line), "Stage: model loaded (%.1f ms)\n", ms_since_start());
+                load_log += line;
+
+                loaded_stats = lfg_model_get_stats(loaded);
+                loaded_session = lfg_session_create(loaded, &session_cfg_snapshot);
+                if (!loaded_session) {
+                    load_error = "ERROR: Failed to create session";
+                } else {
+                    std::snprintf(line, sizeof(line), "Stage: session created (%.1f ms)\n", ms_since_start());
+                    load_log += line;
+
+                    if (entropy_enabled_snapshot) {
+                        entropy_n_embd =
+                            lfg_session_configure_entropy_monitor(loaded_session, &entropy_cfg_snapshot);
+                    }
+                    if (confidence_enabled_snapshot) {
+                        confidence_n_embd =
+                            lfg_session_configure_confidence_monitor(loaded_session, &confidence_cfg_snapshot);
+                    }
+                    if (surprise_enabled_snapshot) {
+                        surprise_n_embd =
+                            lfg_session_configure_surprise_monitor(loaded_session, &surprise_cfg_snapshot);
+                    }
+                    if (entropy_enabled_snapshot || confidence_enabled_snapshot || surprise_enabled_snapshot) {
+                        std::snprintf(line, sizeof(line), "Stage: monitors configured (%.1f ms)\n", ms_since_start());
+                        load_log += line;
+                    }
+                    if (tools_enabled_snapshot) {
+                        int32_t n = lfg_session_register_tools(
+                            loaded_session, EXAMPLE_TOOLS, N_EXAMPLE_TOOLS, tool_top_k_snapshot);
+                        if (n > 0) {
+                            load_log += "Registered " + std::to_string(n) + " tools (top_k=" +
+                                        std::to_string(tool_top_k_snapshot) + ")\n";
+                        } else {
+                            load_log += "WARNING: Failed to register tools\n";
+                        }
+                        std::snprintf(line, sizeof(line), "Stage: tools registered (%.1f ms)\n", ms_since_start());
+                        load_log += line;
+                    }
+                }
+            }
+
+            if (!load_error.empty()) {
+                if (loaded_session) {
+                    lfg_session_free(loaded_session);
+                    loaded_session = nullptr;
+                }
+                if (loaded) {
+                    lfg_model_free(loaded);
+                    loaded = nullptr;
+                }
+            }
+
+            std::lock_guard<std::mutex> lock(state->mtx);
+            state->pending_model = loaded;
+            state->pending_session = loaded_session;
+            state->pending_model_stats = loaded_stats;
+            state->pending_entropy_n_embd = entropy_n_embd;
+            state->pending_confidence_n_embd = confidence_n_embd;
+            state->pending_surprise_n_embd = surprise_n_embd;
+            state->pending_model_log = std::move(load_log);
+            state->pending_model_error = std::move(load_error);
+            state->model_loading.store(false);
+            state->model_load_finished.store(true);
+        }).detach();
     }
     if (!can_load) ImGui::EndDisabled();
 
@@ -940,6 +1228,10 @@ static void draw_model_panel(AppState *state) {
     }
     if (!can_unload) ImGui::EndDisabled();
 
+    if (state->model_loading.load()) {
+        ImGui::TextDisabled("Loading... UI remains responsive.");
+    }
+
     if (state->model_loaded) {
         ImGui::Text("Params: %llu", (unsigned long long)state->model_stats.n_params);
         ImGui::Text("Vocab:  %d", state->model_stats.n_vocab);
@@ -957,7 +1249,6 @@ static void draw_settings_panel(AppState *state) {
         changed |= ImGui::SliderInt("Threads", &state->session_cfg.n_threads, 1, 16);
         changed |= ImGui::SliderInt("Context", &state->session_cfg.n_ctx, 128, 8192);
         changed |= ImGui::SliderInt("Batch", &state->session_cfg.n_batch, 32, 2048);
-        changed |= ImGui::InputInt("Reasoning Budget", &state->session_cfg.reasoning_budget);
     }
 
     if (ImGui::CollapsingHeader("Generation", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -974,11 +1265,37 @@ static void draw_settings_panel(AppState *state) {
             changed = true;
         }
         changed |= ImGui::SliderFloat("Temperature", &state->sampling_cfg.temp, 0.0f, 2.0f);
-        changed |= ImGui::SliderInt("Top K", &state->sampling_cfg.top_k, 0, 200);
+        changed |= ImGui::SliderInt("Top K##sampling_top_k", &state->sampling_cfg.top_k, 0, 200);
         changed |= ImGui::SliderFloat("Top P", &state->sampling_cfg.top_p, 0.0f, 1.0f);
         changed |= ImGui::SliderFloat("Min P", &state->sampling_cfg.min_p, 0.0f, 0.5f);
         changed |= ImGui::SliderFloat("Repeat Penalty", &state->sampling_cfg.penalty_repeat, 1.0f, 2.0f);
     }
+
+    auto apply_monitors = [&]() {
+        if (!state->session || state->generating) return false;
+        if (state->entropy_enabled) {
+            state->entropy_n_embd =
+                lfg_session_configure_entropy_monitor(state->session, &state->entropy_cfg);
+        } else {
+            state->entropy_n_embd = 0;
+            lfg_session_configure_entropy_monitor(state->session, nullptr);
+        }
+        if (state->confidence_enabled) {
+            state->confidence_n_embd =
+                lfg_session_configure_confidence_monitor(state->session, &state->confidence_cfg);
+        } else {
+            state->confidence_n_embd = 0;
+            lfg_session_configure_confidence_monitor(state->session, nullptr);
+        }
+        if (state->surprise_enabled) {
+            state->surprise_n_embd =
+                lfg_session_configure_surprise_monitor(state->session, &state->surprise_cfg);
+        } else {
+            state->surprise_n_embd = 0;
+            lfg_session_configure_surprise_monitor(state->session, nullptr);
+        }
+        return true;
+    };
 
     if (ImGui::CollapsingHeader("Monitors")) {
         bool monitors_changed = false;
@@ -1006,17 +1323,21 @@ static void draw_settings_panel(AppState *state) {
             ImGui::Unindent();
         }
 
-        // Configure monitors live on the existing session — no recreation needed
-        if (monitors_changed && state->session && !state->generating) {
-            if (state->entropy_enabled) {
-                lfg_session_configure_entropy_monitor(state->session, &state->entropy_cfg);
+        // Configure monitors live on the existing session — no recreation needed.
+        // If changed while generating, defer and auto-apply once generation stops.
+        if (monitors_changed) {
+            if (!apply_monitors()) {
+                state->monitors_reconfigure_pending = true;
+            } else {
+                state->monitors_reconfigure_pending = false;
             }
-            if (state->confidence_enabled) {
-                lfg_session_configure_confidence_monitor(state->session, &state->confidence_cfg);
-            }
-            if (state->surprise_enabled) {
-                lfg_session_configure_surprise_monitor(state->session, &state->surprise_cfg);
-            }
+        }
+    }
+
+    // Apply deferred monitor config once generation completes.
+    if (state->monitors_reconfigure_pending && !state->generating) {
+        if (apply_monitors()) {
+            state->monitors_reconfigure_pending = false;
         }
     }
 
@@ -1026,7 +1347,7 @@ static void draw_settings_panel(AppState *state) {
         }
         if (state->tools_enabled) {
             ImGui::Indent();
-            if (ImGui::SliderInt("Top K", &state->tool_top_k, 1, 12)) {
+            if (ImGui::SliderInt("Top K##tools_top_k", &state->tool_top_k, 1, 12)) {
                 changed = true;
             }
             static const char *score_modes[] = {"Off", "Auto", "Fixed"};
@@ -1163,7 +1484,7 @@ static void draw_chat_panel(AppState *state) {
             if (!thinking.empty()) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 0.7f));
                 bool still_thinking = state->generating && i == state->messages.size() - 1 &&
-                                      msg.text.find("</think>") == std::string::npos;
+                                      msg.has_unclosed_think();
                 char header[32];
                 snprintf(header, sizeof(header), "%s##think%d",
                          still_thinking ? "Thinking..." : "Thinking", (int)i);
@@ -1757,9 +2078,12 @@ static void glfw_error_callback(int error, const char *description) {
 }
 
 int main(int /*argc*/, char ** /*argv*/) {
+    lfg_backend_init();
+
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit()) {
         fprintf(stderr, "Failed to initialize GLFW\n");
+        lfg_backend_free();
         return 1;
     }
 
@@ -1770,10 +2094,11 @@ int main(int /*argc*/, char ** /*argv*/) {
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
     const char *glsl_version = "#version 150";
 
-    GLFWwindow *window = glfwCreateWindow(1280, 800, "lfg-demo", nullptr, nullptr);
+    GLFWwindow *window = glfwCreateWindow(1080, 1080, "lfg-demo", nullptr, nullptr);
     if (!window) {
         fprintf(stderr, "Failed to create GLFW window\n");
         glfwTerminate();
+        lfg_backend_free();
         return 1;
     }
     glfwMakeContextCurrent(window);
@@ -1804,6 +2129,9 @@ int main(int /*argc*/, char ** /*argv*/) {
     // Main loop
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+
+        // Finalize async model load (if any) on the UI thread.
+        poll_model_load_completion(&g_state);
 
         // Drain pending output — must run even after generation finishes,
         // otherwise fast models (350M) complete between frames and output is lost.
@@ -1954,6 +2282,7 @@ int main(int /*argc*/, char ** /*argv*/) {
 
     glfwDestroyWindow(window);
     glfwTerminate();
+    lfg_backend_free();
 
     return 0;
 }
