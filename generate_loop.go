@@ -49,6 +49,7 @@ type EntropyCallback func(event EntropyEvent, embedding []float32) string
 type GenerateConfig struct {
 	MaxTokens               int32            // Hard token limit. 0 = use session config.
 	IncludeHistoryReasoning bool             // Include <think> blocks in chat history (default false).
+	IncludeOutputEmbeddings bool             // Compute per-token embeddings for generated output (default false).
 	TokenCallback           TokenCallback    // Per-token callback (optional).
 	EntropyCallback         EntropyCallback  // Live entropy rewind/injection callback (optional).
 	ToolCallCallback        ToolCallCallback // Observation callback for auto-executed tool calls (optional).
@@ -64,6 +65,12 @@ type GenerateLoopResult struct {
 	ToolCallCount   int        // Number of parsed tool calls.
 	ToolRounds      int        // Auto-execution rounds completed.
 	StopReason      StopReason // Why generation stopped.
+
+	// OutputEmbeddings is a flat slice of OutputEmbeddingTokens * OutputEmbeddingSize
+	// floats when GenerateConfig.IncludeOutputEmbeddings is true.
+	OutputEmbeddings      []float32
+	OutputEmbeddingTokens int
+	OutputEmbeddingSize   int
 }
 
 // DefaultGenerateConfig returns a zero-valued generate configuration.
@@ -226,6 +233,7 @@ func prepareGenerate(session *Session, config *GenerateConfig) (func(), cGenerat
 
 	cCfg.MaxTokens = config.MaxTokens
 	cCfg.IncludeHistoryReasoning = boolToByte(config.IncludeHistoryReasoning)
+	cCfg.IncludeOutputEmbeddings = boolToByte(config.IncludeOutputEmbeddings)
 	cCfg.MaxToolRounds = config.MaxToolRounds
 
 	if config.TokenCallback == nil && config.EntropyCallback == nil && config.ToolCallCallback == nil {
@@ -267,8 +275,8 @@ func prepareGenerate(session *Session, config *GenerateConfig) (func(), cGenerat
 	return cleanup, cCfg, nil
 }
 
-func resultFromC(r cGenerateResult) GenerateLoopResult {
-	return GenerateLoopResult{
+func resultFromC(r cGenerateResult, includeOutputEmbeddings bool) GenerateLoopResult {
+	result := GenerateLoopResult{
 		TokenCount:      int(r.NTokens),
 		Retrievals:      int(r.NRetrievals),
 		ConfidenceSpans: int(r.NConfidenceSpans),
@@ -277,6 +285,13 @@ func resultFromC(r cGenerateResult) GenerateLoopResult {
 		ToolRounds:      int(r.NToolRounds),
 		StopReason:      StopReason(r.StopReason),
 	}
+	if includeOutputEmbeddings && r.OutputEmbeddings != 0 && r.NOutputEmbeddingFloats > 0 {
+		src := unsafe.Slice((*float32)(unsafe.Pointer(r.OutputEmbeddings)), int(r.NOutputEmbeddingFloats))
+		result.OutputEmbeddings = append([]float32(nil), src...)
+		result.OutputEmbeddingTokens = int(r.NOutputEmbeddingTokens)
+		result.OutputEmbeddingSize = int(r.OutputEmbeddingSize)
+	}
+	return result
 }
 
 // ---------------------------------------------------------------------------
@@ -306,7 +321,7 @@ func (s *Session) GenerateFromState(config GenerateConfig) (GenerateLoopResult, 
 	defer cleanup()
 
 	r := _lfg_session_generate(s.c, cCfg)
-	return resultFromC(r), nil
+	return resultFromC(r, config.IncludeOutputEmbeddings), nil
 }
 
 // PromptGenerate tokenizes the prompt, ingests it, and generates in a single C call.
@@ -337,7 +352,7 @@ func (s *Session) PromptGenerate(prompt string, addBOS bool, config GenerateConf
 
 	r := _lfg_session_prompt_generate(s.c, promptPtr, cLen, addBOS, cCfg)
 	runtime.KeepAlive(promptBytes)
-	return resultFromC(r), nil
+	return resultFromC(r, config.IncludeOutputEmbeddings), nil
 }
 
 // ChatGenerate formats messages with the model's chat template, tokenizes, ingests,
@@ -379,5 +394,5 @@ func (s *Session) ChatGenerate(messages []ChatMessage, config GenerateConfig) (G
 	r := _lfg_session_chat_generate(s.c, uintptr(unsafe.Pointer(&cMessages[0])), uintptr(len(messages)), cCfg)
 	runtime.KeepAlive(keepAlive)
 	runtime.KeepAlive(cMessages)
-	return resultFromC(r), nil
+	return resultFromC(r, config.IncludeOutputEmbeddings), nil
 }

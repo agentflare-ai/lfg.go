@@ -241,7 +241,8 @@ type cToolDesc struct {
 type cGenerateConfig struct {
 	MaxTokens               int32
 	IncludeHistoryReasoning byte    // bool
-	_                       [3]byte // padding to 8
+	IncludeOutputEmbeddings byte    // bool
+	_                       [2]byte // padding to 8
 	TokenCB                 uintptr // lfg_generate_token_cb
 	TokenCBData             uintptr // void *
 	EntropyCB               uintptr // lfg_generate_entropy_cb
@@ -254,13 +255,18 @@ type cGenerateConfig struct {
 
 // cGenerateResult mirrors lfg_generate_result.
 type cGenerateResult struct {
-	NTokens          int32
-	NRetrievals      int32
-	NConfidenceSpans int32
-	NSurpriseEvents  int32
-	NToolCalls       int32
-	NToolRounds      int32
-	StopReason       int32 // lfg_stop_reason
+	NTokens                int32
+	NRetrievals            int32
+	NConfidenceSpans       int32
+	NSurpriseEvents        int32
+	NToolCalls             int32
+	NToolRounds            int32
+	StopReason             int32 // lfg_stop_reason
+	_                      [4]byte
+	OutputEmbeddings       uintptr // const float *
+	NOutputEmbeddingFloats int32
+	NOutputEmbeddingTokens int32
+	OutputEmbeddingSize    int32
 }
 
 // cCheckpointRestoreOptions mirrors lfg_checkpoint_restore_options.

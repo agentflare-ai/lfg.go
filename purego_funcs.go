@@ -446,11 +446,22 @@ func registerSamplerFuncs() {
 		purego.RegisterLibFunc(&_lfg_sampler_init_infill, lib, "lfg_sampler_init_infill")
 		purego.RegisterLibFunc(&_lfg_sampler_init_prefix, lib, "lfg_sampler_init_prefix")
 		purego.RegisterLibFunc(&_lfg_sampler_prefix_set, lib, "lfg_sampler_prefix_set")
-		purego.RegisterLibFunc(&_lfg_sampler_init_reasoning_budget, lib, "lfg_sampler_init_reasoning_budget")
+		_ = registerOptionalLibFunc(&_lfg_sampler_init_reasoning_budget, lib, "lfg_sampler_init_reasoning_budget")
 		purego.RegisterLibFunc(&_lfg_sampler_init_grammar_lazy_patterns, lib, "lfg_sampler_init_grammar_lazy_patterns")
 		purego.RegisterLibFunc(&_lfg_sampler_init_reasoning_gate, lib, "lfg_sampler_init_reasoning_gate")
 		purego.RegisterLibFunc(&_lfg_sampler_apply, lib, "lfg_sampler_apply")
 	})
+}
+
+func registerOptionalLibFunc(fn any, lib uintptr, name string) (ok bool) {
+	ok = true
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	purego.RegisterLibFunc(fn, lib, name)
+	return ok
 }
 
 // ---------------------------------------------------------------------------

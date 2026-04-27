@@ -17,6 +17,10 @@ type AdapterLoRA struct {
 
 // LoadAdapterLoRA loads a LoRA adapter from the given file path.
 func LoadAdapterLoRA(model *Model, path string) (*AdapterLoRA, error) {
+	if model == nil {
+		return nil, &Error{Code: ErrorInvalidArgument, Message: "model is nil"}
+	}
+
 	model.mu.RLock()
 	defer model.mu.RUnlock()
 	if model.c == 0 {

@@ -356,6 +356,9 @@ func (s *Sampler) PrefixSet(prefix string) {
 // When the budget is exceeded, thinking end tokens are forced.
 func NewReasoningBudgetSampler(budget int, startTokens, endTokens []Token) *Sampler {
 	registerSamplerFuncs()
+	if _lfg_sampler_init_reasoning_budget == nil {
+		return nil
+	}
 	return newSampler(_lfg_sampler_init_reasoning_budget(
 		int32(budget),
 		tokenPtr(startTokens), uintptr(len(startTokens)),

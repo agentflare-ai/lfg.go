@@ -154,6 +154,10 @@ func NewContext(model *Model, opts ...ContextOption) (*Context, error) {
 	registerModelFuncs()
 	registerVocabFuncs()
 
+	if model == nil {
+		return nil, &Error{Code: ErrorInvalidArgument, Message: "model is nil"}
+	}
+
 	model.mu.RLock()
 	if model.c == 0 {
 		model.mu.RUnlock()
