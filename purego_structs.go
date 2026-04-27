@@ -154,7 +154,6 @@ type cSessionConfig struct {
 	EnableHealing           byte    // bool
 	StructuredCheckpointing byte    // bool
 	_                       [2]byte // padding
-	ReasoningBudget         int32   // int
 	MaxTokens               int32   // int32_t
 	ToolScoreMode           int32   // lfg_tool_score_mode (enum)
 	ToolMinScore            float32 // float
